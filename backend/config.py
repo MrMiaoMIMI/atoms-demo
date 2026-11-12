@@ -19,6 +19,8 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-flash")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "180"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
+# Project naming is a background side call; never let it block the workspace.
+TITLE_TIMEOUT = float(os.getenv("TITLE_TIMEOUT", "12"))
 LLM_MODE = "deepseek" if LLM_API_KEY else "mock"
 AUTO_REPAIR = os.getenv("AUTO_REPAIR", "1") != "0"
 

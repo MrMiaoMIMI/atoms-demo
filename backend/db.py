@@ -100,6 +100,12 @@ async def create_project(name: str) -> dict:
     return {"id": pid, "name": name}
 
 
+async def update_project_name(pid: str, name: str) -> None:
+    async with _connect() as conn:
+        await conn.execute("UPDATE projects SET name = ? WHERE id = ?", (name, pid))
+        await conn.commit()
+
+
 async def list_projects() -> list[dict]:
     async with _connect() as conn:
         async with conn.execute(

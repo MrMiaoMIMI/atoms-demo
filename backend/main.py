@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import logging
+import re
 import shutil
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -13,6 +18,7 @@ from fastapi.responses import (
     FileResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from pydantic import BaseModel, Field
@@ -21,7 +27,10 @@ from starlette.background import BackgroundTask
 import agent
 import config
 import db
+import naming
 import runtime
+
+logger = logging.getLogger(__name__)
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
@@ -35,6 +44,8 @@ CORS_HEADERS = {
 }
 
 _locks: dict[str, asyncio.Lock] = {}
+# Project id -> background naming task, kept alive until it resolves.
+_title_tasks: dict[str, asyncio.Task] = {}
 
 
 def _sse(event: str, payload: dict) -> str:
@@ -51,6 +62,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        pending = list(_title_tasks.values())
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await runtime.runtime.stop_all()
         await app.state.http.aclose()
 
@@ -102,10 +118,37 @@ async def list_projects() -> dict:
     return {"projects": projects}
 
 
+async def _name_project(pid: str, prompt: str) -> None:
+    """Resolve an LLM title in the background and persist it."""
+    try:
+        name = await naming.suggest_title(prompt)
+        project = await db.get_project(pid)
+        if project and name and name != project["name"]:
+            await db.update_project_name(pid, name[:80])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - naming must never break creation
+        logger.warning("project naming failed for %s: %s", pid, exc)
+
+
 @app.post("/api/projects")
 async def create_project(body: CreateProjectBody) -> dict:
-    name = (body.name or "").strip() or (body.prompt or "").strip()[:24] or "未命名项目"
-    return await db.create_project(name[:80])
+    prompt = (body.prompt or "").strip()
+    name = (body.name or "").strip()
+    explicit_name = bool(name)
+    if not name:
+        name = naming.draft_title(prompt)
+    project = await db.create_project((name[:80] or "未命名项目"))
+
+    # Long first prompts lose intent when cut to N characters; let the LLM
+    # summarize one. The workspace opens with the draft name in the meantime.
+    if prompt and not explicit_name:
+        task = asyncio.create_task(_name_project(project["id"], prompt))
+        _title_tasks[project["id"]] = task
+        task.add_done_callback(
+            lambda _task, pid=project["id"]: _title_tasks.pop(pid, None)
+        )
+    return project
 
 
 @app.get("/api/projects/{pid}")
@@ -119,6 +162,40 @@ async def get_project(pid: str) -> dict:
     state["mode"] = _project_mode(paths)
     state["preview_url"] = f"/apps/{pid}/?v={version or 1}" if artifacts else None
     return state
+
+
+def _zip_artifacts(files: dict[str, str]) -> bytes:
+    """Pack the latest source files into an in-memory repository archive."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for filename in sorted(files):
+            name = filename.replace("\\", "/").lstrip("/")
+            if not name or ".." in Path(name).parts:
+                continue
+            archive.writestr(name, files[filename])
+    return buffer.getvalue()
+
+
+@app.get("/api/projects/{pid}/export")
+async def export_project(pid: str):
+    project = await db.get_project(pid)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    files = await db.latest_artifacts(pid)
+    if not files:
+        raise HTTPException(status_code=409, detail="项目还没有可导出的文件")
+
+    payload = await asyncio.to_thread(_zip_artifacts, files)
+    safe_name = re.sub(r'[\\/:*?"<>|\r\n]+', "-", project["name"]).strip(" .")
+    download = f"{safe_name[:60] or 'atoms-project'}.zip"
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="atoms-{pid}.zip"; '
+            f"filename*=UTF-8''{quote(download, safe='')}"
+        ),
+        "Cache-Control": "no-store",
+    }
+    return Response(payload, media_type="application/zip", headers=headers)
 
 
 @app.delete("/api/projects/{pid}")
@@ -152,6 +229,29 @@ async def generate(pid: str, body: GenerateBody):
         async with lock:
             await db.add_conversation(pid, "user", message)
             queue: asyncio.Queue = asyncio.Queue()
+
+            # Send the current name at once (it may already hold the resolved
+            # background title), then push a second event if naming finishes
+            # while this run is still streaming.
+            # Read the task reference before the row: if naming finishes in
+            # between, the row already carries the final name.
+            naming_task = _title_tasks.get(pid)
+            current = await db.get_project(pid)
+            if current:
+                await queue.put(("project", current))
+
+            async def notify_rename() -> None:
+                if naming_task is None:
+                    return
+                try:
+                    await asyncio.shield(naming_task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - naming already logged it
+                    return
+                project = await db.get_project(pid)
+                if project:
+                    await queue.put(("project", project))
 
             async def emit(event: str, payload: dict):
                 if event == "execution":
@@ -198,6 +298,7 @@ async def generate(pid: str, body: GenerateBody):
                     await queue.put(None)
 
             task = asyncio.create_task(worker())
+            watcher = asyncio.create_task(notify_rename())
             try:
                 while True:
                     try:
@@ -212,6 +313,8 @@ async def generate(pid: str, body: GenerateBody):
             finally:
                 if not task.done():
                     task.cancel()
+                if not watcher.done():
+                    watcher.cancel()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 

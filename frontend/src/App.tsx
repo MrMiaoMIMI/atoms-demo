@@ -11,15 +11,48 @@ type Route =
   | { name: "workspace"; projectId: string };
 
 function parseRoute(): Route {
-  const projectId = new URLSearchParams(window.location.search).get("p");
-  if (projectId) return { name: "workspace", projectId };
   const path = window.location.pathname.replace(/\/+$/, "");
+  const chat = /^\/chat\/([^/]+)$/.exec(path);
+  if (chat) {
+    let projectId = chat[1];
+    try {
+      projectId = decodeURIComponent(projectId);
+    } catch {
+      // Keep the raw segment if it is not valid percent-encoding.
+    }
+    return { name: "workspace", projectId };
+  }
+  // Legacy links used /?p={id}; keep them working.
+  const legacy = new URLSearchParams(window.location.search).get("p");
+  if (legacy) return { name: "workspace", projectId: legacy };
   if (path === "/projects") return { name: "projects" };
   return { name: "home" };
 }
 
+/** Canonicalise the address bar and migrate old /?p= links. */
+function normalizeRoute(): void {
+  const path = window.location.pathname.replace(/\/+$/, "");
+  const legacy = new URLSearchParams(window.location.search).get("p");
+  if (legacy) {
+    window.history.replaceState(
+      {},
+      "",
+      `/chat/${encodeURIComponent(legacy)}`
+    );
+    return;
+  }
+  const known =
+    path === "/dashboard" ||
+    path === "/projects" ||
+    /^\/chat\/[^/]+$/.test(path);
+  if (!known) window.history.replaceState({}, "", "/dashboard");
+}
+
 export default function App() {
-  const [route, setRoute] = useState<Route>(() => parseRoute());
+  const [route, setRoute] = useState<Route>(() => {
+    normalizeRoute();
+    return parseRoute();
+  });
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
 
@@ -49,7 +82,7 @@ export default function App() {
   }, [route]);
 
   const goHome = useCallback(() => {
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", "/dashboard");
     setPendingPrompt(null);
     setRoute({ name: "home" });
   }, []);
@@ -61,7 +94,11 @@ export default function App() {
   }, []);
 
   const openProject = useCallback((projectId: string) => {
-    window.history.pushState({}, "", `/?p=${encodeURIComponent(projectId)}`);
+    window.history.pushState(
+      {},
+      "",
+      `/chat/${encodeURIComponent(projectId)}`
+    );
     setPendingPrompt(null);
     setRoute({ name: "workspace", projectId });
   }, []);

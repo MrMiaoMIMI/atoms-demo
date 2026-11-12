@@ -61,6 +61,14 @@ ALEX_CONSULT_SYSTEM = """你是 Alex，工程师，从实现、文件结构、�
 不要修改代码，不要输出 @名字。基于项目上下文回答，尽量引用真实的文件名和路径。
 上下文没有的信息要明确说明，不要编造；不要编造实时数据。"""
 
+TITLE_SYSTEM = """你是项目命名助手。根据用户的第一条需求，给出一个简短、具体的项目名称。
+规则：
+- 只输出名称本身，不要解释、不要引号/书名号/句末标点、不要 markdown
+- 6-16 个汉字（英文需求则 2-5 个单词），最多 24 个字符
+- 概括核心产品形态和功能，例如「团队任务看板」「旅行行程规划器」
+- 使用与需求相同的语言
+- 不要输出「未命名项目」「新项目」这类空泛名称"""
+
 AGENTS: dict[str, AgentSpec] = {
     "mike": AgentSpec(
         key="mike",
@@ -105,6 +113,51 @@ CONSULT_SYSTEMS = {
 }
 
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9])@(mike|bob|alex)(?![A-Za-z0-9])", re.IGNORECASE)
+
+# Leading request filler ("帮我做一个…") that carries no naming information.
+_TITLE_FILLER_RE = re.compile(
+    r"^(?:(?:请|麻烦|帮我|帮忙|我想|我要|我们想|我们需要|需要|想要)+)?"
+    r"(?:帮我|帮忙)?"
+    r"(?:做|写|开发|创建|搭建|实现|设计|生成|构建|制作)?"
+    r"(?:一个|一款|一套|个)?"
+)
+_TITLE_TRIM = " \t，,、;；:：-—·\"'“”‘’《》「」『』【】[]()（）"
+_GENERIC_TITLES = {"未命名项目", "新项目", "项目", "应用", "我的项目"}
+
+
+def fallback_title(prompt: str | None, limit: int = 24) -> str:
+    """Deterministic project name used before/without an LLM.
+
+    Takes the first sentence, drops request filler, and prefers a clause
+    boundary rather than cutting a long sentence in the middle.
+    """
+    text = _MENTION_RE.sub("", prompt or "")
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if not text:
+        return "未命名项目"
+    text = re.split(r"[。！？!?\n]", text, maxsplit=1)[0].strip()
+    text = re.sub(r"\s+", " ", text)
+    text = _TITLE_FILLER_RE.sub("", text).strip(_TITLE_TRIM)
+    if not text:
+        return "未命名项目"
+    if len(text) > limit:
+        head = text[:limit]
+        cut = max(head.rfind(ch) for ch in "，,、;；:：")
+        text = (head[:cut] if cut >= 6 else head).strip(_TITLE_TRIM)
+    return text[:limit] or "未命名项目"
+
+
+def sanitize_title(raw: str | None, fallback: str) -> str:
+    """Keep only the first clean line of an LLM title response."""
+    text = re.sub(r"```[A-Za-z0-9_-]*", "", raw or "")
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    line = re.sub(r"^.{0,8}?(?:项目名称|名称|标题|名字)\s*[:：]\s*", "", line)
+    line = line.strip(" \t`*#\"'“”‘’《》「」『』【】[]()（）")
+    line = line.strip("。．.!！?？,，;；:：、")
+    line = re.sub(r"\s+", " ", line).strip()
+    if len(line) < 2 or line in _GENERIC_TITLES:
+        return fallback
+    return line[:24]
 
 # Imperative build actions. These win over consult markers, so "介绍项目并加一个
 # 搜索框" is still a build request.

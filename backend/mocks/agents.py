@@ -7,6 +7,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from agents import fallback_title
+
+
+def title_reply(meta: dict[str, Any]) -> str:
+    """Mock naming agent: same heuristic the backend uses when the LLM fails."""
+    return fallback_title(str(meta.get("prompt") or ""))
+
 
 def _file_list(meta: dict[str, Any]) -> list[str]:
     files = meta.get("files") or []

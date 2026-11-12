@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../api";
 import type { Artifact } from "../types";
 import {
   buildFileTree,
@@ -18,9 +19,11 @@ import {
   Folder,
   PanelLeft,
   Search,
+  Spinner,
 } from "./Icons";
 
 interface Props {
+  projectId: string;
   artifacts: Record<string, Artifact>;
   activeFile: string | null;
   onSelect: (filename: string) => void;
@@ -129,6 +132,7 @@ function TreeRows({
 }
 
 export default function FilePanel({
+  projectId,
   artifacts,
   activeFile,
   onSelect,
@@ -139,6 +143,8 @@ export default function FilePanel({
   const [treeOpen, setTreeOpen] = useState(true);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [copied, setCopied] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const names = useMemo(() => {
@@ -210,16 +216,18 @@ export default function FilePanel({
     );
   }
 
-  function exportProject() {
-    const bundle: Record<string, string> = {};
-    for (const [name, artifact] of Object.entries(artifacts)) bundle[name] = artifact.content;
-    if (streamingFile) bundle[streamingFile] = streamingBuffer;
-    saveBlob(
-      new Blob([JSON.stringify(bundle, null, 2)], {
-        type: "application/json;charset=utf-8",
-      }),
-      "atoms-project.json"
-    );
+  async function exportProject() {
+    if (exporting) return;
+    setExporting(true);
+    setExportError(null);
+    try {
+      const { blob, filename } = await api.exportProject(projectId);
+      saveBlob(blob, filename);
+    } catch (err) {
+      setExportError((err as Error).message || "导出失败，请稍后重试。");
+    } finally {
+      setExporting(false);
+    }
   }
 
   return (
@@ -290,13 +298,19 @@ export default function FilePanel({
             <div className="flex-none border-t border-line-4 p-2">
               <button
                 type="button"
-                onClick={exportProject}
-                disabled={!names.length}
+                onClick={() => void exportProject()}
+                disabled={!names.length || exporting}
+                title="把最新源代码打包为 ZIP 仓库压缩包"
                 className="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg border border-line-6 text-[12px] text-ink-80 transition hover:bg-line-4 hover:text-ink-95 disabled:opacity-40"
               >
-                <Download size={14} />
-                导出项目
+                {exporting ? <Spinner size={14} /> : <Download size={14} />}
+                {exporting ? "正在打包…" : "导出项目"}
               </button>
+              {exportError ? (
+                <p className="mt-1.5 px-1 text-[11px] leading-[16px] text-danger">
+                  {exportError}
+                </p>
+              ) : null}
             </div>
           </div>
         ) : (

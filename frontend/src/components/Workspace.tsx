@@ -1,20 +1,21 @@
-import type { PointerEvent as ReactPointerEvent } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, generate } from "../api";
-import { agentFor, isAgentKey } from "../lib/agents";
-import { copyText } from "../lib/clipboard";
-import { buildGroups, type ChatGroup } from "../lib/groups";
+import type { PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api, generate } from '../api';
+import { AGENT_KEYS, agentFor, isAgentKey } from '../lib/agents';
+import { copyText } from '../lib/clipboard';
+import { buildGroups, type ChatGroup } from '../lib/groups';
 import type {
+  AgentKey,
   Artifact,
   Conversation,
   Execution,
   Health,
   Project,
   ProjectMode,
-} from "../types";
-import { PresenceAvatars } from "./Avatar";
-import ChatPanel from "./ChatPanel";
-import FilePanel from "./FilePanel";
+} from '../types';
+import { PresenceBar } from './Avatar';
+import ChatPanel from './ChatPanel';
+import FilePanel from './FilePanel';
 import {
   AtomsMark,
   ChevronDown,
@@ -22,11 +23,9 @@ import {
   Eye,
   ExternalLink,
   Home,
-  Refresh,
-  Share,
   Spinner,
-} from "./Icons";
-import PreviewPane from "./PreviewPane";
+} from './Icons';
+import PreviewPane from './PreviewPane';
 
 interface Props {
   projectId: string;
@@ -41,17 +40,17 @@ const DEFAULT_CHAT = 500;
 const MAX_CHAT = 760;
 
 const MODE_LABEL: Record<ProjectMode, string> = {
-  frontend: "前端",
-  fullstack: "全栈",
-  backend: "API",
+  frontend: '前端',
+  fullstack: '全栈',
+  backend: 'API',
 };
 
 function pickDefaultFile(artifacts: Artifact[]): string | null {
   const priorities = [
-    "frontend/src/App.tsx",
-    "frontend/src/main.tsx",
-    "backend/main.py",
-    "index.html",
+    'frontend/src/App.tsx',
+    'frontend/src/main.tsx',
+    'backend/main.py',
+    'index.html',
   ];
   for (const path of priorities) {
     if (artifacts.some((artifact) => artifact.filename === path)) return path;
@@ -75,21 +74,24 @@ export default function Workspace({
   onExit,
 }: Props) {
   const [project, setProject] = useState<Project | null>(null);
-  const [mode, setMode] = useState<ProjectMode>("frontend");
+  const [mode, setMode] = useState<ProjectMode>('frontend');
   const [groups, setGroups] = useState<ChatGroup[]>([]);
   const [artifacts, setArtifacts] = useState<Record<string, Artifact>>({});
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [streamingFile, setStreamingFile] = useState<string | null>(null);
-  const [streamingBuffer, setStreamingBuffer] = useState("");
+  const [streamingBuffer, setStreamingBuffer] = useState('');
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [pane, setPane] = useState<"preview" | "code">("preview");
+  const [pane, setPane] = useState<'preview' | 'code'>('preview');
+  const [chatOpen, setChatOpen] = useState(
+    () => window.localStorage.getItem('atoms-chat-open') !== '0'
+  );
   const [refreshKey, setRefreshKey] = useState(0);
   const [chatWidth, setChatWidth] = useState(() => {
-    const saved = Number(window.localStorage.getItem("atoms-chat-width"));
+    const saved = Number(window.localStorage.getItem('atoms-chat-width'));
     return Number.isFinite(saved) && saved >= MIN_CHAT && saved <= MAX_CHAT
       ? saved
       : DEFAULT_CHAT;
@@ -97,16 +99,31 @@ export default function Workspace({
   const [dragging, setDragging] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
   const [projectMenu, setProjectMenu] = useState(false);
-  const [pageMenu, setPageMenu] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const startedRef = useRef(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
 
   const latestVersion = useMemo(
-    () => Object.values(artifacts).reduce((max, artifact) => Math.max(max, artifact.version), 0),
-    [artifacts]
+    () =>
+      Object.values(artifacts).reduce(
+        (max, artifact) => Math.max(max, artifact.version),
+        0,
+      ),
+    [artifacts],
   );
+
+  const chattedAgents = useMemo<AgentKey[]>(() => {
+    const seen = new Set<string>();
+    for (const group of groups) {
+      if (group.kind === 'agent' && group.agent) seen.add(group.agent);
+    }
+    return AGENT_KEYS.filter((key) => seen.has(key));
+  }, [groups]);
+
+  useEffect(() => {
+    if (project?.name) document.title = `${project.name} · Atoms`;
+  }, [project?.name]);
 
   useEffect(() => {
     let cancelled = false;
@@ -117,24 +134,27 @@ export default function Workspace({
       .then((state) => {
         if (cancelled) return;
         setProject(state.project);
-        setMode(state.mode ?? "frontend");
+        setMode(state.mode ?? 'frontend');
         const map: Record<string, Artifact> = {};
-        for (const artifact of state.artifacts) map[artifact.filename] = artifact;
+        for (const artifact of state.artifacts)
+          map[artifact.filename] = artifact;
         setArtifacts(map);
         setActiveFile(pickDefaultFile(state.artifacts));
         const version = state.artifacts.reduce(
           (max, artifact) => Math.max(max, artifact.version),
-          0
+          0,
         );
         if (state.artifacts.length > 0) {
-          setPreviewUrl(state.preview_url ?? `/apps/${projectId}/?v=${version || 1}`);
+          setPreviewUrl(
+            state.preview_url ?? `/apps/${projectId}/?v=${version || 1}`,
+          );
         }
         setGroups(buildGroups(state.conversations, state.executions));
         setLoaded(true);
       })
       .catch((err: Error) => {
         if (cancelled) return;
-        setLoadError(err.message || "项目加载失败");
+        setLoadError(err.message || '项目加载失败');
         setLoaded(true);
       });
     return () => {
@@ -143,29 +163,35 @@ export default function Workspace({
   }, [projectId]);
 
   useEffect(() => {
-    window.localStorage.setItem("atoms-chat-width", String(chatWidth));
+    window.localStorage.setItem('atoms-chat-width', String(chatWidth));
   }, [chatWidth]);
 
   useEffect(() => {
+    window.localStorage.setItem('atoms-chat-open', chatOpen ? '1' : '0');
+  }, [chatOpen]);
+
+  useEffect(() => {
     const clamp = () => {
-      const max = Math.min(MAX_CHAT, Math.max(MIN_CHAT, window.innerWidth - 460));
+      const max = Math.min(
+        MAX_CHAT,
+        Math.max(MIN_CHAT, window.innerWidth - 460),
+      );
       setChatWidth((value) => Math.max(MIN_CHAT, Math.min(max, value)));
     };
     clamp();
-    window.addEventListener("resize", clamp);
-    return () => window.removeEventListener("resize", clamp);
+    window.addEventListener('resize', clamp);
+    return () => window.removeEventListener('resize', clamp);
   }, []);
 
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== 'Escape') return;
       setProjectMenu(false);
-      setPageMenu(false);
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   function startDrag(event: ReactPointerEvent<HTMLDivElement>) {
@@ -174,28 +200,34 @@ export default function Workspace({
     const startWidth = chatWidth;
 
     const onMove = (moveEvent: PointerEvent) => {
-      const max = Math.min(MAX_CHAT, Math.max(MIN_CHAT, window.innerWidth - 460));
+      const max = Math.min(
+        MAX_CHAT,
+        Math.max(MIN_CHAT, window.innerWidth - 460),
+      );
       setChatWidth(
-        Math.max(MIN_CHAT, Math.min(max, startWidth + moveEvent.clientX - startX))
+        Math.max(
+          MIN_CHAT,
+          Math.min(max, startWidth + moveEvent.clientX - startX),
+        ),
       );
     };
 
     const finish = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", finish);
-      window.removeEventListener("pointercancel", finish);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', finish);
+      window.removeEventListener('pointercancel', finish);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
       setDragging(false);
       dragCleanupRef.current = null;
     };
 
     dragCleanupRef.current = finish;
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", finish);
-    window.addEventListener("pointercancel", finish);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', finish);
+    window.addEventListener('pointercancel', finish);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
     setDragging(true);
   }
 
@@ -207,7 +239,7 @@ export default function Workspace({
       const now = new Date().toISOString();
       const userMessage: Conversation = {
         id: -Date.now(),
-        role: "user",
+        role: 'user',
         content: message,
         created_at: now,
       };
@@ -215,12 +247,12 @@ export default function Workspace({
       setError(null);
       setRunning(true);
       setStreamingFile(null);
-      setStreamingBuffer("");
+      setStreamingBuffer('');
       setGroups((prev) => [
         ...prev,
         {
           id: `live-user-${Date.now()}`,
-          kind: "user",
+          kind: 'user',
           user: userMessage,
           executions: [],
           messages: [],
@@ -232,7 +264,7 @@ export default function Workspace({
       abortRef.current = controller;
 
       const normalizeAgent = (raw: unknown) => {
-        const value = typeof raw === "string" ? raw : "mike";
+        const value = typeof raw === 'string' ? raw : 'mike';
         return isAgentKey(value) ? value : agentFor(value).key;
       };
 
@@ -241,35 +273,47 @@ export default function Workspace({
           projectId,
           message,
           (event, data) => {
-            if (event === "agent_start") {
-              const runId = typeof data.run_id === "string" ? data.run_id : null;
+            if (event === 'project') {
+              // The backend names the project from the full first prompt in
+              // the background; adopt the resolved title when it arrives.
+              const name = typeof data.name === 'string' ? data.name.trim() : '';
+              if (name) {
+                setProject((prev) => (prev ? { ...prev, name } : prev));
+              }
+              return;
+            }
+            if (event === 'agent_start') {
+              const runId =
+                typeof data.run_id === 'string' ? data.run_id : null;
               if (!runId) return;
               const agent = normalizeAgent(data.agent);
-              const index = typeof data.index === "number" ? data.index : undefined;
+              const index =
+                typeof data.index === 'number' ? data.index : undefined;
               setGroups((prev) => {
                 if (prev.some((group) => group.runId === runId)) return prev;
                 return [
                   ...prev,
                   {
                     id: `live-${runId}`,
-                    kind: "agent",
+                    kind: 'agent',
                     agent,
                     runId,
                     executions: [],
                     messages: [],
                     createdAt: new Date().toISOString(),
                     live: true,
-                    status: "running",
+                    status: 'running',
                     index,
                   },
                 ];
               });
               return;
             }
-            if (event === "execution") {
+            if (event === 'execution') {
               const execution = data as unknown as Execution;
-              if (typeof execution.id !== "number") return;
-              const runId = typeof execution.run_id === "string" ? execution.run_id : null;
+              if (typeof execution.id !== 'number') return;
+              const runId =
+                typeof execution.run_id === 'string' ? execution.run_id : null;
               if (!runId) return;
               setGroups((prev) => {
                 let found = false;
@@ -287,111 +331,126 @@ export default function Workspace({
                   ...next,
                   {
                     id: `live-${runId}`,
-                    kind: "agent",
+                    kind: 'agent',
                     agent,
                     runId,
                     executions: [execution],
                     messages: [],
                     createdAt: execution.created_at ?? new Date().toISOString(),
                     live: true,
-                    status: "running",
+                    status: 'running',
                   },
                 ];
               });
               return;
             }
-            if (event === "token") {
-              const delta = typeof data.delta === "string" ? data.delta : "";
+            if (event === 'token') {
+              const delta = typeof data.delta === 'string' ? data.delta : '';
               if (delta) setStreamingBuffer((prev) => prev + delta);
               return;
             }
-            if (event === "token_reset") {
-              setStreamingBuffer("");
+            if (event === 'token_reset') {
+              setStreamingBuffer('');
               return;
             }
-            if (event === "file_start") {
-              const filename = typeof data.filename === "string" ? data.filename : null;
+            if (event === 'file_start') {
+              const filename =
+                typeof data.filename === 'string' ? data.filename : null;
               setStreamingFile(filename);
-              setStreamingBuffer("");
+              setStreamingBuffer('');
               if (filename) setActiveFile(filename);
               return;
             }
-            if (event === "artifact") {
+            if (event === 'artifact') {
               const artifact = data as unknown as Artifact;
               if (!artifact.filename) return;
-              setArtifacts((prev) => ({ ...prev, [artifact.filename]: artifact }));
+              setArtifacts((prev) => ({
+                ...prev,
+                [artifact.filename]: artifact,
+              }));
               setActiveFile((prev) => prev ?? artifact.filename);
               setStreamingFile(null);
-              setStreamingBuffer("");
+              setStreamingBuffer('');
               return;
             }
-            if (event === "preview") {
-              if (typeof data.url === "string") setPreviewUrl(data.url);
+            if (event === 'preview') {
+              if (typeof data.url === 'string') setPreviewUrl(data.url);
               if (
-                data.mode === "frontend" ||
-                data.mode === "fullstack" ||
-                data.mode === "backend"
+                data.mode === 'frontend' ||
+                data.mode === 'fullstack' ||
+                data.mode === 'backend'
               ) {
                 setMode(data.mode);
               }
               return;
             }
-            if (event === "message") {
-              const runId = typeof data.run_id === "string" ? data.run_id : null;
-              const content = typeof data.content === "string" ? data.content : null;
+            if (event === 'message') {
+              const runId =
+                typeof data.run_id === 'string' ? data.run_id : null;
+              const content =
+                typeof data.content === 'string' ? data.content : null;
               if (!runId || !content) return;
               setGroups((prev) =>
                 prev.map((group) =>
                   group.runId === runId
                     ? { ...group, messages: [...group.messages, content] }
-                    : group
-                )
+                    : group,
+                ),
               );
               return;
             }
-            if (event === "agent_end") {
-              const runId = typeof data.run_id === "string" ? data.run_id : null;
+            if (event === 'agent_end') {
+              const runId =
+                typeof data.run_id === 'string' ? data.run_id : null;
               if (!runId) return;
               const status =
-                data.status === "error"
-                  ? ("error" as const)
-                  : data.status === "warning"
-                    ? ("warning" as const)
-                    : ("success" as const);
+                data.status === 'error'
+                  ? ('error' as const)
+                  : data.status === 'warning'
+                    ? ('warning' as const)
+                    : ('success' as const);
               setGroups((prev) =>
                 prev.map((group) =>
-                  group.runId === runId ? { ...group, live: false, status } : group
-                )
+                  group.runId === runId
+                    ? { ...group, live: false, status }
+                    : group,
+                ),
               );
               return;
             }
-            if (event === "error") {
-              setError(typeof data.message === "string" ? data.message : "生成失败");
+            if (event === 'error') {
+              setError(
+                typeof data.message === 'string' ? data.message : '生成失败',
+              );
             }
           },
-          controller.signal
+          controller.signal,
         );
       } catch (err) {
-        if ((err as Error).name === "AbortError") {
-          setError("已停止本轮生成。");
+        if ((err as Error).name === 'AbortError') {
+          setError('已停止本轮生成。');
           setGroups((prev) =>
             prev.map((group) =>
               group.live
                 ? {
                     ...group,
                     live: false,
-                    status: "warning" as const,
+                    status: 'warning' as const,
                     executions: group.executions.map((execution) =>
-                      execution.status === "running"
-                        ? { ...execution, status: "warning" as const, log: "已手动停止" }
-                        : execution
+                      execution.status === 'running'
+                        ? {
+                            ...execution,
+                            status: 'warning' as const,
+                            log: '已手动停止',
+                          }
+                        : execution,
                     ),
                   }
-                : group
-            )
+                : group,
+            ),
           );
         } else {
-          setError((err as Error).message || "生成失败，请重试。");
+          setError((err as Error).message || '生成失败，请重试。');
         }
       } finally {
         setRunning(false);
@@ -403,14 +462,16 @@ export default function Workspace({
               ? {
                   ...group,
                   live: false,
-                  status: group.messages.length ? ("success" as const) : ("warning" as const),
+                  status: group.messages.length
+                    ? ('success' as const)
+                    : ('warning' as const),
                 }
-              : group
-          )
+              : group,
+          ),
         );
       }
     },
-    [projectId]
+    [projectId],
   );
 
   useEffect(() => {
@@ -424,7 +485,7 @@ export default function Workspace({
     () => () => {
       abortRef.current?.abort();
     },
-    []
+    [],
   );
 
   function refreshPreview() {
@@ -457,7 +518,9 @@ export default function Workspace({
       <div className="grid h-full place-items-center bg-base px-6">
         <div className="w-full max-w-sm rounded-2xl border border-line-6 bg-white p-6 text-center shadow-composer">
           <p className="text-[14px] font-medium text-ink-95">项目加载失败</p>
-          <p className="mt-2 text-[12px] leading-[19px] text-ink-55">{loadError}</p>
+          <p className="mt-2 text-[12px] leading-[19px] text-ink-55">
+            {loadError}
+          </p>
           <button
             type="button"
             onClick={onExit}
@@ -493,7 +556,7 @@ export default function Workspace({
               className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1 text-left transition hover:bg-line-4"
             >
               <span className="truncate text-[14px] font-medium text-ink-95">
-                {project?.name ?? "未命名项目"}
+                {project?.name ?? '未命名项目'}
               </span>
               <ChevronDown size={14} className="flex-none text-ink-55" />
             </button>
@@ -509,25 +572,17 @@ export default function Workspace({
                 <div className="absolute left-0 top-full z-30 mt-1.5 w-[250px] rounded-xl border border-line-6 bg-white p-2 shadow-float">
                   <div className="px-2 py-1.5">
                     <p className="truncate text-[13px] font-medium text-ink-95">
-                      {project?.name ?? "未命名项目"}
+                      {project?.name ?? '未命名项目'}
                     </p>
                     <p className="mt-0.5 text-[11px] text-ink-55">
-                      {MODE_LABEL[mode]} · v{latestVersion || 1} ·{" "}
-                      {health?.llm_mode === "mock" ? "Mock Agent" : health?.model || "LLM"}
+                      {MODE_LABEL[mode]} · v{latestVersion || 1} ·{' '}
+                      {health?.llm_mode === 'mock'
+                        ? 'Mock Agent'
+                        : health?.model || 'LLM'}
                     </p>
                   </div>
                   <div className="my-1 h-px bg-line-4" />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setProjectMenu(false);
-                      void share();
-                    }}
-                    className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-ink-80 transition hover:bg-line-4 hover:text-ink-95"
-                  >
-                    <Share size={15} />
-                    复制预览链接
-                  </button>
+
                   <button
                     type="button"
                     onClick={() => {
@@ -544,108 +599,64 @@ export default function Workspace({
             ) : null}
           </div>
 
-          <span className="hidden flex-none rounded-full bg-line-4 px-2 py-0.5 text-[10px] text-ink-55 sm:inline">
-            {MODE_LABEL[mode]}
-          </span>
+          <button
+            type="button"
+            onClick={() => setChatOpen((value) => !value)}
+            title={chatOpen ? '关闭聊天框' : '打开聊天框'}
+            aria-label={chatOpen ? '关闭聊天框' : '打开聊天框'}
+            aria-pressed={!chatOpen}
+            className="grid h-6 min-w-[32px] flex-none place-items-center rounded-full bg-line-4 px-2 font-mono text-[12px] font-medium tracking-[-1px] text-ink-55 transition hover:bg-line-6 hover:text-ink-80"
+          >
+            {chatOpen ? '<<' : '>>'}
+          </button>
         </div>
 
         <div className="flex min-w-0 flex-1 items-center justify-between gap-2 pl-2 pr-3">
           <div className="flex items-center rounded-full bg-line-4 p-0 shadow-[inset_0_0_0_1px_rgba(12,12,12,0.03)]">
             <button
               type="button"
-              onClick={() => setPane("preview")}
+              onClick={() => setPane('preview')}
               title="预览"
               className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
-                pane === "preview"
-                  ? "bg-white px-2.5 font-medium text-brand-text shadow-[0_1px_3px_rgba(12,12,12,0.10)]"
-                  : "w-[34px] justify-center text-ink-55 hover:text-ink-80"
+                pane === 'preview'
+                  ? 'bg-white px-2.5 font-medium text-brand-text shadow-[0_1px_3px_rgba(12,12,12,0.10)]'
+                  : 'w-[34px] justify-center text-ink-55 hover:text-ink-80'
               }`}
             >
               <Eye size={17} />
-              {pane === "preview" ? "预览" : null}
+              {pane === 'preview' ? '预览' : null}
             </button>
             <button
               type="button"
-              onClick={() => setPane("code")}
+              onClick={() => setPane('code')}
               title="代码"
               className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
-                pane === "code"
-                  ? "bg-white px-2.5 font-medium text-brand-text shadow-[0_1px_3px_rgba(12,12,12,0.10)]"
-                  : "w-[34px] justify-center text-ink-55 hover:text-ink-80"
+                pane === 'code'
+                  ? 'bg-white px-2.5 font-medium text-brand-text shadow-[0_1px_3px_rgba(12,12,12,0.10)]'
+                  : 'w-[34px] justify-center text-ink-55 hover:text-ink-80'
               }`}
             >
               <Code size={17} />
-              {pane === "code" ? "代码" : null}
+              {pane === 'code' ? '代码' : null}
             </button>
           </div>
 
           <div className="flex min-w-0 items-center gap-1">
-            <div className="relative hidden md:block">
-              <button
-                type="button"
-                onClick={() => setPageMenu((value) => !value)}
-                className="flex h-[30px] items-center gap-1.5 rounded-full px-2.5 text-[13px] text-ink-80 transition hover:bg-line-4"
-              >
-                <Home size={15} />
-                首页
-                <ChevronDown size={13} className="text-ink-55" />
-              </button>
-              {pageMenu ? (
-                <>
-                  <button
-                    type="button"
-                    aria-hidden="true"
-                    className="fixed inset-0 z-20 cursor-default"
-                    onClick={() => setPageMenu(false)}
-                  />
-                  <div className="absolute right-0 top-full z-30 mt-1.5 w-[200px] rounded-xl border border-line-6 bg-white p-1.5 shadow-float">
-                    <p className="px-2 py-1 text-[11px] text-ink-30">当前页面</p>
-                    <div className="flex items-center gap-2 rounded-lg bg-line-4 px-2 py-1.5 text-[13px] text-ink-95">
-                      <Home size={14} />
-                      首页
-                    </div>
-                    <a
-                      href={previewUrl ?? "#"}
-                      target="_blank"
-                      rel="noreferrer"
-                      onClick={() => setPageMenu(false)}
-                      className={`mt-1 flex items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] ${
-                        previewUrl
-                          ? "text-ink-80 hover:bg-line-4 hover:text-ink-95"
-                          : "pointer-events-none text-ink-30"
-                      }`}
-                    >
-                      <ExternalLink size={14} />
-                      在新标签页打开
-                    </a>
-                  </div>
-                </>
-              ) : null}
-            </div>
-
             <a
-              href={previewUrl ?? "#"}
+              href={previewUrl ?? '#'}
               target="_blank"
               rel="noreferrer"
               title="在新标签页打开"
               className={`hidden h-[30px] w-[30px] place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95 md:grid ${
-                previewUrl ? "" : "pointer-events-none opacity-30"
+                previewUrl ? '' : 'pointer-events-none opacity-30'
               }`}
             >
               <ExternalLink size={15} />
             </a>
-            <button
-              type="button"
-              onClick={refreshPreview}
-              title="刷新预览"
-              className="grid h-[30px] w-[30px] place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
-            >
-              <Refresh size={15} className={running ? "animate-spin" : ""} />
-            </button>
 
             <span className="mx-1 hidden h-4 w-px bg-line-6 lg:block" />
             <span className="hidden lg:block">
-              <PresenceAvatars size={28} />
+              <PresenceBar activeAgents={chattedAgents} size={28} />
             </span>
 
             <button
@@ -653,7 +664,7 @@ export default function Workspace({
               onClick={() => void share()}
               className="ml-1 flex h-[30px] items-center rounded-full border border-line-6 bg-white px-3 text-[13px] font-medium text-ink-95 transition hover:border-line-12"
             >
-              {shareCopied ? "已复制" : "分享"}
+              {shareCopied ? '已复制' : '分享'}
             </button>
             <button
               type="button"
@@ -662,44 +673,51 @@ export default function Workspace({
               title="刷新预览"
               className="flex h-[30px] items-center rounded-full bg-brand px-3 text-[13px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              更新
+              刷新预览
             </button>
           </div>
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <div style={{ width: chatWidth }} className="flex min-h-0 min-w-0 flex-none flex-col">
+        <div
+          style={chatOpen ? { width: chatWidth } : undefined}
+          className={`min-h-0 min-w-0 flex-none flex-col ${
+            chatOpen ? 'flex' : 'hidden'
+          }`}
+        >
           <ChatPanel
             groups={groups}
             running={running}
             error={error}
             onSend={(text) => void run(text)}
             onStop={() => abortRef.current?.abort()}
-            onOpenCode={() => setPane("code")}
+            onOpenCode={() => setPane('code')}
           />
         </div>
 
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="调整对话宽度"
-          data-dragging={dragging}
-          onPointerDown={startDrag}
-          className="splitter-handle flex-none"
-        />
+        {chatOpen ? (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="调整对话宽度"
+            data-dragging={dragging}
+            onPointerDown={startDrag}
+            className="splitter-handle flex-none"
+          />
+        ) : null}
 
-        {pane === "preview" ? (
+        {pane === 'preview' ? (
           <PreviewPane
             url={previewUrl}
             running={running}
             version={latestVersion}
             mode={mode}
             refreshKey={refreshKey}
-            onRefresh={refreshPreview}
           />
         ) : (
           <FilePanel
+            projectId={projectId}
             artifacts={artifacts}
             activeFile={activeFile}
             onSelect={setActiveFile}

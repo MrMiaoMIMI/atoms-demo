@@ -21,7 +21,8 @@
 - 生成物是按需的完整 Web 项目：`frontend`（Vite + React 18 + TS）、`fullstack`（前端 + FastAPI + SQLite）、`backend`（FastAPI + SQLite）；不针对每个项目执行 `npm install`，预览用共享 esbuild 打包
 - 每个生成项目拥有独立 SQLite：`apps/{id}/backend/data/app.db`，与 demo 的 `backend/data/atoms.db` 完全隔离；重写代码时保留该数据目录
 - 生成后端按项目启动独立 uvicorn 子进程（仅 127.0.0.1、随机端口、LRU 上限、内存上限）；环境变量裁剪，不泄露 demo 的 LLM Key
-- 一次生成请求返回单一 SSE 流，事件类型：`agent_start` / `execution` / `token` / `file_start` / `artifact` / `preview` / `message` / `agent_end` / `error` / `done`；事件带 `agent` + `run_id`，消息另带 `run_index`
+- 一次生成请求返回单一 SSE 流，事件类型：`project` / `agent_start` / `execution` / `token` / `file_start` / `artifact` / `preview` / `message` / `agent_end` / `error` / `done`；事件带 `agent` + `run_id`，消息另带 `run_index`
+- 项目名由后端在创建后后台生成：用一次轻量 LLM 调用把首条需求概括为 ≤24 字的名称；无 Key 或失败时回退到首句启发式；最终名称通过生成流的 `project` 事件回填前端
 - 多智能体用“单 LLM + 角色 prompt 路由”模拟，不真起多进程：Mike（团队领导）→ Bob（架构师）→ Alex（工程师）；构建请求按依赖顺序串行、尾部 `@` 交接，咨询请求由被 `@` 的角色并行回答；超时/循环用队列去重、单角色 2 次、整轮 5 次上限
 - 用户消息按 `@` 位置确定性切段，每个 Agent 只收到自己名下的问题文本；同一 Agent 的多个问题合并为一轮；分段不额外调用 LLM
 - 分段规则：未被 @ 的独立问题默认给 Mike；`请/麻烦/帮我` 等连接词附着到第一个被 @ 的角色；含 `你们/大家/两位/两个人/分别/各自/每个人` 的句子由所有被 @ 角色共同处理；每段再独立判断 build / consult
@@ -57,6 +58,7 @@ atoms-demo/
 │ ├── frontend_builder.py # 共享 esbuild 预览构建
 │ ├── runtime.py # 生成项目 uvicorn 进程管理（LRU/内存上限）
 │ ├── llm.py # 流式 LLM 调用
+│ ├── naming.py # 项目命名（LLM 概括 + 启发式回退）
 │ ├── db.py # demo SQLite 封装
 │ ├── mocks/ # Mock 模板（frontend/fullstack/backend + agents.py 角色回复）
 │ ├── runtime/frontend/ # 共享 React + esbuild 工具链（node_modules 不入库）

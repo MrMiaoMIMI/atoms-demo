@@ -19,6 +19,8 @@ class MockLLM:
         meta = meta or {}
         if role == "mike":
             text = agent_mocks.mike_reply(meta)
+        elif role == "title":
+            text = agent_mocks.title_reply(meta)
         elif role == "consult":
             text = agent_mocks.consult_reply(meta)
         elif role == "planner":
@@ -128,3 +130,26 @@ def get_llm():
     if _shared is None:
         _shared = DeepSeekLLM()
     return _shared
+
+
+async def complete(
+    *,
+    role: str,
+    system: str,
+    user: str,
+    meta: dict | None = None,
+    max_chars: int = 200,
+) -> str:
+    """Collect a short completion without streaming it to a client.
+
+    Used for lightweight side calls such as project naming; stops reading as
+    soon as ``max_chars`` arrived so a chatty model cannot stall creation.
+    """
+    parts: list[str] = []
+    size = 0
+    async for chunk in get_llm().stream(role=role, system=system, user=user, meta=meta):
+        parts.append(chunk)
+        size += len(chunk)
+        if size >= max_chars:
+            break
+    return "".join(parts)

@@ -3,9 +3,9 @@ import type { ProjectMode } from '../types';
 import {
   ApiIcon,
   AtomsMark,
-  ExternalLink,
+  ChevronLeft,
+  ChevronRight,
   Monitor,
-  Refresh,
   Smartphone,
   Spinner,
 } from './Icons';
@@ -16,7 +16,6 @@ interface Props {
   version: number;
   mode: ProjectMode;
   refreshKey: number;
-  onRefresh: () => void;
 }
 
 export default function PreviewPane({
@@ -25,9 +24,9 @@ export default function PreviewPane({
   version,
   mode,
   refreshKey,
-  onRefresh,
 }: Props) {
   const [device, setDevice] = useState<'desktop' | 'mobile'>('desktop');
+  const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
   const src = url
     ? `${url}${url.includes('?') ? '&' : '?'}r=${refreshKey}`
     : null;
@@ -73,7 +72,9 @@ export default function PreviewPane({
                   {running ? <Spinner size={22} /> : <AtomsMark size={24} />}
                 </span>
                 <p className="text-[14px] font-medium text-ink-95">
-                  {running ? 'Agent 正在构建你的应用…' : '应用会在这里实时运行'}
+                  {running
+                    ? 'Agent 正在构建你的应用…'
+                    : '应用会在这里实时运行'}
                 </p>
                 <p className="max-w-[320px] text-[12px] leading-[19px] text-ink-55">
                   {running
@@ -93,50 +94,55 @@ export default function PreviewPane({
         ) : null}
 
         {src ? (
-          <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-0.5 rounded-full border border-line-4 bg-white/95 p-1 shadow-float backdrop-blur">
-            <button
-              type="button"
-              onClick={() => setDevice('desktop')}
-              title="桌面预览"
-              className={`grid h-8 w-8 place-items-center rounded-full transition ${
-                device === 'desktop'
-                  ? 'bg-line-6 text-ink-95'
-                  : 'text-ink-55 hover:text-ink-80'
-              }`}
-            >
-              <Monitor size={16} />
-            </button>
-            <button
-              type="button"
-              onClick={() => setDevice('mobile')}
-              title="移动预览"
-              className={`grid h-8 w-8 place-items-center rounded-full transition ${
-                device === 'mobile'
-                  ? 'bg-line-6 text-ink-95'
-                  : 'text-ink-55 hover:text-ink-80'
-              }`}
-            >
-              <Smartphone size={16} />
-            </button>
-            <span className="mx-0.5 h-4 w-px bg-line-6" />
-            <button
-              type="button"
-              onClick={onRefresh}
-              title="刷新预览"
-              className="grid h-8 w-8 place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
-            >
-              <Refresh size={15} />
-            </button>
-            <a
-              href={url ?? '#'}
-              target="_blank"
-              rel="noreferrer"
-              title="在新标签页打开"
-              className="grid h-8 w-8 place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
-            >
-              <ExternalLink size={15} />
-            </a>
-          </div>
+          toolbarCollapsed ? (
+            <div className="absolute bottom-4 right-4 flex items-center rounded-full border border-line-4 bg-white/95 p-1 shadow-float backdrop-blur">
+              <button
+                type="button"
+                onClick={() => setToolbarCollapsed(false)}
+                title="展开工具栏"
+                aria-label="展开工具栏"
+                className="grid h-8 w-8 place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
+              >
+                <ChevronLeft size={16} />
+              </button>
+            </div>
+          ) : (
+            <div className="group/toolbar absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-0.5 rounded-full border border-line-4 bg-white/95 p-1 shadow-float backdrop-blur">
+              <button
+                type="button"
+                onClick={() => setDevice('desktop')}
+                title="桌面预览"
+                className={`grid h-8 w-8 place-items-center rounded-full transition ${
+                  device === 'desktop'
+                    ? 'bg-line-6 text-ink-95'
+                    : 'text-ink-55 hover:text-ink-80'
+                }`}
+              >
+                <Monitor size={16} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setDevice('mobile')}
+                title="移动预览"
+                className={`grid h-8 w-8 place-items-center rounded-full transition ${
+                  device === 'mobile'
+                    ? 'bg-line-6 text-ink-95'
+                    : 'text-ink-55 hover:text-ink-80'
+                }`}
+              >
+                <Smartphone size={16} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setToolbarCollapsed(true)}
+                title="最小化工具栏"
+                aria-label="最小化工具栏"
+                className="hidden h-8 w-8 place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95 group-focus-within/toolbar:grid group-hover/toolbar:grid"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </div>
+          )
         ) : null}
       </div>
     </section>

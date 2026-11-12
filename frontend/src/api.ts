@@ -24,17 +24,12 @@ export const api = {
   },
 
   createProject: async (prompt: string): Promise<Project> => {
-    const cleaned = prompt.replace(/@(?:mike|bob|alex)(?![A-Za-z0-9])/gi, "").trim();
-    const firstLine =
-      cleaned
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find(Boolean) ?? cleaned;
-    const name = firstLine.replace(/^[\s,，。.;；:：]+/, "").trim().slice(0, 24);
+    // The backend derives a short title from the full prompt (LLM-assisted,
+    // with a heuristic fallback) instead of truncating the first line here.
     const res = await fetch("/api/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, name: name || prompt.slice(0, 24) }),
+      body: JSON.stringify({ prompt }),
     });
     if (!res.ok) throw new Error(await readError(res));
     return (await res.json()) as Project;
@@ -45,6 +40,30 @@ export const api = {
   deleteProject: async (pid: string): Promise<void> => {
     const res = await fetch(`/api/projects/${pid}`, { method: "DELETE" });
     if (!res.ok) throw new Error(await readError(res));
+  },
+
+  exportProject: async (
+    pid: string
+  ): Promise<{ blob: Blob; filename: string }> => {
+    const res = await fetch(
+      `/api/projects/${encodeURIComponent(pid)}/export`
+    );
+    if (!res.ok) throw new Error(await readError(res));
+
+    const disposition = res.headers.get("content-disposition") ?? "";
+    const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+    const plain = /filename="?([^";]+)"?/i.exec(disposition);
+    let filename = `atoms-${pid}.zip`;
+    if (encoded?.[1]) {
+      try {
+        filename = decodeURIComponent(encoded[1]);
+      } catch {
+        // Keep the default name if the header is malformed.
+      }
+    } else if (plain?.[1]) {
+      filename = plain[1];
+    }
+    return { blob: await res.blob(), filename };
   },
 };
 

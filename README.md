@@ -60,7 +60,7 @@ apps/{project_id}/
  │                                        │    Bob:  形态 / 数据模型 / API / 文件清单
  │                                        │    Alex: 脚手架 / 代码 / 回修 / 预览 / 运行时
  │                                        └─ consult: 被 @ 的角色并行回答，不修改文件
- │◄────────── SSE: agent_start / execution / token / artifact / preview / message / agent_end / done
+ │◄────────── SSE: project / agent_start / execution / token / artifact / preview / message / agent_end / done
  │
  ├─ SQLite (WAL): projects / conversations(agent, run_id, run_index) / artifacts / executions(run_id)
  │
@@ -165,10 +165,11 @@ docker compose up -d --build
 | --- | --- | --- |
 | GET | `/api/health` | 健康检查，返回 LLM 模式与运行中的项目 |
 | GET | `/api/projects` | 项目列表（含 `mode`） |
-| POST | `/api/projects` | 创建项目 `{prompt?, name?}` |
+| POST | `/api/projects` | 创建项目 `{prompt?, name?}`；省略 `name` 时后台用 LLM 把首条需求概括为短名称 |
 | GET | `/api/projects/{id}` | 完整状态（对话、最新文件、执行记录、`mode`、`preview_url`） |
 | DELETE | `/api/projects/{id}` | 删除项目、生成物并停止其运行时 |
 | POST | `/api/projects/{id}/generate` | `{message}`，返回 SSE 流 |
+| GET | `/api/projects/{id}/export` | 下载最新源代码 ZIP 仓库包（`Content-Disposition: attachment`） |
 | GET | `/apps/{id}/` | 已发布项目预览 |
 | GET/POST/... | `/apps/{id}/api/*` | 代理到该项目自己的 FastAPI 后端 |
 | GET | `/apps/{id}/docs` | 生成项目的 Swagger 文档 |
@@ -177,6 +178,7 @@ SSE 事件：
 
 | event | payload |
 | --- | --- |
+| `project` | `{id, name}` 项目名（后台 LLM 概括首条需求后回填） |
 | `agent_start` | `{run_id, agent, name, role, index}` 某个智能体开始一轮 |
 | `execution` | `{id, run_id, agent, step, status, log}`，`status: running/success/warning/error` |
 | `token` | `{filename, delta, run_id}` 流式代码片段 |
