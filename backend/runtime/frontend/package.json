@@ -1,0 +1,13 @@
+{
+  "name": "atoms-preview-toolchain",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Shared toolchain used only to bundle generated React sources for the iframe preview.",
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2"
+  }
+}

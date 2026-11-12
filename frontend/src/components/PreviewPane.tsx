@@ -1,13 +1,21 @@
 import { useState } from "react";
+import type { ProjectMode } from "../types";
 import { ExternalLink, Refresh, Sparkle, Spinner } from "./Icons";
 
 interface Props {
   url: string | null;
   running: boolean;
   version: number;
+  mode: ProjectMode;
 }
 
-export default function PreviewPane({ url, running, version }: Props) {
+const MODE_LABEL: Record<ProjectMode, string> = {
+  frontend: "前端",
+  fullstack: "全栈",
+  backend: "API",
+};
+
+export default function PreviewPane({ url, running, version, mode }: Props) {
   const [nonce, setNonce] = useState(0);
   const src = url ? `${url}${url.includes("?") ? "&" : "?"}r=${nonce}` : null;
 
@@ -21,6 +29,9 @@ export default function PreviewPane({ url, running, version }: Props) {
             <i className="h-2 w-2 rounded-full bg-mint/70" />
           </span>
           <span className="text-xs font-semibold text-slate-300">实时预览</span>
+          <span className="flex-none rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[10px] text-accent-soft">
+            {MODE_LABEL[mode]}
+          </span>
           <span className="flex-none rounded-full border border-white/10 px-2 py-0.5 text-[10px] text-slate-500">
             v{version || 1}
           </span>
@@ -67,7 +78,8 @@ export default function PreviewPane({ url, running, version }: Props) {
               {running ? "Agent 正在构建你的应用…" : "应用会在这里实时运行"}
             </p>
             <p className="max-w-[280px] text-[11px] leading-relaxed text-slate-600">
-              在左侧描述需求，Planner、Coder、Reviewer、Deployer 依次执行，完成后自动加载预览。
+              在左侧描述需求，Planner 判断形态，Coder 生成前端/后端代码，Deployer
+              启动运行时后自动加载预览。
             </p>
           </div>
         )}

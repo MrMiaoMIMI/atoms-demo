@@ -1,5 +1,6 @@
 export type Role = "user" | "assistant";
 export type ExecutionStatus = "running" | "success" | "warning" | "error";
+export type ProjectMode = "frontend" | "fullstack" | "backend";
 
 export interface Conversation {
   id: number;
@@ -35,6 +36,8 @@ export interface ProjectState {
   conversations: Conversation[];
   artifacts: Artifact[];
   executions: Execution[];
+  mode: ProjectMode;
+  preview_url: string | null;
 }
 
 export interface ProjectSummary {
@@ -44,6 +47,9 @@ export interface ProjectSummary {
   message_count: number;
   artifact_count: number;
   latest_version: number | null;
+  mode?: ProjectMode;
+  has_frontend?: number;
+  has_backend?: number;
 }
 
 export interface Health {
@@ -51,4 +57,5 @@ export interface Health {
   llm_mode: "mock" | "deepseek";
   model: string;
   version: string;
+  running_apps?: Record<string, number>;
 }

@@ -1,58 +1,329 @@
-"""Pre-built static site templates used by MockLLM.
+"""Pre-built templates used by MockLLM.
 
-Each template is a flat multi-file site so the real and mock paths produce the
-same shape: index.html + styles.css + app.js.
+The mock path must produce exactly the same project shape as the real path:
+a Vite + React + TypeScript frontend (``frontend/src/App.tsx`` +
+``frontend/src/styles.css``) and, for full-stack requests, a FastAPI backend
+using the per-project SQLite file.
 """
+from __future__ import annotations
+
 import json
 import re
 
-TODO = {
-    "index.html": """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>__TITLE__</title>
-  <link rel="stylesheet" href="styles.css" />
-</head>
-<body>
-  <main class="app">
-    <header class="app__header">
-      <div>
-        <p class="eyebrow">TASK FLOW</p>
-        <h1>__TITLE__</h1>
-        <p class="subtitle">保持专注，一件一件完成。</p>
+TITLE_JSON = "__TITLE_JSON__"
+
+# ---------------------------------------------------------------------------
+# Mock planners
+# ---------------------------------------------------------------------------
+
+FRONTEND_ONLY = ("落地页", "官网", "展示页", "宣传页", "纯前端", "不要后端", "去掉后端", "只做前端", "只要前端")
+BACKEND_ONLY = ("只做后端", "只要后端", "纯后端", "只写后端", "只写api", "只提供api", "api服务", "后端服务", "没有前端", "不要前端")
+FULLSTACK_KEYS = (
+    "持久化",
+    "数据库",
+    "sqlite",
+    "保存",
+    "存储",
+    "增删改查",
+    "crud",
+    "后端",
+    "api",
+    "登录",
+    "注册",
+    "用户系统",
+    "订单",
+    "记账",
+    "留言",
+    "评论",
+    "投票",
+    "表单提交",
+    "数据管理",
+)
+
+
+def pick_mode(prompt: str, existing_mode: str | None = None) -> str:
+    p = prompt.lower()
+    if any(key in p for key in FRONTEND_ONLY):
+        return "frontend"
+    if any(key in p for key in BACKEND_ONLY):
+        return "backend"
+    upgrade = any(key in p for key in FULLSTACK_KEYS)
+    if existing_mode == "fullstack":
+        return "fullstack"
+    if upgrade:
+        return "fullstack"
+    return existing_mode or "frontend"
+
+
+def _todo_entity() -> dict:
+    return {
+        "table": "todos",
+        "fields": [
+            {"name": "id", "type": "INTEGER", "primary_key": True, "autoincrement": True},
+            {"name": "title", "type": "TEXT", "not_null": True},
+            {"name": "done", "type": "INTEGER", "not_null": True, "default": 0},
+        ],
+    }
+
+
+def _notes_entity() -> dict:
+    return {
+        "table": "notes",
+        "fields": [
+            {"name": "id", "type": "INTEGER", "primary_key": True, "autoincrement": True},
+            {"name": "content", "type": "TEXT", "not_null": True},
+        ],
+    }
+
+
+def entities_for(mode: str, prompt: str) -> list[dict]:
+    if mode == "frontend":
+        return []
+    p = prompt.lower()
+    if any(key in p for key in ("笔记", "留言", "note", "备忘")):
+        return [_notes_entity()]
+    if mode == "backend":
+        return [_notes_entity()]
+    return [_todo_entity()]
+
+
+def api_for(mode: str, entities: list[dict]) -> list[dict]:
+    if mode == "frontend":
+        return []
+    table = entities[0]["table"] if entities else "items"
+    return [
+        {"method": "GET", "path": f"/api/{table}", "description": f"获取 {table} 列表"},
+        {"method": "POST", "path": f"/api/{table}", "description": f"新增一条 {table} 记录"},
+        {"method": "PUT", "path": f"/api/{table}/{{id}}", "description": f"更新 {table} 记录"},
+        {"method": "DELETE", "path": f"/api/{table}/{{id}}", "description": f"删除 {table} 记录"},
+        {"method": "GET", "path": "/api/health", "description": "健康检查"},
+    ]
+
+
+def mock_plan(
+    prompt: str,
+    existing: dict[str, str] | None = None,
+    existing_mode: str | None = None,
+) -> str:
+    mode = pick_mode(prompt, existing_mode)
+    entities = entities_for(mode, prompt)
+    api = api_for(mode, entities)
+    files: list[dict] = []
+    if mode in ("frontend", "fullstack"):
+        files += [
+            {"path": "frontend/src/App.tsx", "purpose": "根组件与页面交互"},
+            {"path": "frontend/src/styles.css", "purpose": "视觉样式与响应式布局"},
+        ]
+    if mode in ("backend", "fullstack"):
+        files.append({"path": "backend/main.py", "purpose": "FastAPI 路由与 SQLite 读写"})
+    label = {"frontend": "纯前端应用", "fullstack": "前后端一体应用", "backend": "纯后端 API"}[mode]
+    plan = {
+        "summary": f"基于「{prompt.strip()[:40]}」生成一个{label}（Mock 模板）。",
+        "title": extract_title(prompt, mode),
+        "mode": mode,
+        "reason": "根据需求中的持久化 / 后端关键词判断",
+        "entities": entities,
+        "api": api,
+        "files": files,
+    }
+    return json.dumps(plan, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Mock app sources
+# ---------------------------------------------------------------------------
+
+FULLSTACK_TODO_APP = """import { useEffect, useMemo, useState } from "react";
+import type { FormEvent } from "react";
+
+interface Todo {
+  id: number;
+  title: string;
+  done: number;
+  created_at: string;
+}
+
+const BRAND = __TITLE_JSON__;
+
+type Filter = "all" | "active" | "done";
+
+export default function App() {
+  const [todos, setTodos] = useState<Todo[]>([]);
+  const [draft, setDraft] = useState("");
+  const [filter, setFilter] = useState<Filter>("all");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function request(path: string, init?: RequestInit) {
+    const res = await fetch(path, init);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(body || "请求失败 (" + res.status + ")");
+    }
+    return res;
+  }
+
+  async function load() {
+    try {
+      const res = await request("api/todos");
+      setTodos(await res.json());
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  async function add(event: FormEvent) {
+    event.preventDefault();
+    const title = draft.trim();
+    if (!title || busy) return;
+    setBusy(true);
+    try {
+      const res = await request("api/todos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      const created = (await res.json()) as Todo;
+      setTodos((prev) => [created, ...prev]);
+      setDraft("");
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "添加失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggle(todo: Todo) {
+    try {
+      const res = await request("api/todos/" + todo.id, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ done: todo.done ? 0 : 1 }),
+      });
+      const updated = (await res.json()) as Todo;
+      setTodos((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新失败");
+    }
+  }
+
+  async function remove(todo: Todo) {
+    try {
+      await request("api/todos/" + todo.id, { method: "DELETE" });
+      setTodos((prev) => prev.filter((item) => item.id !== todo.id));
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除失败");
+    }
+  }
+
+  const visible = useMemo(() => {
+    if (filter === "active") return todos.filter((todo) => !todo.done);
+    if (filter === "done") return todos.filter((todo) => todo.done);
+    return todos;
+  }, [filter, todos]);
+
+  const done = todos.filter((todo) => todo.done).length;
+  const percent = todos.length ? Math.round((done / todos.length) * 100) : 0;
+
+  return (
+    <main className="app">
+      <header className="app__header">
+        <div>
+          <p className="eyebrow">SQLITE PERSISTED</p>
+          <h1>{BRAND}</h1>
+          <p className="subtitle">任务保存在项目自带的 SQLite 中，刷新或重启都不会丢失。</p>
+        </div>
+        <div className="progress">
+          <div className="progress__bar">
+            <span style={{ width: percent + "%" }} />
+          </div>
+          <strong>{percent}%</strong>
+        </div>
+      </header>
+
+      <form className="composer" onSubmit={add}>
+        <input
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          placeholder="添加一个新任务…"
+          maxLength={120}
+          autoComplete="off"
+        />
+        <button type="submit" disabled={busy}>
+          {busy ? "添加中…" : "添加"}
+        </button>
+      </form>
+
+      <div className="toolbar">
+        <div className="filters">
+          {(["all", "active", "done"] as Filter[]).map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={"filter" + (filter === item ? " is-active" : "")}
+              onClick={() => setFilter(item)}
+            >
+              {item === "all" ? "全部" : item === "active" ? "进行中" : "已完成"}
+            </button>
+          ))}
+        </div>
+        <span className="count">
+          {done} / {todos.length} 已完成
+        </span>
       </div>
-      <div class="ring" id="ring"><span id="ringText">0%</span></div>
-    </header>
 
-    <form class="composer" id="composer">
-      <input id="todoInput" type="text" placeholder="添加一个新任务…" autocomplete="off" maxlength="80" />
-      <button type="submit">添加</button>
-    </form>
+      {error ? <p className="error">{error}</p> : null}
+      {loading ? (
+        <p className="empty">正在从 SQLite 加载…</p>
+      ) : visible.length === 0 ? (
+        <p className="empty">这里还没有任务，先添加一个吧。</p>
+      ) : (
+        <ul className="list">
+          {visible.map((todo) => (
+            <li key={todo.id} className={"todo" + (todo.done ? " is-done" : "")}>
+              <button
+                type="button"
+                className="todo__check"
+                aria-label="切换完成"
+                onClick={() => void toggle(todo)}
+              />
+              <span className="todo__text">{todo.title}</span>
+              <button
+                type="button"
+                className="todo__delete"
+                aria-label="删除"
+                onClick={() => void remove(todo)}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
 
-    <div class="toolbar">
-      <div class="filters" id="filters">
-        <button class="filter is-active" data-filter="all" type="button">全部</button>
-        <button class="filter" data-filter="active" type="button">进行中</button>
-        <button class="filter" data-filter="done" type="button">已完成</button>
-      </div>
-      <span class="count" id="count"></span>
-    </div>
+      <footer className="app__footer">
+        <span>FastAPI + SQLite · backend/data/app.db</span>
+        <button type="button" className="clear" onClick={() => void load()}>
+          重新加载
+        </button>
+      </footer>
+    </main>
+  );
+}
+"""
 
-    <ul class="list" id="list"></ul>
-    <p class="empty" id="empty" hidden>这里还没有任务，先添加一个吧。</p>
-
-    <footer class="app__footer">
-      <span>双击任务文字可以编辑</span>
-      <button class="clear" id="clearDone" type="button">清除已完成</button>
-    </footer>
-  </main>
-  <script src="app.js"></script>
-</body>
-</html>
-""",
-    "styles.css": """* { box-sizing: border-box; }
+FULLSTACK_TODO_CSS = """* { box-sizing: border-box; }
 
 body {
   margin: 0;
@@ -83,21 +354,10 @@ body {
 h1 { margin: 0; font-size: clamp(24px, 4vw, 32px); letter-spacing: -.02em; }
 .subtitle { margin: 8px 0 0; color: #8f98b3; font-size: 14px; }
 
-.ring {
-  --p: 0;
-  flex: none;
-  width: 74px;
-  height: 74px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  font-size: 13px;
-  font-weight: 700;
-  background: conic-gradient(#6c8cff calc(var(--p) * 1%), rgba(255, 255, 255, .08) 0);
-  position: relative;
-}
-.ring::before { content: ""; position: absolute; inset: 6px; border-radius: 50%; background: #101731; }
-.ring span { position: relative; z-index: 1; }
+.progress { flex: none; width: 104px; display: grid; gap: 8px; justify-items: end; }
+.progress__bar { width: 100%; height: 8px; border-radius: 999px; background: rgba(255, 255, 255, .08); overflow: hidden; }
+.progress__bar span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #6c8cff, #38e1c6); transition: width .35s ease; }
+.progress strong { font-size: 13px; color: #aab4cf; }
 
 .composer { display: flex; gap: 10px; margin: 28px 0 22px; }
 .composer input {
@@ -127,6 +387,7 @@ h1 { margin: 0; font-size: clamp(24px, 4vw, 32px); letter-spacing: -.02em; }
   transition: transform .15s, box-shadow .2s;
 }
 .composer button:hover { transform: translateY(-1px); box-shadow: 0 14px 30px rgba(108, 140, 255, .45); }
+.composer button:disabled { opacity: .6; cursor: wait; }
 
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .filters { display: flex; gap: 6px; padding: 4px; border-radius: 12px; background: rgba(255, 255, 255, .04); }
@@ -143,6 +404,16 @@ h1 { margin: 0; font-size: clamp(24px, 4vw, 32px); letter-spacing: -.02em; }
 .filter:hover { color: #d7ddf0; }
 .filter.is-active { color: #0a0f1f; background: #e9edf9; font-weight: 600; }
 .count { font-size: 12px; color: #737d99; }
+
+.error {
+  margin: 16px 0 0;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: #ffc2cb;
+  border: 1px solid rgba(255, 107, 129, .3);
+  border-radius: 10px;
+  background: rgba(255, 107, 129, .1);
+}
 
 .list { list-style: none; margin: 18px 0 0; padding: 0; display: grid; gap: 9px; }
 .todo {
@@ -183,19 +454,8 @@ h1 { margin: 0; font-size: clamp(24px, 4vw, 32px); letter-spacing: -.02em; }
 .todo.is-done .todo__check { background: #38e1c6; border-color: #38e1c6; }
 .todo.is-done .todo__check::after { transform: rotate(42deg) scale(1); }
 
-.todo__text { flex: 1; font-size: 15px; line-height: 1.45; word-break: break-word; cursor: default; }
+.todo__text { flex: 1; font-size: 15px; line-height: 1.45; word-break: break-word; }
 .todo.is-done .todo__text { color: #66708c; text-decoration: line-through; }
-
-.todo__edit {
-  flex: 1;
-  padding: 6px 8px;
-  font: inherit;
-  color: inherit;
-  background: rgba(8, 13, 28, .9);
-  border: 1px solid #6c8cff;
-  border-radius: 8px;
-  outline: none;
-}
 
 .todo__delete {
   flex: none;
@@ -233,259 +493,318 @@ h1 { margin: 0; font-size: clamp(24px, 4vw, 32px); letter-spacing: -.02em; }
 
 @media (max-width: 560px) {
   .app { padding: 24px 20px; border-radius: 20px; }
-  .app__header { flex-direction: column-reverse; align-items: flex-start; }
-  .ring { width: 60px; height: 60px; }
+  .app__header { flex-direction: column; align-items: stretch; }
+  .progress { width: 100%; justify-items: stretch; }
+  .composer { flex-direction: column; }
+  .composer button { padding: 12px; }
 }
-""",
-    "app.js": """const state = {
-  filter: "all",
-  todos: [
-    { id: "1", text: "梳理今天最重要的三件事", done: true },
-    { id: "2", text: "完成 Atoms Demo 的生成链路", done: false },
-    { id: "3", text: "部署到服务器并截图验收", done: false },
-  ],
-};
+"""
 
-const els = {
-  list: document.getElementById("list"),
-  empty: document.getElementById("empty"),
-  composer: document.getElementById("composer"),
-  input: document.getElementById("todoInput"),
-  filters: document.getElementById("filters"),
-  count: document.getElementById("count"),
-  ring: document.getElementById("ring"),
-  ringText: document.getElementById("ringText"),
-  clearDone: document.getElementById("clearDone"),
-};
+FULLSTACK_TODO_BACKEND = '''import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-function uid() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-}
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-function escapeHtml(value) {
-  return value.replace(/[&<>"']/g, function (ch) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
-  });
-}
+from db import connection, init_db
 
-function visibleTodos() {
-  if (state.filter === "active") return state.todos.filter(function (t) { return !t.done; });
-  if (state.filter === "done") return state.todos.filter(function (t) { return t.done; });
-  return state.todos;
-}
+TITLE = __TITLE_PY__
 
-function render() {
-  const items = visibleTodos();
-  els.list.innerHTML = items
-    .map(function (todo) {
-      return (
-        '<li class="todo ' + (todo.done ? "is-done" : "") + '" data-id="' + todo.id + '">' +
-          '<button class="todo__check" data-action="toggle" aria-label="切换完成"></button>' +
-          '<span class="todo__text" data-action="edit">' + escapeHtml(todo.text) + "</span>" +
-          '<button class="todo__delete" data-action="delete" aria-label="删除">×</button>' +
-        "</li>"
-      );
-    })
-    .join("");
 
-  els.empty.hidden = state.todos.length > 0;
-  const done = state.todos.filter(function (t) { return t.done; }).length;
-  const total = state.todos.length;
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  els.count.textContent = done + " / " + total + " 已完成";
-  els.ringText.textContent = pct + "%";
-  els.ring.style.setProperty("--p", String(pct));
-}
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-function addTodo(text) {
-  const value = text.trim();
-  if (!value) return;
-  state.todos.unshift({ id: uid(), text: value, done: false });
-  els.input.value = "";
-  render();
-}
 
-function startEdit(id) {
-  const item = els.list.querySelector('[data-id="' + id + '"]');
-  if (!item) return;
-  const todo = state.todos.find(function (t) { return t.id === id; });
-  const label = item.querySelector(".todo__text");
-  const input = document.createElement("input");
-  input.className = "todo__edit";
-  input.value = todo.text;
-  input.maxLength = 80;
-  label.replaceWith(input);
-  input.focus();
-  input.select();
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await init_db()
+    yield
 
-  let finished = false;
-  function commit(save) {
-    if (finished) return;
-    finished = true;
-    if (save) {
-      const next = input.value.trim();
-      if (next) todo.text = next;
-    }
-    render();
-  }
-  input.addEventListener("blur", function () { commit(true); });
-  input.addEventListener("keydown", function (event) {
-    if (event.key === "Enter") commit(true);
-    if (event.key === "Escape") commit(false);
-  });
-}
 
-els.composer.addEventListener("submit", function (event) {
-  event.preventDefault();
-  addTodo(els.input.value);
-});
+app = FastAPI(title=TITLE, root_path=os.getenv("APP_ROOT_PATH", ""), lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-els.filters.addEventListener("click", function (event) {
-  const button = event.target.closest("[data-filter]");
-  if (!button) return;
-  state.filter = button.dataset.filter;
-  els.filters.querySelectorAll(".filter").forEach(function (el) {
-    el.classList.toggle("is-active", el === button);
-  });
-  render();
-});
 
-els.list.addEventListener("click", function (event) {
-  const action = event.target.closest("[data-action]");
-  if (!action) return;
-  const item = event.target.closest("[data-id]");
-  if (!item) return;
-  const id = item.dataset.id;
-  if (action.dataset.action === "toggle") {
-    const todo = state.todos.find(function (t) { return t.id === id; });
-    if (todo) todo.done = !todo.done;
-    render();
-  }
-  if (action.dataset.action === "delete") {
-    state.todos = state.todos.filter(function (t) { return t.id !== id; });
-    render();
-  }
-});
+class TodoIn(BaseModel):
+    title: str
 
-els.list.addEventListener("dblclick", function (event) {
-  const target = event.target.closest('[data-action="edit"]');
-  if (!target) return;
-  const item = target.closest("[data-id]");
-  if (item) startEdit(item.dataset.id);
-});
 
-els.clearDone.addEventListener("click", function () {
-  state.todos = state.todos.filter(function (t) { return !t.done; });
-  render();
-});
+class TodoPatch(BaseModel):
+    title: str | None = None
+    done: int | None = None
 
-render();
-""",
-}
 
-LANDING = {
-    "index.html": """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>__TITLE__</title>
-  <link rel="stylesheet" href="styles.css" />
-</head>
-<body>
-  <div class="glow glow--a"></div>
-  <div class="glow glow--b"></div>
+@app.get("/api/health")
+async def health() -> dict:
+    return {"ok": True, "service": "todos", "database": "sqlite"}
 
-  <header class="nav">
-    <a class="brand" href="#top">
-      <span class="brand__mark">◆</span>
-      <span>__TITLE__</span>
-    </a>
-    <nav class="nav__links">
-      <a href="#features">特性</a>
-      <a href="#showcase">案例</a>
-      <a href="#cta">开始</a>
-    </nav>
-    <a class="nav__cta" href="#cta">免费试用</a>
-  </header>
 
-  <main id="top">
-    <section class="hero">
-      <p class="pill">全新 2.0 版本 · 由 AI 驱动</p>
-      <h1>把想法，<span class="grad">变成产品</span>。</h1>
-      <p class="hero__desc">
-        从一句话描述到可上线的网页应用，自动完成规划、编码与部署。
-        无需样板代码，无需等待。
-      </p>
-      <div class="hero__actions">
-        <a class="btn btn--primary" href="#cta">立即开始 <span>→</span></a>
-        <a class="btn btn--ghost" href="#features">看看能做什么</a>
-      </div>
-      <div class="stats">
-        <div class="stat"><strong data-count="128">0</strong><span>个项目已上线</span></div>
-        <div class="stat"><strong data-count="96">0</strong><span>% 用户满意度</span></div>
-        <div class="stat"><strong data-count="43">0</strong><span>秒平均生成时间</span></div>
-      </div>
-    </section>
+@app.get("/api/todos")
+async def list_todos() -> list[dict]:
+    async with connection() as conn:
+        cur = await conn.execute(
+            "SELECT id, title, done, created_at FROM todos ORDER BY id DESC"
+        )
+        return [dict(row) for row in await cur.fetchall()]
 
-    <section class="features" id="features">
-      <p class="section__eyebrow">FEATURES</p>
-      <h2>从灵感到上线，只需要一步</h2>
-      <div class="grid">
-        <article class="card reveal">
-          <div class="card__icon">✦</div>
-          <h3>自然语言生成</h3>
-          <p>描述你的需求，Planner 自动拆解页面结构与交互，不再从空白文件开始。</p>
-        </article>
-        <article class="card reveal">
-          <div class="card__icon">◈</div>
-          <h3>实时预览</h3>
-          <p>代码生成的同时即可预览，随时对话修改，所见即所得。</p>
-        </article>
-        <article class="card reveal">
-          <div class="card__icon">◇</div>
-          <h3>一键部署</h3>
-          <p>生成完成即拥有独立访问地址，分享给任何人即可查看。</p>
-        </article>
-      </div>
-    </section>
 
-    <section class="showcase" id="showcase">
-      <div class="showcase__copy">
-        <p class="section__eyebrow">SHOWCASE</p>
-        <h2>一个下午，上线三个产品</h2>
-        <p>落地页、数据看板、内部工具——用同一套工作流快速验证你的想法。</p>
-        <a class="btn btn--primary" href="#cta">创建你的第一个项目 <span>→</span></a>
-      </div>
-      <div class="showcase__mock">
-        <div class="mock__bar"><i></i><i></i><i></i></div>
-        <div class="mock__body">
-          <div class="mock__side"></div>
-          <div class="mock__main">
-            <div class="mock__line mock__line--lg"></div>
-            <div class="mock__line"></div>
-            <div class="mock__cards"><span></span><span></span><span></span></div>
+@app.post("/api/todos", status_code=201)
+async def create_todo(payload: TodoIn) -> dict:
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title 不能为空")
+    async with connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO todos (title, done, created_at) VALUES (?, 0, ?)",
+            (title, now()),
+        )
+        await conn.commit()
+        row = await (
+            await conn.execute(
+                "SELECT id, title, done, created_at FROM todos WHERE id = ?",
+                (cur.lastrowid,),
+            )
+        ).fetchone()
+        return dict(row)
+
+
+@app.put("/api/todos/{todo_id}")
+async def update_todo(todo_id: int, payload: TodoPatch) -> dict:
+    async with connection() as conn:
+        row = await (
+            await conn.execute("SELECT id, title, done FROM todos WHERE id = ?", (todo_id,))
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        title = payload.title.strip() if payload.title is not None else row["title"]
+        done = int(payload.done) if payload.done is not None else row["done"]
+        await conn.execute(
+            "UPDATE todos SET title = ?, done = ? WHERE id = ?", (title, done, todo_id)
+        )
+        await conn.commit()
+        updated = await (
+            await conn.execute(
+                "SELECT id, title, done, created_at FROM todos WHERE id = ?", (todo_id,)
+            )
+        ).fetchone()
+        return dict(updated)
+
+
+@app.delete("/api/todos/{todo_id}")
+async def delete_todo(todo_id: int) -> dict:
+    async with connection() as conn:
+        cur = await conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+        await conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="任务不存在")
+    return {"ok": True}
+'''
+
+NOTES_BACKEND = '''import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from db import connection, init_db
+
+TITLE = __TITLE_PY__
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(title=TITLE, root_path=os.getenv("APP_ROOT_PATH", ""), lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class NoteIn(BaseModel):
+    content: str
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    return {"ok": True, "service": "notes", "database": "sqlite"}
+
+
+@app.get("/api/notes")
+async def list_notes() -> list[dict]:
+    async with connection() as conn:
+        cur = await conn.execute(
+            "SELECT id, content, created_at FROM notes ORDER BY id DESC"
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+@app.post("/api/notes", status_code=201)
+async def create_note(payload: NoteIn) -> dict:
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    async with connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO notes (content, created_at) VALUES (?, ?)", (content, now())
+        )
+        await conn.commit()
+        row = await (
+            await conn.execute(
+                "SELECT id, content, created_at FROM notes WHERE id = ?", (cur.lastrowid,)
+            )
+        ).fetchone()
+        return dict(row)
+
+
+@app.delete("/api/notes/{note_id}")
+async def delete_note(note_id: int) -> dict:
+    async with connection() as conn:
+        cur = await conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        await conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="记录不存在")
+    return {"ok": True}
+'''
+
+LANDING_APP = """import { useEffect, useState } from "react";
+
+const BRAND = __TITLE_JSON__;
+
+const FEATURES = [
+  { icon: "✦", title: "自然语言生成", body: "描述你的需求，自动拆解页面结构与交互，不必从空白文件开始。" },
+  { icon: "◈", title: "实时预览", body: "生成的同时即可预览，随时对话修改，所见即所得。" },
+  { icon: "◇", title: "一键上线", body: "生成完成即拥有独立访问地址，分享给任何人即可查看。" },
+];
+
+const STATS = [
+  { value: 128, label: "个项目已上线" },
+  { value: 96, label: "% 用户满意度" },
+  { value: 43, label: "秒平均生成时间" },
+];
+
+export default function App() {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setVisible(true), 60);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  return (
+    <div className="page">
+      <div className="glow glow--a" />
+      <div className="glow glow--b" />
+
+      <header className="nav">
+        <a className="brand" href="#top">
+          <span className="brand__mark">◆</span>
+          <span>{BRAND}</span>
+        </a>
+        <nav className="nav__links">
+          <a href="#features">特性</a>
+          <a href="#showcase">案例</a>
+          <a href="#cta">开始</a>
+        </nav>
+        <a className="nav__cta" href="#cta">免费试用</a>
+      </header>
+
+      <main id="top">
+        <section className={"hero" + (visible ? " is-visible" : "")}>
+          <p className="pill">全新 2.0 版本 · 由 AI 驱动</p>
+          <h1>
+            把想法，<span className="grad">变成产品</span>。
+          </h1>
+          <p className="hero__desc">
+            从一句话描述到可上线的网页应用，自动完成规划、编码与发布。无需样板代码，无需等待。
+          </p>
+          <div className="hero__actions">
+            <a className="btn btn--primary" href="#cta">立即开始 <span>→</span></a>
+            <a className="btn btn--ghost" href="#features">看看能做什么</a>
           </div>
-        </div>
-      </div>
-    </section>
+          <div className="stats">
+            {STATS.map((stat) => (
+              <div className="stat" key={stat.label}>
+                <strong>{stat.value}</strong>
+                <span>{stat.label}</span>
+              </div>
+            ))}
+          </div>
+        </section>
 
-    <section class="cta" id="cta">
-      <h2>准备好构建你的下一个产品了吗？</h2>
-      <p>打开页面即可使用，无需注册。</p>
-      <a class="btn btn--primary" href="#top">开始构建 <span>→</span></a>
-    </section>
-  </main>
+        <section className="features" id="features">
+          <p className="section__eyebrow">FEATURES</p>
+          <h2>从灵感到上线，只需要一步</h2>
+          <div className="grid">
+            {FEATURES.map((feature, index) => (
+              <article
+                className={"card" + (visible ? " is-visible" : "")}
+                style={{ transitionDelay: index * 90 + "ms" }}
+                key={feature.title}
+              >
+                <div className="card__icon">{feature.icon}</div>
+                <h3>{feature.title}</h3>
+                <p>{feature.body}</p>
+              </article>
+            ))}
+          </div>
+        </section>
 
-  <footer class="footer">
-    <span>© 2026 __TITLE__</span>
-    <span>Built with Atoms Demo</span>
-  </footer>
-  <script src="app.js"></script>
-</body>
-</html>
-""",
-    "styles.css": """* { box-sizing: border-box; }
+        <section className="showcase" id="showcase">
+          <div className="showcase__copy">
+            <p className="section__eyebrow">SHOWCASE</p>
+            <h2>一个下午，上线三个产品</h2>
+            <p>落地页、数据看板、内部工具——用同一套工作流快速验证你的想法。</p>
+            <a className="btn btn--primary" href="#cta">创建你的第一个项目 <span>→</span></a>
+          </div>
+          <div className="showcase__mock">
+            <div className="mock__bar"><i /><i /><i /></div>
+            <div className="mock__body">
+              <div className="mock__side" />
+              <div className="mock__main">
+                <div className="mock__line mock__line--lg" />
+                <div className="mock__line" />
+                <div className="mock__cards"><span /><span /><span /></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="cta" id="cta">
+          <h2>准备好构建你的下一个产品了吗？</h2>
+          <p>打开页面即可使用，无需注册。</p>
+          <a className="btn btn--primary" href="#top">开始构建 <span>→</span></a>
+        </section>
+      </main>
+
+      <footer className="footer">
+        <span>© 2026 {BRAND}</span>
+        <span>Built with Atoms Demo</span>
+      </footer>
+    </div>
+  );
+}
+"""
+
+LANDING_CSS = """* { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 
 body {
@@ -497,6 +816,7 @@ body {
 }
 
 a { color: inherit; text-decoration: none; }
+.page { position: relative; min-height: 100vh; }
 
 .glow { position: fixed; border-radius: 50%; filter: blur(120px); pointer-events: none; z-index: 0; }
 .glow--a { width: 520px; height: 520px; top: -180px; left: -120px; background: rgba(108, 140, 255, .32); }
@@ -531,7 +851,8 @@ a { color: inherit; text-decoration: none; }
 
 main { position: relative; z-index: 1; padding: 0 clamp(20px, 5vw, 72px); }
 
-.hero { max-width: 920px; margin: 0 auto; padding: clamp(70px, 12vw, 130px) 0 90px; text-align: center; }
+.hero { max-width: 920px; margin: 0 auto; padding: clamp(70px, 12vw, 130px) 0 90px; text-align: center; opacity: 0; transform: translateY(14px); transition: opacity .6s ease, transform .6s ease; }
+.hero.is-visible { opacity: 1; transform: none; }
 .pill {
   display: inline-block;
   margin: 0 0 26px;
@@ -599,9 +920,12 @@ section > p { color: #98a2bd; line-height: 1.7; }
   border: 1px solid rgba(255, 255, 255, .08);
   border-radius: 20px;
   background: linear-gradient(180deg, rgba(255, 255, 255, .05), rgba(255, 255, 255, .015));
-  transition: transform .25s, border-color .25s;
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity .55s ease, transform .55s ease, border-color .25s;
 }
-.card:hover { transform: translateY(-4px); border-color: rgba(108, 140, 255, .4); }
+.card.is-visible { opacity: 1; transform: none; }
+.card:hover { border-color: rgba(108, 140, 255, .4); }
 .card__icon {
   width: 42px;
   height: 42px;
@@ -665,413 +989,18 @@ section > p { color: #98a2bd; line-height: 1.7; }
   border-top: 1px solid rgba(255, 255, 255, .06);
 }
 
-.reveal { opacity: 0; transform: translateY(18px); transition: opacity .6s ease, transform .6s ease; }
-.reveal.is-visible { opacity: 1; transform: none; }
-
 @media (max-width: 820px) {
   .nav__links { display: none; }
   .showcase { grid-template-columns: 1fr; }
   .showcase__mock { transform: none; }
+  section { padding: 56px 0; }
 }
-""",
-    "app.js": """const counters = document.querySelectorAll("[data-count]");
-
-const counterObserver = new IntersectionObserver(function (entries) {
-  entries.forEach(function (entry) {
-    if (!entry.isIntersecting) return;
-    const el = entry.target;
-    const target = Number(el.dataset.count || 0);
-    counterObserver.unobserve(el);
-    const start = performance.now();
-    const duration = 1100;
-
-    function tick(now) {
-      const progress = Math.min((now - start) / duration, 1);
-      const eased = 1 - Math.pow(1 - progress, 3);
-      el.textContent = String(Math.round(target * eased));
-      if (progress < 1) requestAnimationFrame(tick);
-    }
-    requestAnimationFrame(tick);
-  });
-}, { threshold: 0.5 });
-
-counters.forEach(function (el) { counterObserver.observe(el); });
-
-const revealObserver = new IntersectionObserver(function (entries) {
-  entries.forEach(function (entry) {
-    if (entry.isIntersecting) {
-      entry.target.classList.add("is-visible");
-      revealObserver.unobserve(entry.target);
-    }
-  });
-}, { threshold: 0.15 });
-
-document.querySelectorAll(".reveal").forEach(function (el, index) {
-  el.style.transitionDelay = index * 90 + "ms";
-  revealObserver.observe(el);
-});
-
-const nav = document.querySelector(".nav");
-window.addEventListener("scroll", function () {
-  nav.style.borderBottomColor = window.scrollY > 20
-    ? "rgba(255, 255, 255, .12)"
-    : "rgba(255, 255, 255, .06)";
-}, { passive: true });
-""",
-}
-
-DASHBOARD = {
-    "index.html": """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>__TITLE__</title>
-  <link rel="stylesheet" href="styles.css" />
-</head>
-<body>
-  <div class="shell">
-    <aside class="sidebar">
-      <div class="brand"><span>◆</span> __TITLE__</div>
-      <nav class="menu">
-        <a class="menu__item is-active" href="#">概览</a>
-        <a class="menu__item" href="#">流量</a>
-        <a class="menu__item" href="#">转化</a>
-        <a class="menu__item" href="#">用户</a>
-        <a class="menu__item" href="#">设置</a>
-      </nav>
-      <div class="sidebar__foot">
-        <div class="avatar">AI</div>
-        <div><strong>Atoms Demo</strong><span>管理员</span></div>
-      </div>
-    </aside>
-
-    <main class="main">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">OVERVIEW</p>
-          <h1>数据概览</h1>
-        </div>
-        <div class="range" id="range">
-          <button class="is-active" data-range="7" type="button">近 7 天</button>
-          <button data-range="30" type="button">近 30 天</button>
-        </div>
-      </header>
-
-      <section class="kpis" id="kpis"></section>
-
-      <section class="panels">
-        <article class="panel panel--chart">
-          <div class="panel__head">
-            <div><h2>访问趋势</h2><p>按天统计的页面浏览量</p></div>
-            <span class="badge" id="trendBadge">+0%</span>
-          </div>
-          <div class="chart" id="chart"></div>
-        </article>
-
-        <article class="panel">
-          <div class="panel__head"><div><h2>来源分布</h2><p>流量渠道占比</p></div></div>
-          <div class="donut" id="donut"><span id="donutText">0%</span></div>
-          <ul class="legend" id="legend"></ul>
-        </article>
-      </section>
-
-      <section class="panel">
-        <div class="panel__head"><div><h2>最近活动</h2><p>系统实时事件</p></div><button class="ghost" id="refresh" type="button">刷新</button></div>
-        <ul class="activity" id="activity"></ul>
-      </section>
-    </main>
-  </div>
-  <script src="app.js"></script>
-</body>
-</html>
-""",
-    "styles.css": """* { box-sizing: border-box; }
-
-body {
-  margin: 0;
-  min-height: 100vh;
-  color: #e8edf9;
-  font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  background:
-    radial-gradient(800px 500px at 80% -10%, rgba(108, 140, 255, .18), transparent 60%),
-    #080d18;
-}
-
-.shell { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
-
-.sidebar {
-  display: flex;
-  flex-direction: column;
-  gap: 30px;
-  padding: 26px 18px;
-  border-right: 1px solid rgba(255, 255, 255, .07);
-  background: rgba(255, 255, 255, .02);
-}
-.brand { display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 700; padding: 0 8px; }
-.brand span { color: #7d9bff; }
-.menu { display: grid; gap: 4px; }
-.menu__item {
-  padding: 10px 12px;
-  font-size: 14px;
-  color: #8b96b2;
-  text-decoration: none;
-  border-radius: 10px;
-  transition: background .18s, color .18s;
-}
-.menu__item:hover { color: #dce3f5; background: rgba(255, 255, 255, .04); }
-.menu__item.is-active { color: #fff; background: rgba(108, 140, 255, .16); box-shadow: inset 0 0 0 1px rgba(108, 140, 255, .28); }
-.sidebar__foot { margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 0 8px; font-size: 12px; }
-.sidebar__foot strong { display: block; font-size: 13px; }
-.sidebar__foot span { color: #7c87a4; }
-.avatar { width: 34px; height: 34px; display: grid; place-items: center; font-size: 12px; font-weight: 700; border-radius: 10px; background: linear-gradient(135deg, #6c8cff, #38e1c6); color: #06101f; }
-
-.main { padding: 30px clamp(20px, 4vw, 48px) 48px; display: grid; align-content: start; gap: 20px; }
-.topbar { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 16px; }
-.eyebrow { margin: 0 0 8px; font-size: 11px; letter-spacing: .26em; color: #6c8cff; font-weight: 700; }
-h1 { margin: 0; font-size: clamp(24px, 4vw, 32px); letter-spacing: -.02em; }
-.range { display: flex; gap: 4px; padding: 4px; border: 1px solid rgba(255, 255, 255, .08); border-radius: 12px; background: rgba(255, 255, 255, .03); }
-.range button { padding: 8px 14px; font-size: 13px; color: #8b96b2; background: transparent; border: 0; border-radius: 9px; cursor: pointer; }
-.range button.is-active { color: #08111f; background: #dfe6f7; font-weight: 600; }
-
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
-.kpi {
-  padding: 20px;
-  border: 1px solid rgba(255, 255, 255, .08);
-  border-radius: 16px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, .05), rgba(255, 255, 255, .015));
-}
-.kpi span { display: block; font-size: 12px; color: #8b96b2; }
-.kpi strong { display: block; margin: 10px 0 8px; font-size: 28px; letter-spacing: -.02em; }
-.kpi em { font-style: normal; font-size: 12px; color: #38e1c6; }
-.kpi em.is-down { color: #ff7a8f; }
-
-.panels { display: grid; grid-template-columns: 1.6fr 1fr; gap: 14px; }
-.panel {
-  padding: 22px;
-  border: 1px solid rgba(255, 255, 255, .08);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, .022);
-}
-.panel--chart { display: flex; min-height: 300px; flex-direction: column; }
-.panel__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 22px; }
-.panel__head h2 { margin: 0 0 4px; font-size: 16px; }
-.panel__head p { margin: 0; font-size: 12px; color: #7c87a4; }
-.badge { padding: 5px 10px; font-size: 12px; font-weight: 600; color: #38e1c6; background: rgba(56, 225, 198, .12); border-radius: 999px; }
-.badge.is-down { color: #ff7a8f; background: rgba(255, 122, 143, .12); }
-
-.chart { display: flex; align-items: flex-end; gap: 8px; height: 190px; }
-.bar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 8px; height: 100%; }
-.bar__fill {
-  width: 100%;
-  min-height: 4px;
-  border-radius: 7px 7px 3px 3px;
-  background: linear-gradient(180deg, #8fa8ff, rgba(108, 140, 255, .25));
-  transition: height .5s cubic-bezier(.2, .8, .2, 1);
-}
-.bar__label { font-size: 10px; color: #66708c; }
-
-.donut {
-  --p: 0;
-  width: 150px;
-  height: 150px;
-  margin: 6px auto 20px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  background: conic-gradient(#6c8cff calc(var(--p) * 1%), rgba(255, 255, 255, .07) 0);
-  position: relative;
-}
-.donut::before { content: ""; position: absolute; inset: 16px; border-radius: 50%; background: #0c1322; }
-.donut span { position: relative; z-index: 1; font-size: 20px; font-weight: 700; }
-.legend { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; font-size: 12px; color: #8b96b2; }
-.legend li { display: flex; align-items: center; gap: 8px; }
-.legend i { width: 8px; height: 8px; border-radius: 3px; }
-.legend b { margin-left: auto; color: #dce3f5; font-weight: 600; }
-
-.activity { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
-.activity li { display: flex; align-items: center; gap: 12px; padding: 11px 8px; font-size: 13px; border-bottom: 1px solid rgba(255, 255, 255, .05); }
-.activity li:last-child { border-bottom: 0; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: #38e1c6; flex: none; }
-.activity time { margin-left: auto; font-size: 11px; color: #66708c; }
-.ghost { padding: 7px 12px; font-size: 12px; color: #aab4cf; background: transparent; border: 1px solid rgba(255, 255, 255, .12); border-radius: 9px; cursor: pointer; }
-.ghost:hover { background: rgba(255, 255, 255, .06); }
-
-@media (max-width: 900px) {
-  .shell { grid-template-columns: 1fr; }
-  .sidebar { flex-direction: row; align-items: center; gap: 16px; padding: 16px; border-right: 0; border-bottom: 1px solid rgba(255, 255, 255, .07); overflow-x: auto; }
-  .menu { display: flex; }
-  .sidebar__foot { display: none; }
-  .panels { grid-template-columns: 1fr; }
-}
-""",
-    "app.js": """const RANGES = {
-  7: [42, 58, 51, 76, 64, 92, 88],
-  30: [30, 44, 38, 52, 61, 58, 72, 69, 84, 78, 91, 96, 88, 102, 118, 110, 126, 139, 131, 148, 142, 160, 155, 171, 166, 182, 178, 196, 190, 208],
-};
-
-const KPIS = {
-  7: [
-    { label: "页面浏览量", value: "24.8K", delta: "+12.4%" },
-    { label: "独立访客", value: "8,142", delta: "+6.8%" },
-    { label: "转化率", value: "3.62%", delta: "+0.42%" },
-    { label: "平均停留", value: "4m 12s", delta: "-1.3%", down: true },
-  ],
-  30: [
-    { label: "页面浏览量", value: "96.3K", delta: "+28.1%" },
-    { label: "独立访客", value: "31,576", delta: "+19.2%" },
-    { label: "转化率", value: "3.18%", delta: "+0.17%" },
-    { label: "平均停留", value: "3m 58s", delta: "+2.1%" },
-  ],
-};
-
-const SOURCES = [
-  { label: "自然搜索", pct: 42, color: "#6c8cff" },
-  { label: "直接访问", pct: 27, color: "#38e1c6" },
-  { label: "社交媒体", pct: 19, color: "#c38bff" },
-  { label: "其他渠道", pct: 12, color: "#ffd166" },
-];
-
-const ACTIVITIES = [
-  { text: "新用户注册：alex@nova.dev", time: "刚刚" },
-  { text: "部署完成：portfolio-site v3", time: "2 分钟前" },
-  { text: "页面访问量突破 10,000", time: "18 分钟前" },
-  { text: "新项目创建：team-dashboard", time: "1 小时前" },
-  { text: "订阅方案升级：Pro 年付", time: "3 小时前" },
-];
-
-let range = "7";
-
-const els = {
-  kpis: document.getElementById("kpis"),
-  chart: document.getElementById("chart"),
-  range: document.getElementById("range"),
-  donut: document.getElementById("donut"),
-  donutText: document.getElementById("donutText"),
-  legend: document.getElementById("legend"),
-  activity: document.getElementById("activity"),
-  refresh: document.getElementById("refresh"),
-  trendBadge: document.getElementById("trendBadge"),
-};
-
-function renderKpis() {
-  els.kpis.innerHTML = KPIS[range]
-    .map(function (kpi) {
-      return (
-        '<article class="kpi"><span>' + kpi.label + "</span><strong>" + kpi.value + "</strong>" +
-        '<em class="' + (kpi.down ? "is-down" : "") + '">' + kpi.delta + " 较上期</em></article>"
-      );
-    })
-    .join("");
-}
-
-function renderChart() {
-  const values = RANGES[range];
-  const max = Math.max.apply(null, values);
-  const showEvery = range === "30" ? 5 : 1;
-  els.chart.innerHTML = values
-    .map(function (value, index) {
-      const height = Math.max(6, Math.round((value / max) * 100));
-      const label = range === "7"
-        ? "周" + "一二三四五六日"[index]
-        : (index % showEvery === 0 ? "第" + (index + 1) + "天" : "");
-      return (
-        '<div class="bar"><div class="bar__fill" style="height:' + height + '%"></div>' +
-        '<span class="bar__label">' + label + "</span></div>"
-      );
-    })
-    .join("");
-
-  const first = values[0];
-  const last = values[values.length - 1];
-  const growth = Math.round(((last - first) / first) * 100);
-  els.trendBadge.textContent = (growth >= 0 ? "+" : "") + growth + "%";
-  els.trendBadge.classList.toggle("is-down", growth < 0);
-}
-
-function renderDonut() {
-  const total = SOURCES.reduce(function (sum, item) { return sum + item.pct; }, 0);
-  const top = SOURCES[0];
-  els.donut.style.setProperty("--p", String(Math.round((top.pct / total) * 100)));
-  els.donutText.textContent = top.pct + "%";
-  els.legend.innerHTML = SOURCES.map(function (source) {
-    return (
-      '<li><i style="background:' + source.color + '"></i>' + source.label +
-      "<b>" + source.pct + "%</b></li>"
-    );
-  }).join("");
-}
-
-function renderActivity() {
-  els.activity.innerHTML = ACTIVITIES.map(function (item) {
-    return '<li><span class="dot"></span>' + item.text + "<time>" + item.time + "</time></li>";
-  }).join("");
-}
-
-function renderAll() {
-  renderKpis();
-  renderChart();
-  renderDonut();
-  renderActivity();
-}
-
-els.range.addEventListener("click", function (event) {
-  const button = event.target.closest("[data-range]");
-  if (!button) return;
-  range = button.dataset.range;
-  els.range.querySelectorAll("button").forEach(function (el) {
-    el.classList.toggle("is-active", el === button);
-  });
-  renderAll();
-});
-
-els.refresh.addEventListener("click", function () {
-  renderAll();
-  els.refresh.textContent = "已刷新";
-  setTimeout(function () { els.refresh.textContent = "刷新"; }, 1200);
-});
-
-renderAll();
-""",
-}
-
-TEMPLATES = {"todo": TODO, "landing": LANDING, "dashboard": DASHBOARD}
-DEFAULT_TITLE = {"todo": "我的待办清单", "landing": "Nova · 用 AI 构建产品", "dashboard": "数据概览"}
+"""
 
 
-def _detect_existing_template(existing: dict[str, str] | None) -> str | None:
-    if not existing:
-        return None
-    html = existing.get("index.html", "")
-    if 'id="todoInput"' in html or "TASK FLOW" in html:
-        return "todo"
-    if 'id="kpis"' in html or "OVERVIEW" in html:
-        return "dashboard"
-    if html:
-        return "landing"
-    return None
-
-
-def pick_template(prompt: str, existing: dict[str, str] | None = None) -> str:
-    p = prompt.lower()
-    if any(k in p for k in ("待办", "todo", "任务", "清单", "checklist", "习惯")):
-        return "todo"
-    if any(k in p for k in ("仪表盘", "dashboard", "看板", "数据", "图表", "统计", "分析", "报表")):
-        return "dashboard"
-    if any(k in p for k in ("落地页", "官网", "landing", "主页", "产品页")):
-        return "landing"
-    # Follow-up edits ("换成暖色") must not silently swap the app type.
-    return _detect_existing_template(existing) or "landing"
-
-
-def extract_title(prompt: str, template: str) -> str:
-    text = re.sub(r"^\s*(帮我|请|我想|想要|做一个|做|生成|开发|设计|搭建|一个|一款|一套)+", "", prompt.strip())
-    text = re.sub(r"[。！!？?，,；;：:].*$", "", text).strip()
-    text = re.sub(r"\s+", " ", text)
-    if 2 <= len(text) <= 24:
-        return text
-    return DEFAULT_TITLE[template]
-
+# ---------------------------------------------------------------------------
+# Prompt helpers + rendering
+# ---------------------------------------------------------------------------
 
 PALETTES = {
     "暖色": ("#ff9f68", "#ffd166", "#ff7a8f"),
@@ -1094,16 +1023,6 @@ def _hex_rgb(color: str) -> str:
     return f"{int(value[0:2], 16)}, {int(value[2:4], 16)}, {int(value[4:6], 16)}"
 
 
-def _existing_title(existing: dict[str, str] | None) -> str | None:
-    if not existing:
-        return None
-    html = existing.get("index.html", "")
-    match = re.search(r"<title>(.*?)</title>", html, re.S)
-    if match and match.group(1).strip():
-        return match.group(1).strip()[:60]
-    return None
-
-
 def _apply_palette(content: str, prompt: str) -> str:
     palette = next((value for key, value in PALETTES.items() if key in prompt), None)
     if not palette:
@@ -1122,42 +1041,56 @@ def _apply_palette(content: str, prompt: str) -> str:
     return content
 
 
-def _render(
-    template: str, prompt: str, title_override: str | None = None
-) -> dict[str, str]:
-    title = title_override or extract_title(prompt, template)
-    return {
-        name: _apply_palette(content.replace("__TITLE__", title), prompt)
-        for name, content in TEMPLATES[template].items()
-    }
+DEFAULT_TITLE = {
+    "frontend": "Nova · 用 AI 构建产品",
+    "fullstack": "我的待办清单",
+    "backend": "Notes API",
+}
 
 
-def mock_plan(prompt: str, existing: dict[str, str] | None = None) -> str:
-    template = pick_template(prompt, existing)
-    purposes = {
-        "index.html": "页面结构与内容",
-        "styles.css": "视觉样式与响应式布局",
-        "app.js": "交互逻辑与状态管理",
-    }
-    plan = {
-        "summary": f"基于「{prompt.strip()[:40]}」生成一个可交互的静态 Web 应用（{template} 模板）。",
-        "files": [
-            {"path": name, "purpose": purposes[name]} for name in TEMPLATES[template]
-        ],
-    }
-    return json.dumps(plan, ensure_ascii=False)
+def extract_title(prompt: str, mode: str) -> str:
+    text = re.sub(
+        r"^\s*(帮我|请|我想|想要|做一个|做|生成|开发|设计|搭建|一个|一款|一套)+",
+        "",
+        prompt.strip(),
+    )
+    text = re.sub(r"[。！!？?，,；;：:].*$", "", text).strip()
+    text = re.sub(r"\s+", " ", text)
+    if 2 <= len(text) <= 24:
+        return text
+    return DEFAULT_TITLE[mode]
 
 
 def mock_file(
-    prompt: str, filename: str, existing: dict[str, str] | None = None
+    prompt: str,
+    filename: str,
+    existing: dict[str, str] | None = None,
+    mode: str | None = None,
+    title: str | None = None,
 ) -> str:
-    template = pick_template(prompt, existing)
-    files = _render(template, prompt, _existing_title(existing))
-    if filename in files:
-        return files[filename]
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext == "css":
-        return files["styles.css"]
-    if ext == "js":
-        return files["app.js"]
-    return files["index.html"]
+    resolved = mode or pick_mode(prompt)
+    name = title or extract_title(prompt, resolved)
+    title_json = json.dumps(name, ensure_ascii=False)
+    title_py = json.dumps(name, ensure_ascii=False)
+
+    if resolved == "fullstack" and filename == "frontend/src/App.tsx":
+        return _apply_palette(FULLSTACK_TODO_APP.replace(TITLE_JSON, title_json), prompt)
+    if resolved == "fullstack" and filename == "frontend/src/styles.css":
+        return _apply_palette(FULLSTACK_TODO_CSS, prompt)
+    if resolved == "fullstack" and filename == "backend/main.py":
+        return FULLSTACK_TODO_BACKEND.replace("__TITLE_PY__", title_py)
+    if resolved == "frontend" and filename == "frontend/src/App.tsx":
+        return _apply_palette(LANDING_APP.replace(TITLE_JSON, title_json), prompt)
+    if resolved == "frontend" and filename == "frontend/src/styles.css":
+        return _apply_palette(LANDING_CSS, prompt)
+    if resolved == "backend" and filename == "backend/main.py":
+        return NOTES_BACKEND.replace("__TITLE_PY__", title_py)
+
+    # Defensive fallbacks for unexpected requested paths.
+    return {
+        "frontend/src/App.tsx": _apply_palette(
+            LANDING_APP.replace(TITLE_JSON, title_json), prompt
+        ),
+        "frontend/src/styles.css": _apply_palette(LANDING_CSS, prompt),
+        "backend/main.py": NOTES_BACKEND.replace("__TITLE_PY__", title_py),
+    }.get(filename, "")

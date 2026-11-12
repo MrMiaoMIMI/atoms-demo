@@ -7,10 +7,16 @@ import HealthPill from "./HealthPill";
 import { ArrowRight, Code, Sparkle, Spinner, Trash } from "./Icons";
 
 const EXAMPLES = [
-  "做一个待办清单应用",
+  "做一个待办清单，数据保存到 SQLite",
   "做一个 SaaS 产品落地页",
-  "做一个数据看板",
+  "做一个记账 API（只要后端）",
 ];
+
+const MODE_LABEL: Record<string, string> = {
+  frontend: "前端",
+  fullstack: "全栈",
+  backend: "API",
+};
 
 interface Props {
   health: Health | null;
@@ -115,8 +121,9 @@ export default function Home({ health, onStart, onOpen }: Props) {
             。
           </h1>
           <p className="mx-auto mt-6 max-w-xl text-sm leading-relaxed text-slate-400 sm:text-[15px]">
-            Planner 拆解需求，Coder 多文件生成，Reviewer 静态检查，Deployer 发布到服务器。
-            全过程可视化，生成后还能继续对话修改。
+            描述需求，Planner 自动判断纯前端还是前后端一体；Coder 生成 Vite + React
+            页面与 FastAPI + SQLite 接口，Reviewer 检查，Deployer 发布到服务器。
+            生成后还能继续对话修改，数据持久保存在项目自己的数据库里。
           </p>
         </section>
 
@@ -134,7 +141,7 @@ export default function Home({ health, onStart, onOpen }: Props) {
               onKeyDown={handleKeyDown}
               rows={3}
               maxLength={4000}
-              placeholder="描述你想构建的应用，例如：做一个极简风格的待办清单，支持筛选和进度统计…"
+              placeholder="描述你想构建的应用，例如：做一个极简待办清单，任务要保存到数据库，刷新不丢…"
               className="min-h-[84px] w-full resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed text-slate-100 outline-none placeholder:text-slate-600"
             />
           </div>
@@ -206,9 +213,14 @@ export default function Home({ health, onStart, onOpen }: Props) {
                     <div className="grid h-9 w-9 place-items-center rounded-xl bg-accent/15 text-accent-soft">
                       <Code />
                     </div>
-                    <span className="rounded-full border border-white/10 px-2 py-0.5 text-[9px] text-slate-500">
-                      v{project.latest_version ?? 0}
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[9px] text-accent-soft">
+                        {MODE_LABEL[project.mode ?? "frontend"] ?? "前端"}
+                      </span>
+                      <span className="rounded-full border border-white/10 px-2 py-0.5 text-[9px] text-slate-500">
+                        v{project.latest_version ?? 0}
+                      </span>
+                    </div>
                   </div>
                   <h3 className="mt-4 truncate text-sm font-semibold text-slate-100">{project.name}</h3>
                   <p className="mt-1.5 text-[10px] text-slate-500">

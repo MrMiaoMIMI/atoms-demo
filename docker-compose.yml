@@ -6,11 +6,13 @@ services:
       - ./backend/.env
     environment:
       DATA_DIR: /app/data
+      MAX_RUNNING_APPS: "2"
+      GENERATED_APP_MEMORY_MB: "256"
     volumes:
       - ./backend/data:/app/data
     expose:
       - "8000"
-    mem_limit: 768m
+    mem_limit: 1024m
     cpus: "1.0"
     restart: unless-stopped
     healthcheck:
@@ -32,8 +34,6 @@ services:
       dockerfile: nginx/Dockerfile
     ports:
       - "80:80"
-    volumes:
-      - ./backend/data/apps:/var/www/apps:ro
     depends_on:
       - backend
     mem_limit: 192m

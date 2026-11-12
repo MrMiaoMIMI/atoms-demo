@@ -17,12 +17,18 @@ class MockLLM:
     async def stream(self, *, role: str, system: str, user: str, meta: dict | None = None) -> AsyncIterator[str]:
         meta = meta or {}
         if role == "planner":
-            text = templates.mock_plan(meta.get("prompt", ""), meta.get("existing"))
+            text = templates.mock_plan(
+                meta.get("prompt", ""),
+                meta.get("existing"),
+                meta.get("existing_mode"),
+            )
         else:
             text = templates.mock_file(
                 meta.get("prompt", ""),
-                meta.get("filename", "index.html"),
+                meta.get("filename", "frontend/src/App.tsx"),
                 meta.get("existing"),
+                mode=meta.get("mode"),
+                title=meta.get("title"),
             )
 
         step = 48

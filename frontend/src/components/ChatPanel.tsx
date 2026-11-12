@@ -36,7 +36,8 @@ export default function ChatPanel({ messages, running, error, onSend, onStop }: 
             </div>
             <p className="text-sm font-medium text-slate-200">描述你想构建的应用</p>
             <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
-              Planner 会拆解需求，Coder 逐文件生成代码，Reviewer 检查后由 Deployer 发布。生成完成后还能继续对话修改。
+              Planner 会判断需要纯前端还是前后端一体；Coder 生成 Vite + React 页面和
+              FastAPI + SQLite 接口，Reviewer 检查后由 Deployer 发布。生成完成后还能继续对话修改。
             </p>
           </div>
         ) : null}

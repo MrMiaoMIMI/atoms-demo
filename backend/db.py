@@ -54,6 +54,7 @@ def now() -> str:
 async def _connect():
     conn = await aiosqlite.connect(str(DB_PATH))
     conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
     finally:
@@ -87,7 +88,9 @@ async def list_projects() -> list[dict]:
             SELECT p.id, p.name, p.created_at,
                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS message_count,
                    (SELECT COUNT(DISTINCT filename) FROM artifacts a WHERE a.project_id = p.id) AS artifact_count,
-                   (SELECT MAX(a.version) FROM artifacts a WHERE a.project_id = p.id) AS latest_version
+                   (SELECT MAX(a.version) FROM artifacts a WHERE a.project_id = p.id) AS latest_version,
+                   EXISTS(SELECT 1 FROM artifacts a WHERE a.project_id = p.id AND a.filename LIKE 'frontend/%') AS has_frontend,
+                   EXISTS(SELECT 1 FROM artifacts a WHERE a.project_id = p.id AND a.filename LIKE 'backend/%') AS has_backend
             FROM projects p
             ORDER BY p.created_at DESC
             """
@@ -203,6 +206,20 @@ async def update_execution(exec_id: int, status: str, log: str | None) -> None:
             "UPDATE executions SET status = ?, log = COALESCE(?, log) WHERE id = ?",
             (status, log, exec_id),
         )
+        await conn.commit()
+
+
+async def delete_artifacts_except(pid: str, keep: set[str]) -> None:
+    """Drop latest-file rows for paths that no longer exist on disk."""
+    async with _connect() as conn:
+        if keep:
+            placeholders = ",".join("?" for _ in keep)
+            await conn.execute(
+                f"DELETE FROM artifacts WHERE project_id = ? AND filename NOT IN ({placeholders})",
+                (pid, *sorted(keep)),
+            )
+        else:
+            await conn.execute("DELETE FROM artifacts WHERE project_id = ?", (pid,))
         await conn.commit()
 
 

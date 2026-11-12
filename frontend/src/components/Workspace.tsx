@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, generate } from "../api";
-import type { Artifact, Conversation, Execution, Health, Project } from "../types";
+import type {
+  Artifact,
+  Conversation,
+  Execution,
+  Health,
+  Project,
+  ProjectMode,
+} from "../types";
 import ChatPanel from "./ChatPanel";
 import FilePanel from "./FilePanel";
 import HealthPill from "./HealthPill";
@@ -24,6 +31,7 @@ export default function Workspace({
   onExit,
 }: Props) {
   const [project, setProject] = useState<Project | null>(null);
+  const [mode, setMode] = useState<ProjectMode>("frontend");
   const [messages, setMessages] = useState<Conversation[]>([]);
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [artifacts, setArtifacts] = useState<Record<string, Artifact>>({});
@@ -54,19 +62,24 @@ export default function Workspace({
       .then((state) => {
         if (cancelled) return;
         setProject(state.project);
+        setMode(state.mode ?? "frontend");
         setMessages(state.conversations);
         setExecutions(state.executions);
         const map: Record<string, Artifact> = {};
         for (const artifact of state.artifacts) map[artifact.filename] = artifact;
         setArtifacts(map);
         setActiveFile(
-          state.artifacts.find((artifact) => artifact.filename === "index.html")?.filename ??
+          state.artifacts.find((artifact) => artifact.filename === "frontend/src/App.tsx")
+            ?.filename ??
+            state.artifacts.find((artifact) => artifact.filename === "backend/main.py")
+              ?.filename ??
+            state.artifacts.find((artifact) => artifact.filename === "index.html")?.filename ??
             state.artifacts[0]?.filename ??
             null
         );
         const version = state.artifacts.reduce((max, artifact) => Math.max(max, artifact.version), 0);
         if (state.artifacts.length > 0) {
-          setPreviewUrl(`/apps/${projectId}/index.html?v=${version}`);
+          setPreviewUrl(state.preview_url ?? `/apps/${projectId}/?v=${version || 1}`);
         }
         setLoaded(true);
       })
@@ -141,6 +154,13 @@ export default function Workspace({
             }
             if (event === "preview") {
               if (typeof data.url === "string") setPreviewUrl(data.url);
+              if (
+                data.mode === "frontend" ||
+                data.mode === "fullstack" ||
+                data.mode === "backend"
+              ) {
+                setMode(data.mode);
+              }
               return;
             }
             if (event === "message") {
@@ -236,7 +256,8 @@ export default function Workspace({
               {project?.name ?? "未命名项目"}
             </p>
             <p className="text-[10px] text-slate-500">
-              Atoms 工作台 · v{latestVersion || 1}
+              Atoms 工作台 · v{latestVersion || 1} ·{" "}
+              {mode === "fullstack" ? "全栈" : mode === "backend" ? "API" : "前端"}
             </p>
           </div>
         </div>
@@ -320,7 +341,7 @@ export default function Workspace({
           )}
         </section>
 
-        <PreviewPane url={previewUrl} running={running} version={latestVersion} />
+        <PreviewPane url={previewUrl} running={running} version={latestVersion} mode={mode} />
       </div>
     </div>
   );

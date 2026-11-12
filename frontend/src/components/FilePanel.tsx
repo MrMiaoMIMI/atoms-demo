@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import type { Artifact } from "../types";
 import { formatSize } from "../lib/format";
-import { Code, Copy } from "./Icons";
+import { Code, Copy, Folder } from "./Icons";
 
 interface Props {
   artifacts: Record<string, Artifact>;
@@ -11,7 +11,12 @@ interface Props {
   streamingBuffer: string;
 }
 
-const ORDER: Record<string, number> = { "index.html": 0, "styles.css": 1, "app.js": 2 };
+const GROUP_ORDER = ["frontend", "backend", "root"];
+const GROUP_LABEL: Record<string, string> = {
+  frontend: "frontend",
+  backend: "backend",
+  root: "根目录",
+};
 
 export default function FilePanel({
   artifacts,
@@ -22,12 +27,37 @@ export default function FilePanel({
 }: Props) {
   const [copied, setCopied] = useState(false);
 
-  const files = useMemo(() => {
+  const groups = useMemo(() => {
     const names = new Set(Object.keys(artifacts));
     if (streamingFile) names.add(streamingFile);
-    return Array.from(names).sort((a, b) => (ORDER[a] ?? 9) - (ORDER[b] ?? 9) || a.localeCompare(b));
+    const buckets = new Map<string, string[]>();
+    for (const name of names) {
+      const index = name.indexOf("/");
+      const group = index === -1 ? "root" : name.slice(0, index);
+      const list = buckets.get(group) ?? [];
+      list.push(name);
+      buckets.set(group, list);
+    }
+    return Array.from(buckets.entries())
+      .sort((a, b) => {
+        const ai = GROUP_ORDER.indexOf(a[0]);
+        const bi = GROUP_ORDER.indexOf(b[0]);
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi) || a[0].localeCompare(b[0]);
+      })
+      .map(([group, files]) => ({
+        group,
+        files: files.sort((a, b) => {
+          const [aName, bName] = [a.split("/").pop() ?? a, b.split("/").pop() ?? b];
+          if (aName === "App.tsx") return -1;
+          if (bName === "App.tsx") return 1;
+          if (aName === "main.py") return -1;
+          if (bName === "main.py") return 1;
+          return a.localeCompare(b);
+        }),
+      }));
   }, [artifacts, streamingFile]);
 
+  const fileCount = groups.reduce((sum, item) => sum + item.files.length, 0);
   const active = activeFile ? artifacts[activeFile] : undefined;
   const isStreaming = activeFile !== null && activeFile === streamingFile;
   const content = isStreaming ? streamingBuffer : active?.content ?? "";
@@ -47,37 +77,52 @@ export default function FilePanel({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-none items-center justify-between border-b border-white/5 px-4 py-2">
         <span className="text-[11px] font-medium text-slate-400">项目文件</span>
-        <span className="text-[10px] text-slate-600">{files.length} files</span>
+        <span className="text-[10px] text-slate-600">{fileCount} files</span>
       </div>
 
-      <div className="flex flex-none gap-1.5 overflow-x-auto border-b border-white/5 px-3 py-2">
-        {files.length === 0 ? (
-          <span className="px-1 py-1 text-[11px] text-slate-600">等待 Coder 生成文件…</span>
+      <div className="max-h-44 flex-none overflow-y-auto border-b border-white/5 px-2 py-2">
+        {fileCount === 0 ? (
+          <span className="block px-2 py-1 text-[11px] text-slate-600">
+            等待 Coder 生成文件…
+          </span>
         ) : null}
-        {files.map((name) => {
-          const streaming = name === streamingFile;
-          const artifact = artifacts[name];
-          return (
-            <button
-              key={name}
-              type="button"
-              onClick={() => onSelect(name)}
-              className={`inline-flex flex-none items-center gap-1.5 rounded-lg border px-2.5 py-1.5 font-mono text-[11px] transition ${
-                name === activeFile
-                  ? "border-accent/40 bg-accent/15 text-slate-100"
-                  : "border-white/10 bg-white/[0.02] text-slate-400 hover:border-white/20 hover:text-slate-200"
-              }`}
-            >
-              <Code className="h-3 w-3" />
-              {name}
-              {streaming ? (
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
-              ) : artifact ? (
-                <span className="text-[9px] text-slate-600">v{artifact.version}</span>
-              ) : null}
-            </button>
-          );
-        })}
+        {groups.map(({ group, files }) => (
+          <div key={group} className="mb-1 last:mb-0">
+            <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+              <Folder className="h-3 w-3" />
+              {GROUP_LABEL[group] ?? group}
+              <span className="font-normal text-slate-600">{files.length}</span>
+            </div>
+            {files.map((name) => {
+              const streaming = name === streamingFile;
+              const artifact = artifacts[name];
+              const short = group === "root" ? name : name.slice(group.length + 1);
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  title={name}
+                  onClick={() => onSelect(name)}
+                  className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left font-mono text-[11px] transition ${
+                    name === activeFile
+                      ? "bg-accent/15 text-slate-100"
+                      : "text-slate-400 hover:bg-white/[0.04] hover:text-slate-200"
+                  }`}
+                >
+                  <Code className="h-3 w-3 flex-none opacity-60" />
+                  <span className="truncate">{short}</span>
+                  {streaming ? (
+                    <span className="ml-auto h-1.5 w-1.5 flex-none animate-pulse rounded-full bg-accent" />
+                  ) : artifact ? (
+                    <span className="ml-auto flex-none text-[9px] text-slate-600">
+                      v{artifact.version}
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        ))}
       </div>
 
       {activeFile ? (
