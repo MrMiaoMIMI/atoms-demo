@@ -1,93 +1,124 @@
 import { useState } from "react";
 import type { ProjectMode } from "../types";
-import { ExternalLink, Refresh, Sparkle, Spinner } from "./Icons";
+import { ApiIcon, AtomsMark, ExternalLink, Monitor, Refresh, Smartphone, Spinner } from "./Icons";
 
 interface Props {
   url: string | null;
   running: boolean;
   version: number;
   mode: ProjectMode;
+  refreshKey: number;
+  onRefresh: () => void;
 }
 
-const MODE_LABEL: Record<ProjectMode, string> = {
-  frontend: "前端",
-  fullstack: "全栈",
-  backend: "API",
-};
-
-export default function PreviewPane({ url, running, version, mode }: Props) {
-  const [nonce, setNonce] = useState(0);
-  const src = url ? `${url}${url.includes("?") ? "&" : "?"}r=${nonce}` : null;
+export default function PreviewPane({
+  url,
+  running,
+  version,
+  mode,
+  refreshKey,
+  onRefresh,
+}: Props) {
+  const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
+  const src = url ? `${url}${url.includes("?") ? "&" : "?"}r=${refreshKey}` : null;
 
   return (
-    <section className="flex min-h-[70vh] min-w-0 flex-col bg-ink-950/40 xl:min-h-0">
-      <div className="flex h-12 flex-none items-center justify-between gap-2 border-b border-white/5 px-4">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <span className="flex flex-none gap-1">
-            <i className="h-2 w-2 rounded-full bg-rose-400/70" />
-            <i className="h-2 w-2 rounded-full bg-amber-300/70" />
-            <i className="h-2 w-2 rounded-full bg-mint/70" />
-          </span>
-          <span className="text-xs font-semibold text-slate-300">实时预览</span>
-          <span className="flex-none rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[10px] text-accent-soft">
-            {MODE_LABEL[mode]}
-          </span>
-          <span className="flex-none rounded-full border border-white/10 px-2 py-0.5 text-[10px] text-slate-500">
-            v{version || 1}
-          </span>
-        </div>
-        <div className="flex flex-none items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setNonce((value) => value + 1)}
-            disabled={!url}
-            title="刷新预览"
-            className="grid h-7 w-7 place-items-center rounded-lg text-slate-400 transition hover:bg-white/[0.06] hover:text-slate-200 disabled:opacity-30"
-          >
-            <Refresh className={`h-3.5 w-3.5 ${running ? "animate-spin" : ""}`} />
-          </button>
-          <a
-            href={url ?? "#"}
-            target="_blank"
-            rel="noreferrer"
-            title="在新窗口打开"
-            className={`grid h-7 w-7 place-items-center rounded-lg text-slate-400 transition hover:bg-white/[0.06] hover:text-slate-200 ${
-              url ? "" : "pointer-events-none opacity-30"
+    <section className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-base pb-2 pr-2">
+      <div className="relative flex min-h-0 flex-1 items-stretch justify-center overflow-hidden rounded-[16px] bg-white">
+        {src ? (
+          <div
+            className={`h-full transition-[width] duration-300 ease-out ${
+              device === "mobile"
+                ? "w-[390px] max-w-full border-x border-line-6 shadow-[0_0_40px_rgba(12,12,12,0.06)]"
+                : "w-full"
             }`}
           >
-            <ExternalLink className="h-3.5 w-3.5" />
-          </a>
-        </div>
-      </div>
-
-      <div className="relative min-h-0 flex-1 overflow-hidden bg-[#0b101d]">
-        {src ? (
-          <iframe
-            key={src}
-            src={src}
-            title="生成应用预览"
-            sandbox="allow-scripts allow-forms allow-popups allow-modals"
-            className="h-full w-full border-0 bg-white"
-          />
+            <iframe
+              key={src}
+              src={src}
+              title="生成应用预览"
+              sandbox="allow-scripts allow-forms allow-popups allow-modals"
+              className="h-full w-full border-0 bg-white"
+            />
+          </div>
         ) : (
-          <div className="dot-grid flex h-full flex-col items-center justify-center gap-3 px-8 text-center">
-            <div className="grid h-12 w-12 place-items-center rounded-2xl border border-white/10 bg-white/[0.03] text-accent-soft">
-              {running ? <Spinner className="h-5 w-5" /> : <Sparkle className="h-5 w-5" />}
-            </div>
-            <p className="text-sm text-slate-400">
-              {running ? "Agent 正在构建你的应用…" : "应用会在这里实时运行"}
-            </p>
-            <p className="max-w-[280px] text-[11px] leading-relaxed text-slate-600">
-              在左侧描述需求，Planner 判断形态，Coder 生成前端/后端代码，Deployer
-              启动运行时后自动加载预览。
-            </p>
+          <div className="flex h-full w-full flex-col items-center justify-center gap-3 px-8 text-center">
+            {mode === "backend" && !running ? (
+              <>
+                <span className="grid h-12 w-12 place-items-center rounded-2xl bg-line-4 text-ink-55">
+                  <ApiIcon size={22} />
+                </span>
+                <p className="text-[14px] font-medium text-ink-95">纯 API 项目</p>
+                <p className="max-w-[320px] text-[12px] leading-[19px] text-ink-55">
+                  本轮只生成了 FastAPI + SQLite 接口，没有可预览页面。可以切换到「代码」查看
+                  main.py 与数据库逻辑。
+                </p>
+              </>
+            ) : (
+              <>
+                <span className="grid h-12 w-12 place-items-center rounded-2xl bg-line-4 text-brand">
+                  {running ? <Spinner size={22} /> : <AtomsMark size={24} />}
+                </span>
+                <p className="text-[14px] font-medium text-ink-95">
+                  {running ? "Agent 正在构建你的应用…" : "应用会在这里实时运行"}
+                </p>
+                <p className="max-w-[320px] text-[12px] leading-[19px] text-ink-55">
+                  {running
+                    ? "Planner 规划形态，Coder 生成代码，Deployer 启动运行时后会自动加载预览。"
+                    : "在左侧描述需求，生成完成后这里会加载可交互的真实页面。"}
+                </p>
+              </>
+            )}
           </div>
         )}
 
         {running && src ? (
-          <div className="absolute right-3 top-3 inline-flex items-center gap-1.5 rounded-full border border-accent/30 bg-ink-950/90 px-3 py-1.5 text-[10px] text-accent-soft shadow-lg">
-            <Spinner className="h-3 w-3" />
-            更新中
+          <div className="absolute right-3 top-3 inline-flex items-center gap-1.5 rounded-full border border-line-6 bg-white/95 px-3 py-1.5 text-[11px] text-ink-55 shadow-pill backdrop-blur">
+            <Spinner size={12} className="text-brand" />
+            更新中 · v{version || 1}
+          </div>
+        ) : null}
+
+        {src ? (
+          <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-0.5 rounded-full border border-line-4 bg-white/95 p-1 shadow-float backdrop-blur">
+            <button
+              type="button"
+              onClick={() => setDevice("desktop")}
+              title="桌面预览"
+              className={`grid h-8 w-8 place-items-center rounded-full transition ${
+                device === "desktop" ? "bg-line-6 text-ink-95" : "text-ink-55 hover:text-ink-80"
+              }`}
+            >
+              <Monitor size={16} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setDevice("mobile")}
+              title="移动预览"
+              className={`grid h-8 w-8 place-items-center rounded-full transition ${
+                device === "mobile" ? "bg-line-6 text-ink-95" : "text-ink-55 hover:text-ink-80"
+              }`}
+            >
+              <Smartphone size={16} />
+            </button>
+            <span className="mx-0.5 h-4 w-px bg-line-6" />
+            <button
+              type="button"
+              onClick={onRefresh}
+              title="刷新预览"
+              className="grid h-8 w-8 place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
+            >
+              <Refresh size={15} />
+            </button>
+            <a
+              href={url ?? "#"}
+              target="_blank"
+              rel="noreferrer"
+              title="在新标签页打开"
+              className="grid h-8 w-8 place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
+            >
+              <ExternalLink size={15} />
+            </a>
           </div>
         ) : null}
       </div>

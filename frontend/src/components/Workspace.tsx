@@ -1,5 +1,8 @@
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, generate } from "../api";
+import { copyText } from "../lib/clipboard";
+import { buildTurns, type Turn } from "../lib/turns";
 import type {
   Artifact,
   Conversation,
@@ -8,12 +11,21 @@ import type {
   Project,
   ProjectMode,
 } from "../types";
+import { PresenceAvatars } from "./Avatar";
 import ChatPanel from "./ChatPanel";
 import FilePanel from "./FilePanel";
-import HealthPill from "./HealthPill";
-import { Chat, ChevronLeft, Code, Plus } from "./Icons";
+import {
+  AtomsMark,
+  ChevronDown,
+  Code,
+  Eye,
+  ExternalLink,
+  Home,
+  Refresh,
+  Share,
+  Spinner,
+} from "./Icons";
 import PreviewPane from "./PreviewPane";
-import Timeline from "./Timeline";
 
 interface Props {
   projectId: string;
@@ -21,6 +33,37 @@ interface Props {
   onPromptUsed: () => void;
   health: Health | null;
   onExit: () => void;
+}
+
+const MIN_CHAT = 340;
+const DEFAULT_CHAT = 500;
+const MAX_CHAT = 760;
+
+const MODE_LABEL: Record<ProjectMode, string> = {
+  frontend: "前端",
+  fullstack: "全栈",
+  backend: "API",
+};
+
+function pickDefaultFile(artifacts: Artifact[]): string | null {
+  const priorities = [
+    "frontend/src/App.tsx",
+    "frontend/src/main.tsx",
+    "backend/main.py",
+    "index.html",
+  ];
+  for (const path of priorities) {
+    if (artifacts.some((artifact) => artifact.filename === path)) return path;
+  }
+  return artifacts[0]?.filename ?? null;
+}
+
+function upsertExecution(list: Execution[], execution: Execution): Execution[] {
+  const index = list.findIndex((item) => item.id === execution.id);
+  if (index === -1) return [...list, execution];
+  const next = [...list];
+  next[index] = { ...next[index], ...execution };
+  return next;
 }
 
 export default function Workspace({
@@ -32,8 +75,7 @@ export default function Workspace({
 }: Props) {
   const [project, setProject] = useState<Project | null>(null);
   const [mode, setMode] = useState<ProjectMode>("frontend");
-  const [messages, setMessages] = useState<Conversation[]>([]);
-  const [executions, setExecutions] = useState<Execution[]>([]);
+  const [turns, setTurns] = useState<Turn[]>([]);
   const [artifacts, setArtifacts] = useState<Record<string, Artifact>>({});
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -43,10 +85,22 @@ export default function Workspace({
   const [error, setError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [tab, setTab] = useState<"chat" | "files">("chat");
+  const [pane, setPane] = useState<"preview" | "code">("preview");
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [chatWidth, setChatWidth] = useState(() => {
+    const saved = Number(window.localStorage.getItem("atoms-chat-width"));
+    return Number.isFinite(saved) && saved >= MIN_CHAT && saved <= MAX_CHAT
+      ? saved
+      : DEFAULT_CHAT;
+  });
+  const [dragging, setDragging] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
+  const [projectMenu, setProjectMenu] = useState(false);
+  const [pageMenu, setPageMenu] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const startedRef = useRef(false);
+  const dragCleanupRef = useRef<(() => void) | null>(null);
 
   const latestVersion = useMemo(
     () => Object.values(artifacts).reduce((max, artifact) => Math.max(max, artifact.version), 0),
@@ -63,24 +117,18 @@ export default function Workspace({
         if (cancelled) return;
         setProject(state.project);
         setMode(state.mode ?? "frontend");
-        setMessages(state.conversations);
-        setExecutions(state.executions);
         const map: Record<string, Artifact> = {};
         for (const artifact of state.artifacts) map[artifact.filename] = artifact;
         setArtifacts(map);
-        setActiveFile(
-          state.artifacts.find((artifact) => artifact.filename === "frontend/src/App.tsx")
-            ?.filename ??
-            state.artifacts.find((artifact) => artifact.filename === "backend/main.py")
-              ?.filename ??
-            state.artifacts.find((artifact) => artifact.filename === "index.html")?.filename ??
-            state.artifacts[0]?.filename ??
-            null
+        setActiveFile(pickDefaultFile(state.artifacts));
+        const version = state.artifacts.reduce(
+          (max, artifact) => Math.max(max, artifact.version),
+          0
         );
-        const version = state.artifacts.reduce((max, artifact) => Math.max(max, artifact.version), 0);
         if (state.artifacts.length > 0) {
           setPreviewUrl(state.preview_url ?? `/apps/${projectId}/?v=${version || 1}`);
         }
+        setTurns(buildTurns(state.conversations, state.executions));
         setLoaded(true);
       })
       .catch((err: Error) => {
@@ -93,19 +141,84 @@ export default function Workspace({
     };
   }, [projectId]);
 
+  useEffect(() => {
+    window.localStorage.setItem("atoms-chat-width", String(chatWidth));
+  }, [chatWidth]);
+
+  useEffect(() => {
+    const clamp = () => {
+      const max = Math.min(MAX_CHAT, Math.max(MIN_CHAT, window.innerWidth - 460));
+      setChatWidth((value) => Math.max(MIN_CHAT, Math.min(max, value)));
+    };
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, []);
+
+  useEffect(() => () => dragCleanupRef.current?.(), []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setProjectMenu(false);
+      setPageMenu(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  function startDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = chatWidth;
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const max = Math.min(MAX_CHAT, Math.max(MIN_CHAT, window.innerWidth - 460));
+      setChatWidth(
+        Math.max(MIN_CHAT, Math.min(max, startWidth + moveEvent.clientX - startX))
+      );
+    };
+
+    const finish = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      setDragging(false);
+      dragCleanupRef.current = null;
+    };
+
+    dragCleanupRef.current = finish;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    setDragging(true);
+  }
+
   const run = useCallback(
     async (text: string) => {
       const message = text.trim();
       if (!message) return;
 
-      setTab("chat");
+      const liveId = `live-${Date.now()}`;
+      const now = new Date().toISOString();
+      const userMessage: Conversation = {
+        id: -Date.now(),
+        role: "user",
+        content: message,
+        created_at: now,
+      };
+
       setError(null);
+      setRunning(true);
       setStreamingFile(null);
       setStreamingBuffer("");
-      setRunning(true);
-      setMessages((prev) => [
+      setTurns((prev) => [
         ...prev,
-        { id: -Date.now(), role: "user", content: message, created_at: new Date().toISOString() },
+        { id: liveId, user: userMessage, assistant: null, executions: [], live: true },
       ]);
 
       const controller = new AbortController();
@@ -117,15 +230,15 @@ export default function Workspace({
           message,
           (event, data) => {
             if (event === "execution") {
-              const exec = data as unknown as Execution;
-              if (typeof exec.id !== "number") return;
-              setExecutions((prev) => {
-                const index = prev.findIndex((item) => item.id === exec.id);
-                if (index === -1) return [...prev, exec];
-                const next = [...prev];
-                next[index] = { ...next[index], ...exec };
-                return next;
-              });
+              const execution = data as unknown as Execution;
+              if (typeof execution.id !== "number") return;
+              setTurns((prev) =>
+                prev.map((turn) =>
+                  turn.id === liveId
+                    ? { ...turn, executions: upsertExecution(turn.executions, execution) }
+                    : turn
+                )
+              );
               return;
             }
             if (event === "token") {
@@ -150,6 +263,7 @@ export default function Workspace({
               setArtifacts((prev) => ({ ...prev, [artifact.filename]: artifact }));
               setActiveFile((prev) => prev ?? artifact.filename);
               setStreamingFile(null);
+              setStreamingBuffer("");
               return;
             }
             if (event === "preview") {
@@ -165,11 +279,22 @@ export default function Workspace({
             }
             if (event === "message") {
               if (typeof data.content !== "string") return;
-              const role = data.role === "user" ? "user" : "assistant";
-              setMessages((prev) => [
-                ...prev,
-                { id: -Date.now() - Math.random(), role, content: data.content as string },
-              ]);
+              setTurns((prev) =>
+                prev.map((turn) =>
+                  turn.id === liveId
+                    ? {
+                        ...turn,
+                        assistant: {
+                          id: turn.assistant?.id ?? -Date.now(),
+                          role: "assistant",
+                          content: data.content as string,
+                          created_at: turn.assistant?.created_at ?? new Date().toISOString(),
+                        },
+                        live: false,
+                      }
+                    : turn
+                )
+              );
               return;
             }
             if (event === "error") {
@@ -181,6 +306,21 @@ export default function Workspace({
       } catch (err) {
         if ((err as Error).name === "AbortError") {
           setError("已停止本轮生成。");
+          setTurns((prev) =>
+            prev.map((turn) =>
+              turn.id === liveId
+                ? {
+                    ...turn,
+                    live: false,
+                    executions: turn.executions.map((execution) =>
+                      execution.status === "running"
+                        ? { ...execution, status: "warning", log: "已手动停止" }
+                        : execution
+                    ),
+                  }
+                : turn
+            )
+          );
         } else {
           setError((err as Error).message || "生成失败，请重试。");
         }
@@ -188,6 +328,9 @@ export default function Workspace({
         setRunning(false);
         setStreamingFile(null);
         abortRef.current = null;
+        setTurns((prev) =>
+          prev.map((turn) => (turn.id === liveId ? { ...turn, live: false } : turn))
+        );
       }
     },
     [projectId]
@@ -197,8 +340,8 @@ export default function Workspace({
     if (!loaded || !initialPrompt || startedRef.current) return;
     startedRef.current = true;
     onPromptUsed();
-    if (messages.length === 0) void run(initialPrompt);
-  }, [loaded, initialPrompt, messages.length, onPromptUsed, run]);
+    if (turns.length === 0) void run(initialPrompt);
+  }, [loaded, initialPrompt, turns.length, onPromptUsed, run]);
 
   useEffect(
     () => () => {
@@ -207,11 +350,25 @@ export default function Workspace({
     []
   );
 
+  function refreshPreview() {
+    setRefreshKey((value) => value + 1);
+  }
+
+  async function share() {
+    const url = previewUrl
+      ? new URL(previewUrl, window.location.origin).toString()
+      : window.location.href;
+    const ok = await copyText(url);
+    if (!ok) return;
+    setShareCopied(true);
+    window.setTimeout(() => setShareCopied(false), 1500);
+  }
+
   if (!loaded) {
     return (
-      <div className="grid h-full place-items-center">
-        <div className="flex items-center gap-3 text-sm text-slate-500">
-          <span className="h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+      <div className="grid h-full place-items-center bg-base">
+        <div className="flex items-center gap-2.5 text-[13px] text-ink-55">
+          <Spinner size={16} className="text-brand" />
           正在加载项目…
         </div>
       </div>
@@ -220,14 +377,14 @@ export default function Workspace({
 
   if (loadError) {
     return (
-      <div className="grid h-full place-items-center px-6">
-        <div className="glass max-w-sm rounded-2xl p-6 text-center">
-          <p className="text-sm font-medium text-slate-200">项目加载失败</p>
-          <p className="mt-2 text-xs text-slate-500">{loadError}</p>
+      <div className="grid h-full place-items-center bg-base px-6">
+        <div className="w-full max-w-sm rounded-2xl border border-line-6 bg-white p-6 text-center shadow-composer">
+          <p className="text-[14px] font-medium text-ink-95">项目加载失败</p>
+          <p className="mt-2 text-[12px] leading-[19px] text-ink-55">{loadError}</p>
           <button
             type="button"
             onClick={onExit}
-            className="mt-5 rounded-xl bg-accent px-4 py-2 text-xs font-semibold text-white transition hover:bg-accent-soft"
+            className="mt-5 inline-flex h-8 items-center rounded-full bg-brand px-4 text-[13px] font-medium text-white transition hover:bg-brand-600"
           >
             返回首页
           </button>
@@ -237,111 +394,242 @@ export default function Workspace({
   }
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      <header className="flex h-14 flex-none items-center justify-between gap-3 border-b border-white/5 bg-ink-950/70 px-3 backdrop-blur sm:px-4">
-        <div className="flex min-w-0 items-center gap-2.5">
+    <div className="flex h-full flex-col overflow-hidden bg-base">
+      <header className="flex h-11 flex-none items-center bg-base">
+        <div
+          style={{ width: chatWidth }}
+          className="flex h-full min-w-0 flex-none items-center gap-2 border-r border-transparent px-4"
+        >
           <button
             type="button"
             onClick={onExit}
-            title="返回项目列表"
-            className="grid h-8 w-8 flex-none place-items-center rounded-lg text-slate-400 transition hover:bg-white/[0.06] hover:text-slate-200"
+            title="返回首页"
+            className="grid h-7 w-7 flex-none place-items-center rounded-md text-ink-95 transition hover:bg-line-6"
           >
-            <ChevronLeft />
+            <AtomsMark size={20} />
           </button>
-          <div className="grid h-8 w-8 flex-none place-items-center rounded-xl bg-gradient-to-br from-accent to-mint text-sm font-black text-ink-950">
-            A
+
+          <div className="relative min-w-0 flex-1">
+            <button
+              type="button"
+              onClick={() => setProjectMenu((value) => !value)}
+              className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1 text-left transition hover:bg-line-4"
+            >
+              <span className="truncate text-[14px] font-medium text-ink-95">
+                {project?.name ?? "未命名项目"}
+              </span>
+              <ChevronDown size={14} className="flex-none text-ink-55" />
+            </button>
+
+            {projectMenu ? (
+              <>
+                <button
+                  type="button"
+                  aria-hidden="true"
+                  className="fixed inset-0 z-20 cursor-default"
+                  onClick={() => setProjectMenu(false)}
+                />
+                <div className="absolute left-0 top-full z-30 mt-1.5 w-[250px] rounded-xl border border-line-6 bg-white p-2 shadow-float">
+                  <div className="px-2 py-1.5">
+                    <p className="truncate text-[13px] font-medium text-ink-95">
+                      {project?.name ?? "未命名项目"}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-ink-55">
+                      {MODE_LABEL[mode]} · v{latestVersion || 1} ·{" "}
+                      {health?.llm_mode === "mock" ? "Mock Agent" : health?.model || "LLM"}
+                    </p>
+                  </div>
+                  <div className="my-1 h-px bg-line-4" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProjectMenu(false);
+                      void share();
+                    }}
+                    className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-ink-80 transition hover:bg-line-4 hover:text-ink-95"
+                  >
+                    <Share size={15} />
+                    复制预览链接
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProjectMenu(false);
+                      onExit();
+                    }}
+                    className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-ink-80 transition hover:bg-line-4 hover:text-ink-95"
+                  >
+                    <Home size={15} />
+                    返回项目列表
+                  </button>
+                </div>
+              </>
+            ) : null}
           </div>
-          <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-slate-100">
-              {project?.name ?? "未命名项目"}
-            </p>
-            <p className="text-[10px] text-slate-500">
-              Atoms 工作台 · v{latestVersion || 1} ·{" "}
-              {mode === "fullstack" ? "全栈" : mode === "backend" ? "API" : "前端"}
-            </p>
-          </div>
+
+          <span className="hidden flex-none rounded-full bg-line-4 px-2 py-0.5 text-[10px] text-ink-55 sm:inline">
+            {MODE_LABEL[mode]}
+          </span>
         </div>
-        <div className="flex flex-none items-center gap-2">
-          <HealthPill health={health} />
-          <button
-            type="button"
-            onClick={onExit}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-[11px] font-medium text-slate-300 transition hover:border-white/20 hover:text-white"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">新项目</span>
-          </button>
+
+        <div className="flex min-w-0 flex-1 items-center justify-between gap-2 pl-2 pr-3">
+          <div className="flex items-center rounded-full bg-line-4 p-0 shadow-[inset_0_0_0_1px_rgba(12,12,12,0.03)]">
+            <button
+              type="button"
+              onClick={() => setPane("preview")}
+              title="预览"
+              className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
+                pane === "preview"
+                  ? "bg-white px-2.5 font-medium text-brand-text shadow-[0_1px_3px_rgba(12,12,12,0.10)]"
+                  : "w-[34px] justify-center text-ink-55 hover:text-ink-80"
+              }`}
+            >
+              <Eye size={17} />
+              {pane === "preview" ? "预览" : null}
+            </button>
+            <button
+              type="button"
+              onClick={() => setPane("code")}
+              title="代码"
+              className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
+                pane === "code"
+                  ? "bg-white px-2.5 font-medium text-brand-text shadow-[0_1px_3px_rgba(12,12,12,0.10)]"
+                  : "w-[34px] justify-center text-ink-55 hover:text-ink-80"
+              }`}
+            >
+              <Code size={17} />
+              {pane === "code" ? "代码" : null}
+            </button>
+          </div>
+
+          <div className="flex min-w-0 items-center gap-1">
+            <div className="relative hidden md:block">
+              <button
+                type="button"
+                onClick={() => setPageMenu((value) => !value)}
+                className="flex h-[30px] items-center gap-1.5 rounded-full px-2.5 text-[13px] text-ink-80 transition hover:bg-line-4"
+              >
+                <Home size={15} />
+                首页
+                <ChevronDown size={13} className="text-ink-55" />
+              </button>
+              {pageMenu ? (
+                <>
+                  <button
+                    type="button"
+                    aria-hidden="true"
+                    className="fixed inset-0 z-20 cursor-default"
+                    onClick={() => setPageMenu(false)}
+                  />
+                  <div className="absolute right-0 top-full z-30 mt-1.5 w-[200px] rounded-xl border border-line-6 bg-white p-1.5 shadow-float">
+                    <p className="px-2 py-1 text-[11px] text-ink-30">当前页面</p>
+                    <div className="flex items-center gap-2 rounded-lg bg-line-4 px-2 py-1.5 text-[13px] text-ink-95">
+                      <Home size={14} />
+                      首页
+                    </div>
+                    <a
+                      href={previewUrl ?? "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={() => setPageMenu(false)}
+                      className={`mt-1 flex items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] ${
+                        previewUrl
+                          ? "text-ink-80 hover:bg-line-4 hover:text-ink-95"
+                          : "pointer-events-none text-ink-30"
+                      }`}
+                    >
+                      <ExternalLink size={14} />
+                      在新标签页打开
+                    </a>
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            <a
+              href={previewUrl ?? "#"}
+              target="_blank"
+              rel="noreferrer"
+              title="在新标签页打开"
+              className={`hidden h-[30px] w-[30px] place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95 md:grid ${
+                previewUrl ? "" : "pointer-events-none opacity-30"
+              }`}
+            >
+              <ExternalLink size={15} />
+            </a>
+            <button
+              type="button"
+              onClick={refreshPreview}
+              title="刷新预览"
+              className="grid h-[30px] w-[30px] place-items-center rounded-full text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
+            >
+              <Refresh size={15} className={running ? "animate-spin" : ""} />
+            </button>
+
+            <span className="mx-1 hidden h-4 w-px bg-line-6 lg:block" />
+            <span className="hidden lg:block">
+              <PresenceAvatars size={28} />
+            </span>
+
+            <button
+              type="button"
+              onClick={() => void share()}
+              className="ml-1 flex h-[30px] items-center rounded-full border border-line-6 bg-white px-3 text-[13px] font-medium text-ink-95 transition hover:border-line-12"
+            >
+              {shareCopied ? "已复制" : "分享"}
+            </button>
+            <button
+              type="button"
+              onClick={refreshPreview}
+              disabled={!previewUrl}
+              title="刷新预览"
+              className="flex h-[30px] items-center rounded-full bg-brand px-3 text-[13px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              更新
+            </button>
+          </div>
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto xl:grid-cols-[260px_400px_minmax(0,1fr)] xl:overflow-hidden">
-        <Timeline executions={executions} running={running} />
+      <div className="flex min-h-0 flex-1">
+        <div style={{ width: chatWidth }} className="flex min-h-0 min-w-0 flex-none flex-col">
+          <ChatPanel
+            turns={turns}
+            running={running}
+            error={error}
+            onSend={(text) => void run(text)}
+            onStop={() => abortRef.current?.abort()}
+            onOpenCode={() => setPane("code")}
+          />
+        </div>
 
-        <section className="flex min-h-[70vh] min-w-0 flex-col border-r border-white/5 bg-ink-900/30 xl:min-h-0">
-          <div className="flex h-12 flex-none items-center justify-between border-b border-white/5 px-3">
-            <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-1">
-              <button
-                type="button"
-                onClick={() => setTab("chat")}
-                className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition ${
-                  tab === "chat"
-                    ? "bg-white/[0.08] text-slate-100"
-                    : "text-slate-500 hover:text-slate-300"
-                }`}
-              >
-                <Chat className="h-3 w-3" />
-                对话
-              </button>
-              <button
-                type="button"
-                onClick={() => setTab("files")}
-                className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition ${
-                  tab === "files"
-                    ? "bg-white/[0.08] text-slate-100"
-                    : "text-slate-500 hover:text-slate-300"
-                }`}
-              >
-                <Code className="h-3 w-3" />
-                文件
-                {Object.keys(artifacts).length > 0 ? (
-                  <span className="rounded bg-white/10 px-1 text-[9px] text-slate-400">
-                    {Object.keys(artifacts).length}
-                  </span>
-                ) : null}
-              </button>
-            </div>
-            {running ? (
-              <span className="inline-flex items-center gap-1.5 text-[10px] text-accent-soft">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
-                生成中
-              </span>
-            ) : (
-              <span className="text-[10px] text-slate-600">
-                {messages.filter((m) => m.role === "user").length} 轮对话
-              </span>
-            )}
-          </div>
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整对话宽度"
+          data-dragging={dragging}
+          onPointerDown={startDrag}
+          className="splitter-handle flex-none"
+        />
 
-          {tab === "chat" ? (
-            <ChatPanel
-              messages={messages}
-              running={running}
-              error={error}
-              onSend={(text) => void run(text)}
-              onStop={() => abortRef.current?.abort()}
-            />
-          ) : (
-            <FilePanel
-              artifacts={artifacts}
-              activeFile={activeFile}
-              onSelect={setActiveFile}
-              streamingFile={streamingFile}
-              streamingBuffer={streamingBuffer}
-            />
-          )}
-        </section>
-
-        <PreviewPane url={previewUrl} running={running} version={latestVersion} mode={mode} />
+        {pane === "preview" ? (
+          <PreviewPane
+            url={previewUrl}
+            running={running}
+            version={latestVersion}
+            mode={mode}
+            refreshKey={refreshKey}
+            onRefresh={refreshPreview}
+          />
+        ) : (
+          <FilePanel
+            artifacts={artifacts}
+            activeFile={activeFile}
+            onSelect={setActiveFile}
+            streamingFile={streamingFile}
+            streamingBuffer={streamingBuffer}
+          />
+        )}
       </div>
     </div>
   );

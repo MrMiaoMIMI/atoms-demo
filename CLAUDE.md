@@ -16,7 +16,7 @@
 
 ## 架构约束
 
-- 三栏布局：左侧执行时间线 / 中间对话+文件树 / 右侧 iframe 预览
+- 两栏布局：左侧对话（执行步骤内联折叠，角色执行中自动展开）/ 右侧 App Viewer（预览、代码两个模式；文件树位于代码模式的右侧面板内），两栏分界线可拖拽
 - 生成代码写入 `backend/data/apps/{project_id}/`，nginx 将 `/apps/` 反代到 FastAPI；FastAPI 托管 `.preview/` 静态产物，并把 `/apps/{id}/api/*` 代理到项目自己的 uvicorn 进程
 - 生成物是按需的完整 Web 项目：`frontend`（Vite + React 18 + TS）、`fullstack`（前端 + FastAPI + SQLite）、`backend`（FastAPI + SQLite）；不针对每个项目执行 `npm install`，预览用共享 esbuild 打包
 - 每个生成项目拥有独立 SQLite：`apps/{id}/backend/data/app.db`，与 demo 的 `backend/data/atoms.db` 完全隔离；重写代码时保留该数据目录
@@ -24,6 +24,15 @@
 - 一次生成请求返回单一 SSE 流，事件类型：`execution` / `token` / `file_start` / `artifact` / `preview` / `message` / `error` / `done`
 - 多智能体用“单 LLM + 角色 prompt 路由”模拟，不真起多进程
 - 所有 AI 调用必须可降级：无 API Key 时走 Mock Agent 返回预置模板；运行中 LLM 失败自动降级并记录 warning；前端构建或后端启动失败也会整轮回退 Mock
+
+## 前端视觉规范（对齐 atoms.dev）
+
+- 浅色单主题：主区 `#F6F6F6`，侧边栏 `#EBEBEA`，卡片白底
+- 主色 `#4267FF` / 文本主色 `#425CE1`；文字层级 `rgba(12,12,12,.95/.8/.55/.3)`
+- 字体自托管：IBM Plex Sans / Serif / Mono（`frontend/public/fonts`，中文回退 PingFang SC / Noto Sans CJK）
+- 首页：270px 侧边栏 + 最大 1100px 内容卡 + 720px composer
+- 工作台：44px 顶栏 + 左侧对话（默认 500px，可拖拽）+ 右侧 App Viewer（预览 / 代码）
+- 无实际功能的官方入口不展示；保留的结构位标注“占位”
 
 ## 数据模型
 
@@ -60,15 +69,16 @@ atoms-demo/
 
 ## 当前阶段
 
-Phase 3：生成模式已从“纯静态前端”升级为“按需生成完整 Web 项目”。
+Phase 3.5：生成模式已从“纯静态前端”升级为“按需生成完整 Web 项目”。
 Planner 判定 frontend / fullstack / backend；确定性脚手架 + LLM 应用代码；
 每个项目独立 FastAPI 运行时与 SQLite；预览构建、CORS、LRU 运行时、数据保留均已本地验证。
+前端已按 atoms.dev 真实页面重构为“首页 Dashboard + 两栏工作台”，执行步骤内联、文件树位于代码模式。
 下一步：部署到腾讯云服务器（安全组 80、数据卷持久化），整理演示脚本与验收截图。
 
 ## 硬性验收
 
 1. 打开 IP 能直接用，无需注册登录
-2. 输入需求 → 看到 Agent 执行时间线 → 按需生成前端/后端 → iframe 真实预览
+2. 输入需求 → 看到 Agent 执行时间线（消息内联，执行中自动展开）→ 按需生成前端/后端 → iframe 真实预览
 3. 可对话续改，前后端文件按需更新
 4. 刷新页面项目不丢失（demo SQLite 持久化）
 5. 全栈项目的业务数据刷新/重启不丢失（项目自己的 SQLite）
