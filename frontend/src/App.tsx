@@ -1,15 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import Home from "./components/Home";
+import ProjectsPage from "./components/ProjectsPage";
 import Workspace from "./components/Workspace";
 import type { Health } from "./types";
 
-function currentProjectId(): string | null {
-  return new URLSearchParams(window.location.search).get("p");
+type Route =
+  | { name: "home" }
+  | { name: "projects" }
+  | { name: "workspace"; projectId: string };
+
+function parseRoute(): Route {
+  const projectId = new URLSearchParams(window.location.search).get("p");
+  if (projectId) return { name: "workspace", projectId };
+  const path = window.location.pathname.replace(/\/+$/, "");
+  if (path === "/projects") return { name: "projects" };
+  return { name: "home" };
 }
 
 export default function App() {
-  const [projectId, setProjectId] = useState<string | null>(() => currentProjectId());
+  const [route, setRoute] = useState<Route>(() => parseRoute());
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
 
@@ -21,40 +31,79 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const onPop = () => setProjectId(currentProjectId());
+    const onPop = () => {
+      setPendingPrompt(null);
+      setRoute(parseRoute());
+    };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  const navigate = useCallback((pid: string | null) => {
-    const url = new URL(window.location.href);
-    if (pid) url.searchParams.set("p", pid);
-    else url.searchParams.delete("p");
-    window.history.pushState({}, "", url);
-    setProjectId(pid);
-    if (!pid) setPendingPrompt(null);
+  useEffect(() => {
+    document.title =
+      route.name === "projects"
+        ? "项目 · Atoms"
+        : route.name === "workspace"
+          ? "工作台 · Atoms"
+          : "Atoms · 让想法变成可运行的应用";
+  }, [route]);
+
+  const goHome = useCallback(() => {
+    window.history.pushState({}, "", "/");
+    setPendingPrompt(null);
+    setRoute({ name: "home" });
+  }, []);
+
+  const goProjects = useCallback(() => {
+    window.history.pushState({}, "", "/projects");
+    setPendingPrompt(null);
+    setRoute({ name: "projects" });
+  }, []);
+
+  const openProject = useCallback((projectId: string) => {
+    window.history.pushState({}, "", `/?p=${encodeURIComponent(projectId)}`);
+    setPendingPrompt(null);
+    setRoute({ name: "workspace", projectId });
   }, []);
 
   const start = useCallback(
-    (pid: string, prompt: string) => {
+    (projectId: string, prompt: string) => {
+      openProject(projectId);
       setPendingPrompt(prompt);
-      navigate(pid);
     },
-    [navigate]
+    [openProject]
   );
 
-  if (projectId) {
+  if (route.name === "workspace") {
     return (
       <Workspace
-        key={projectId}
-        projectId={projectId}
+        key={route.projectId}
+        projectId={route.projectId}
         initialPrompt={pendingPrompt}
         onPromptUsed={() => setPendingPrompt(null)}
         health={health}
-        onExit={() => navigate(null)}
+        onExit={goHome}
       />
     );
   }
 
-  return <Home health={health} onStart={start} onOpen={navigate} />;
+  if (route.name === "projects") {
+    return (
+      <ProjectsPage
+        health={health}
+        onHome={goHome}
+        onNewProject={goHome}
+        onOpenProject={openProject}
+      />
+    );
+  }
+
+  return (
+    <Home
+      health={health}
+      onStart={start}
+      onOpen={openProject}
+      onBrowseAllProjects={goProjects}
+    />
+  );
 }

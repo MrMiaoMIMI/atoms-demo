@@ -7,6 +7,7 @@ export interface AgentPersona {
   avatar: string;
   bg: string;
   ring: string;
+  color: string;
 }
 
 export const AGENTS: AgentPersona[] = [
@@ -17,6 +18,7 @@ export const AGENTS: AgentPersona[] = [
     avatar: "/agents/mike.webp",
     bg: "#F7DFC4",
     ring: "#F1D3B3",
+    color: "#FFBA6C",
   },
   {
     key: "bob",
@@ -25,6 +27,7 @@ export const AGENTS: AgentPersona[] = [
     avatar: "/agents/bob.webp",
     bg: "#E9E4DE",
     ring: "#DCD4CB",
+    color: "#8890CE",
   },
   {
     key: "alex",
@@ -33,6 +36,7 @@ export const AGENTS: AgentPersona[] = [
     avatar: "/agents/alex.webp",
     bg: "#DCEBFB",
     ring: "#C9DFF7",
+    color: "#2BA3FF",
   },
 ];
 
