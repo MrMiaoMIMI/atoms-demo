@@ -12,6 +12,10 @@
 .venv/
 __pycache__/
 *.pyc
+.env
+backend/.env
+backend/data/
+!backend/data/.gitkeep
 
 # Frontend
 frontend/dist/
