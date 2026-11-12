@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 import config
+from mocks import agents as agent_mocks
 from mocks import templates
 
 
@@ -16,7 +17,11 @@ class MockLLM:
 
     async def stream(self, *, role: str, system: str, user: str, meta: dict | None = None) -> AsyncIterator[str]:
         meta = meta or {}
-        if role == "planner":
+        if role == "mike":
+            text = agent_mocks.mike_reply(meta)
+        elif role == "consult":
+            text = agent_mocks.consult_reply(meta)
+        elif role == "planner":
             text = templates.mock_plan(
                 meta.get("prompt", ""),
                 meta.get("existing"),

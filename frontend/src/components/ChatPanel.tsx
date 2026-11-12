@@ -1,12 +1,13 @@
-import type { KeyboardEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { agentFor } from "../lib/agents";
 import { copyText } from "../lib/clipboard";
+import type { ChatGroup } from "../lib/groups";
+import { summaryFromText, versionFromText } from "../lib/groups";
 import { Markdown } from "../lib/markdown";
-import type { Turn } from "../lib/turns";
-import { summaryFromText, versionFromText } from "../lib/turns";
 import { AgentAvatar } from "./Avatar";
 import ExecutionSteps from "./ExecutionSteps";
+import MentionComposer from "./MentionComposer";
+import MentionText from "./MentionText";
 import {
   ArrowUp,
   ChevronDown,
@@ -31,8 +32,15 @@ function dayLabel(iso?: string): string {
   return date.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" });
 }
 
+function timeLabel(iso?: string): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
 interface Props {
-  turns: Turn[];
+  groups: ChatGroup[];
   running: boolean;
   error: string | null;
   onSend: (text: string) => void;
@@ -41,7 +49,7 @@ interface Props {
 }
 
 export default function ChatPanel({
-  turns,
+  groups,
   running,
   error,
   onSend,
@@ -59,15 +67,15 @@ export default function ChatPanel({
 
   const signal = useMemo(
     () =>
-      turns.reduce(
-        (total, turn) =>
+      groups.reduce(
+        (total, group) =>
           total +
-          (turn.assistant?.content.length ?? 0) +
-          (turn.user?.content.length ?? 0) +
-          turn.executions.length,
+          group.executions.length +
+          group.messages.reduce((sum, message) => sum + message.length, 0) +
+          (group.user?.content.length ?? 0),
         0
       ),
-    [turns]
+    [groups]
   );
 
   useEffect(() => {
@@ -75,13 +83,6 @@ export default function ChatPanel({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [signal, running]);
-
-  useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
-  }, [input]);
 
   function onScroll() {
     const el = scrollRef.current;
@@ -106,14 +107,7 @@ export default function ChatPanel({
     onSend(text);
   }
 
-  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      submit();
-    }
-  }
-
-  async function copyTurn(id: string, content: string) {
+  async function copyGroup(id: string, content: string) {
     const ok = await copyText(content);
     if (!ok) return;
     setCopied(id);
@@ -128,97 +122,116 @@ export default function ChatPanel({
           onScroll={onScroll}
           className="h-full overflow-y-auto px-4 pb-3 pt-5"
         >
-        {turns.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center px-6 text-center">
-            <span className="grid h-12 w-12 place-items-center rounded-2xl bg-white text-brand shadow-pill">
-              <Code size={22} />
-            </span>
-            <p className="mt-4 text-[15px] font-medium text-ink-95">描述你想构建的应用</p>
-            <p className="mt-1.5 max-w-[300px] text-[12px] leading-[19px] text-ink-55">
-              Planner 判断形态，Coder 生成代码，Deployer 启动预览。生成后继续对话即可修改。
-            </p>
-            <div className="mt-4 flex flex-wrap justify-center gap-2">
-              {QUICK_EDITS.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  onClick={() => {
-                    setInput(item);
-                    textareaRef.current?.focus();
-                  }}
-                  className="rounded-full border border-line-6 bg-white px-3 py-1.5 text-[12px] text-ink-55 transition hover:border-line-12 hover:text-ink-80"
-                >
-                  {item.length > 18 ? `${item.slice(0, 18)}…` : item}
-                </button>
-              ))}
+          {groups.length === 0 ? (
+            <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+              <span className="grid h-12 w-12 place-items-center rounded-2xl bg-white text-brand shadow-pill">
+                <Code size={22} />
+              </span>
+              <p className="mt-4 text-[15px] font-medium text-ink-95">描述你想构建的应用</p>
+              <p className="mt-1.5 max-w-[320px] text-[12px] leading-[19px] text-ink-55">
+                Mike 拆解需求，Bob 设计架构，Alex 写代码并启动预览。也可以输入 @
+                直接指定某一位智能体。
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                {QUICK_EDITS.map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={() => {
+                      setInput(item);
+                      textareaRef.current?.focus();
+                    }}
+                    className="rounded-full border border-line-6 bg-white px-3 py-1.5 text-[12px] text-ink-55 transition hover:border-line-12 hover:text-ink-80"
+                  >
+                    {item.length > 18 ? `${item.slice(0, 18)}…` : item}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
-        ) : (
-          <div className="space-y-6">
-            {turns.map((turn, index) => {
-              const previousTurn = turns[index - 1];
-              const day = dayLabel(turn.user?.created_at ?? turn.assistant?.created_at);
-              const previousDay = dayLabel(
-                previousTurn?.user?.created_at ?? previousTurn?.assistant?.created_at
-              );
-              const showDay = Boolean(day) && day !== previousDay;
-              const assistantContent = turn.assistant?.content ?? "";
-              const version = versionFromText(assistantContent);
-              const persona = agentFor("orchestrator");
-              const hasAssistant =
-                Boolean(turn.assistant) || turn.live || turn.executions.length > 0;
+          ) : (
+            <div className="space-y-6">
+              {groups.map((group, index) => {
+                const previous = groups[index - 1];
+                const day = dayLabel(group.createdAt ?? group.user?.created_at);
+                const previousDay = dayLabel(previous?.createdAt ?? previous?.user?.created_at);
+                const showDay = Boolean(day) && day !== previousDay;
 
-              return (
-                <div key={turn.id} className="space-y-4">
-                  {showDay ? (
-                    <div className="flex items-center gap-3 py-1 text-[12px] text-ink-30">
-                      <span className="h-px flex-1 bg-line-4" />
-                      {day}
-                      <span className="h-px flex-1 bg-line-4" />
-                    </div>
-                  ) : null}
-
-                  {turn.user ? (
-                    <div className="flex justify-end">
-                      <div className="max-w-[86%] whitespace-pre-wrap break-words rounded-[12px] rounded-tl-none bg-line-4 px-3 py-2.5 text-[16px] leading-[24px] text-ink-80">
-                        {turn.user.content}
+                if (group.kind === "user") {
+                  return (
+                    <div key={group.id} className="space-y-4">
+                      {showDay ? (
+                        <div className="flex items-center gap-3 py-1 text-[12px] text-ink-30">
+                          <span className="h-px flex-1 bg-line-4" />
+                          {day}
+                          <span className="h-px flex-1 bg-line-4" />
+                        </div>
+                      ) : null}
+                      <div className="flex justify-end">
+                        <div className="max-w-[86%] whitespace-pre-wrap break-words rounded-[12px] rounded-tl-none bg-line-4 px-3 py-2.5 text-[16px] leading-[24px] text-ink-80">
+                          <MentionText text={group.user?.content ?? ""} />
+                        </div>
                       </div>
                     </div>
-                  ) : null}
+                  );
+                }
 
-                  {hasAssistant ? (
-                    <div className="flex items-start gap-3">
+                const persona = agentFor(group.agent);
+                const content = group.messages.join("\n\n");
+                const buildMessage = group.messages.find((message) =>
+                  /^已完成\s*v\d+/i.test(message.trim())
+                );
+                const version = buildMessage ? versionFromText(buildMessage) : null;
+                const hasBody = group.messages.length > 0 || group.executions.length > 0;
+
+                return (
+                  <div key={group.id} className="space-y-4">
+                    {showDay ? (
+                      <div className="flex items-center gap-3 py-1 text-[12px] text-ink-30">
+                        <span className="h-px flex-1 bg-line-4" />
+                        {day}
+                        <span className="h-px flex-1 bg-line-4" />
+                      </div>
+                    ) : null}
+
+                    <div className="group flex items-start gap-3">
                       <AgentAvatar
-                        agent="orchestrator"
+                        agent={persona.key}
                         size={32}
                         ringColor="#F6F6F6"
                         className="mt-0.5"
                       />
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2 text-[14px] leading-[22px]">
+                        <div className="flex h-[22px] items-center gap-2 text-[14px] leading-[22px]">
                           <span className="font-medium text-ink-95">{persona.name}</span>
-                          <span className="text-ink-30">|</span>
-                          <span className="text-ink-55">{persona.role}</span>
+                          <span className="h-3 w-px bg-line-8" />
+                          <span className="text-[12px] text-ink-55">{persona.role}</span>
+                          <span className="hidden text-[12px] text-ink-30 group-hover:inline">
+                            {group.live ? "正在处理" : timeLabel(group.createdAt)}
+                          </span>
                         </div>
 
-                        <ExecutionSteps executions={turn.executions} live={turn.live} />
+                        <ExecutionSteps executions={group.executions} live={group.live} />
 
-                        {assistantContent ? (
-                          <Markdown content={assistantContent} className="mt-3" />
-                        ) : turn.live ? (
+                        {group.messages.map((message, messageIndex) => (
+                          <Markdown
+                            key={`${group.id}-m-${messageIndex}`}
+                            content={message}
+                            className={messageIndex === 0 ? "mt-3" : "mt-4"}
+                          />
+                        ))}
+
+                        {group.live && !group.messages.length ? (
                           <div className="mt-3 flex items-center gap-2 text-[14px] text-ink-55">
                             <span className="flex gap-1">
                               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-30 [animation-delay:-0.2s]" />
                               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-30 [animation-delay:-0.1s]" />
                               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-30" />
                             </span>
-                            {turn.executions.some((execution) => execution.status === "running")
-                              ? "正在生成…"
-                              : "等待智能体响应…"}
+                            正在生成…
                           </div>
                         ) : null}
 
-                        {turn.assistant && version ? (
+                        {hasBody && version ? (
                           <button
                             type="button"
                             onClick={onOpenCode}
@@ -230,18 +243,18 @@ export default function ChatPanel({
                                 版本 {version}
                               </p>
                               <p className="mt-0.5 line-clamp-2 text-[13px] leading-[20px] text-ink-80">
-                                {summaryFromText(assistantContent) || "构建完成"}
+                                {summaryFromText(buildMessage) || "构建完成"}
                               </p>
                             </div>
                             <Code size={16} className="mt-0.5 flex-none text-brand-text" />
                           </button>
                         ) : null}
 
-                        {turn.assistant ? (
+                        {group.messages.length ? (
                           <div className="mt-3 flex items-center gap-1">
                             <button
                               type="button"
-                              onClick={() => void copyTurn(turn.id, assistantContent)}
+                              onClick={() => void copyGroup(group.id, content)}
                               title="复制"
                               className="grid h-7 w-7 place-items-center rounded-md text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
                             >
@@ -255,24 +268,21 @@ export default function ChatPanel({
                             >
                               <Code size={15} />
                             </button>
-                            {copied === turn.id ? (
+                            {copied === group.id ? (
                               <span className="ml-1 text-[11px] text-ink-30">已复制</span>
                             ) : null}
                           </div>
                         ) : null}
                       </div>
                     </div>
-                  ) : null}
-
-                </div>
-              );
-            })}
-          </div>
-        )}
-
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
-        {!atBottom && turns.length ? (
+        {!atBottom && groups.length ? (
           <button
             type="button"
             onClick={scrollToBottom}
@@ -292,14 +302,19 @@ export default function ChatPanel({
         ) : null}
 
         <div className="rounded-[24px] border border-line-4 bg-white p-3 shadow-composer transition focus-within:border-line-8">
-          <textarea
-            ref={textareaRef}
+          <MentionComposer
             value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={handleKeyDown}
+            onChange={setInput}
+            onSubmit={submit}
+            textareaRef={textareaRef}
             rows={2}
             maxLength={4000}
-            placeholder={running ? "Agent 正在生成，可以先描述下一轮修改…" : "让智能体团队实现你的想法"}
+            maxHeight={140}
+            placeholder={
+              running
+                ? "Agent 正在处理，可以先描述下一轮修改…"
+                : "让智能体团队实现你的想法，输入 @ 指定成员"
+            }
             className="max-h-[140px] min-h-[48px] w-full resize-none bg-transparent px-1 text-[14px] leading-[22px] text-ink-95 outline-none placeholder:text-ink-30"
           />
 
@@ -367,7 +382,6 @@ export default function ChatPanel({
             </div>
           </div>
         </div>
-
       </div>
     </div>
   );

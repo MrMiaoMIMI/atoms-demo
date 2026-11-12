@@ -25,11 +25,16 @@ export function AgentAvatar({
         height: size,
         background: persona.bg,
         borderColor: ringColor,
-        fontSize: Math.round(size * 0.53),
         lineHeight: 1,
       }}
     >
-      <span className="translate-y-[0.5px]">{persona.emoji}</span>
+      <img
+        src={persona.avatar}
+        alt=""
+        draggable={false}
+        className="h-full w-full object-cover"
+        style={{ transform: "scale(1.08)" }}
+      />
     </span>
   );
 }
@@ -49,7 +54,7 @@ export function AgentRail({
         <span
           key={persona.key}
           className="inline-flex rounded-full"
-          style={{ marginLeft: index === 0 ? 0 : -Math.round(size * 0.26) }}
+          style={{ marginLeft: index === 0 ? 0 : -Math.round(size * 0.22) }}
         >
           <AgentAvatar
             agent={persona.key}
@@ -64,7 +69,7 @@ export function AgentRail({
 }
 
 export function PresenceAvatars({
-  agents = ["orchestrator", "coder", "reviewer"],
+  agents = ["mike", "bob", "alex"],
   size = 30,
   ringColor = "#F6F6F6",
 }: {

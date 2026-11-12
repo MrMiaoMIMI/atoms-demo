@@ -13,12 +13,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import shutil
-import tempfile
+import uuid
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import Any
 
+import agents as agent_roster
 import config
 import db
 import frontend_builder
@@ -26,6 +26,7 @@ import runtime
 import scaffold
 from llm import MockLLM, get_llm
 from mocks import templates
+from tools import Toolbox, ToolContext
 
 Emit = Callable[[str, dict], Awaitable[Any]]
 
@@ -680,18 +681,6 @@ def _repair_backend_user(files: dict[str, str], issues: list[str], plan: dict) -
     )
 
 
-async def _check_health(port: int) -> None:
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            response = await client.get(f"http://127.0.0.1:{port}/api/health")
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"健康检查失败：{type(exc).__name__}: {exc}") from exc
-    if response.status_code >= 400:
-        raise RuntimeError(f"健康检查返回 HTTP {response.status_code}")
-
-
 async def _llm_text(
     llm,
     *,
@@ -762,133 +751,233 @@ async def _llm_text(
 
 
 # ---------------------------------------------------------------------------
-# Publishing + preview
+# Role orchestration
 # ---------------------------------------------------------------------------
 
-async def _publish(pid: str, files: dict[str, str]) -> None:
-    """Replace the project tree while preserving its SQLite data directory."""
-    await runtime.runtime.stop(pid)
-    target = config.APPS_DIR / pid
+MAX_TOTAL_RUNS = 5
+MAX_RUNS_PER_AGENT = 2
 
-    def write() -> None:
-        backup: Path | None = None
-        data_dir = target / "backend" / "data"
-        try:
-            if data_dir.exists():
-                backup = Path(tempfile.mkdtemp()) / "data"
-                shutil.move(str(data_dir), str(backup))
-            if target.exists():
-                shutil.rmtree(target)
-            target.mkdir(parents=True, exist_ok=True)
-            for name, content in files.items():
-                dest = target / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(content, encoding="utf-8")
-        finally:
-            if backup is not None:
-                restore = target / "backend" / "data"
-                restore.parent.mkdir(parents=True, exist_ok=True)
-                if restore.exists():
-                    shutil.rmtree(restore)
-                shutil.move(str(backup), str(restore))
-
-    await asyncio.to_thread(write)
+MODE_LABEL = {
+    "frontend": "纯前端",
+    "fullstack": "前后端一体",
+    "backend": "纯后端 API",
+}
 
 
-async def _emit_artifact(
-    pid: str,
-    version: int,
-    path: str,
-    content: str,
-    emit: Emit,
-) -> None:
-    await db.add_artifact(pid, path, content, version)
-    await emit("artifact", {"filename": path, "content": content, "version": version})
+class RoleEmitter:
+    """Adds agent + run_id to every event emitted by one agent run."""
 
+    def __init__(
+        self,
+        pid: str,
+        run_id: str,
+        agent: str,
+        emit: Emit,
+        version: int,
+        index: int = 0,
+    ) -> None:
+        self.pid = pid
+        self.run_id = run_id
+        self.agent = agent
+        self.base_emit = emit
+        self.version = version
+        self.index = index
 
-async def _build_preview(pid: str, plan: dict) -> None:
-    if plan["mode"] in ("frontend", "fullstack"):
-        await frontend_builder.build(pid, plan["title"])
-    if plan["mode"] == "backend":
-        await asyncio.to_thread(
-            frontend_builder.publish_api_page, pid, plan["title"], plan["api"]
+    async def __call__(self, event: str, payload: dict) -> Any:
+        data = dict(payload)
+        if event in {"execution", "message", "agent_start", "agent_end"}:
+            data["agent"] = self.agent
+            data["run_id"] = self.run_id
+            data["run_index"] = self.index
+        elif event in {"artifact", "file_start", "token", "token_reset"}:
+            data.setdefault("run_id", self.run_id)
+            data.setdefault("agent", self.agent)
+        return await self.base_emit(event, data)
+
+    def toolbox(self) -> Toolbox:
+        spec = agent_roster.AGENTS[self.agent]
+        return Toolbox(
+            ToolContext(
+                pid=self.pid,
+                run_id=self.run_id,
+                agent=self.agent,
+                emit=self.base_emit,
+                version=self.version,
+            ),
+            spec.tools,
         )
 
 
-async def _install_mock_fallback(
-    pid: str,
-    version: int,
-    existing: dict[str, str],
-    message: str,
-    existing_mode: str | None,
+def _new_run_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _project_context(
     project_name: str,
-    emit: Emit,
-) -> dict:
-    plan = _mock_plan_data(message, existing, existing_mode, project_name)
-    scaffolds = _scaffold_files(plan, existing)
-    contents = _mock_contents(plan)
-    published = _prune({**existing, **scaffolds, **contents}, plan["mode"])
-    for path, content in {**scaffolds, **contents}.items():
-        if existing.get(path) != content:
-            await _emit_artifact(pid, version, path, content, emit)
-    await _publish(pid, published)
-    return {"plan": plan, "published": published, "contents": contents}
+    existing: dict[str, str],
+    mode: str | None,
+    version: int,
+) -> str:
+    files = ", ".join(sorted(existing)[:30]) or "（空）"
+    return (
+        f"项目：{project_name}\n"
+        f"当前形态：{mode or '空项目'}\n"
+        f"当前版本：v{version}\n"
+        f"文件（{len(existing)}）：{files}"
+    )
 
 
-def _build_error_path(error: str, published: dict[str, str]) -> str | None:
-    match = re.search(r"((?:src/)[^\s:]+\.(?:tsx|ts|jsx|js|css))", error)
-    if not match:
-        return None
-    path = "frontend/" + match.group(1)
-    return path if path in published else None
+def _fallback_route(message: str, existing_mode: str | None) -> str:
+    """Deterministic fallback when Mike omits the trailing @mention."""
+    text = (message or "").lower()
+    backend_need = any(
+        token in text
+        for token in (
+            "登录",
+            "支付",
+            "订单",
+            "数据库",
+            "数据保存",
+            "持久化",
+            "存储",
+            "sqlite",
+            "多表",
+            "权限",
+            "购物车",
+            "后台",
+            "库存",
+            "api",
+            "后端",
+            "全栈",
+            "webhook",
+            "用户",
+            "fullstack",
+        )
+    )
+    frontend_only = any(
+        token in text
+        for token in (
+            "颜色",
+            "配色",
+            "样式",
+            "字体",
+            "文案",
+            "按钮",
+            "布局",
+            "间距",
+            "圆角",
+            "图片",
+            "动效",
+            "首页",
+            "落地页",
+        )
+    )
+    if backend_need:
+        return "bob"
+    if existing_mode in ("fullstack", "backend") and not frontend_only:
+        return "bob"
+    if len(message or "") > 240:
+        return "bob"
+    return "alex"
 
 
-# ---------------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------------
-
-async def run_generation(pid: str, message: str, emit: Emit) -> None:
-    project = await db.get_project(pid)
-    project_name = (project or {}).get("name") or "未命名项目"
-    existing = await db.latest_artifacts(pid)
-    version = await db.next_version(pid)
-    existing_mode = _existing_mode(existing)
-    llm = get_llm()
+async def _run_mike(
+    pid: str,
+    message: str,
+    emit: RoleEmitter,
+    *,
+    project_name: str,
+    existing: dict[str, str],
+    existing_mode: str | None,
+    current_version: int,
+) -> str:
+    ex = await emit(
+        "execution",
+        {"step": "理解需求", "status": "running", "log": "分析目标、约束与现有项目…"},
+    )
+    context = _project_context(project_name, existing, existing_mode, current_version)
+    user = (
+        f"用户请求：\n{message}\n\n"
+        f"项目上下文：\n{context}\n\n"
+        "请按角色要求输出；最后一行给出 @Bob 或 @Alex。"
+    )
     state: dict = {}
+    text = await _llm_text(
+        get_llm(),
+        role="mike",
+        system=agent_roster.MIKE_SYSTEM,
+        user=user,
+        meta={
+            "prompt": message,
+            "project_name": project_name,
+            "mode": existing_mode,
+            "files": sorted(existing),
+            "version": current_version,
+        },
+        emit=emit,
+        emit_tokens=False,
+        state=state,
+    )
+    text = text.strip()
+    if not text:
+        target = _fallback_route(message, existing_mode)
+        text = f"需求理解：{message[:80]}\n\n复杂度：待评估\n\n@{agent_roster.AGENT_NAMES[target]}"
 
-    ctx = await emit(
+    tail = agent_roster.parse_mentions(text, tail_only=True)
+    if not tail:
+        target = _fallback_route(message, existing_mode)
+        text = text.rstrip() + f"\n\n@{agent_roster.AGENT_NAMES[target]}"
+        tail = [target]
+    await emit(
         "execution",
         {
-            "agent": "Orchestrator",
-            "step": "载入上下文",
+            "id": ex,
+            "step": "理解需求",
+            "status": "success",
+            "log": f"{len(message)} 字符需求 · {len(existing)} 个已有文件",
+        },
+    )
+    ex2 = await emit(
+        "execution",
+        {
+            "step": "拆解与分配",
             "status": "running",
-            "log": f"{len(existing)} 个已有文件 · 模型 {config.LLM_MODEL if config.LLM_MODE == 'deepseek' else 'mock'}",
+            "log": "判断复杂度并选择下一位…",
         },
     )
     await emit(
         "execution",
         {
-            "id": ctx,
-            "agent": "Orchestrator",
-            "step": "载入上下文",
+            "id": ex2,
+            "step": "拆解与分配",
             "status": "success",
-            "log": f"目标版本 v{version} · 现有形态 {existing_mode or '空项目'}",
+            "log": "交接给 " + "、".join(
+                f"@{agent_roster.AGENT_NAMES[key]}" for key in tail
+            ),
         },
     )
+    return text
 
-    # 1) Planner -------------------------------------------------------------
-    plan_ex = await emit(
-        "execution",
-        {"agent": "Planner", "step": "需求分析与形态规划", "status": "running", "log": "拆解需求…"},
-    )
+
+async def _call_planner(
+    message: str,
+    emit: RoleEmitter,
+    *,
+    project_name: str,
+    existing: dict[str, str],
+    existing_mode: str | None,
+    extra_context: str = "",
+) -> tuple[dict, bool]:
     planner_user = (
         f"用户需求：\n{message}\n\n"
-        f"当前项目文件：{', '.join(existing) if existing else '（空项目）'}\n"
-        f"当前形态：{existing_mode or '（空项目）'}\n\n"
-        "输出 JSON。"
+        + (f"{extra_context}\n\n" if extra_context else "")
+        + f"当前项目文件：{', '.join(existing) if existing else '（空项目）'}\n"
+        + f"当前形态：{existing_mode or '（空项目）'}\n\n"
+        + "输出 JSON。"
     )
+    state: dict = {}
     plan_text = await _llm_text(
-        llm,
+        get_llm(),
         role="planner",
         system=PLANNER_SYSTEM,
         user=planner_user,
@@ -902,32 +991,242 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         state=state,
     )
     plan = _plan_from_text(plan_text, message, existing, existing_mode, project_name)
-    if state.get("degraded"):
+    is_mock = bool(state.get("degraded"))
+    if is_mock:
         plan = _mock_plan_data(message, existing, existing_mode, project_name)
+    return plan, is_mock
+
+
+async def _run_bob(
+    pid: str,
+    message: str,
+    emit: RoleEmitter,
+    *,
+    project_name: str,
+    existing: dict[str, str],
+    existing_mode: str | None,
+    mike_text: str,
+) -> tuple[dict, str, bool]:
+    ex = await emit(
+        "execution",
+        {
+            "step": "分析项目形态",
+            "status": "running",
+            "log": "阅读现有结构，判断前端 / 全栈 / 后端…",
+        },
+    )
+    plan, is_mock = await _call_planner(
+        message,
+        emit,
+        project_name=project_name,
+        existing=existing,
+        existing_mode=existing_mode,
+        extra_context=(f"Mike 的计划：\n{mike_text}" if mike_text else ""),
+    )
     await emit(
         "execution",
         {
-            "id": plan_ex,
-            "agent": "Planner",
-            "step": "需求分析与形态规划",
+            "id": ex,
+            "step": "分析项目形态",
             "status": "success",
-            "log": (
-                f"{plan['summary']} → {plan['mode']} · "
-                f"{len(plan['entities'])} 张表 · {len(plan['files'])} 个应用文件"
-            ),
+            "log": f"{plan['summary']} → {plan['mode']}",
         },
     )
-    await asyncio.sleep(0.2)
 
+    ex2 = await emit(
+        "execution",
+        {
+            "step": "设计数据模型与接口",
+            "status": "running",
+            "log": "校验表结构、API 合约与文件清单…",
+        },
+    )
+    toolbox = emit.toolbox()
+    try:
+        valid = await toolbox.call("validate_plan", plan=plan)
+    except Exception:  # noqa: BLE001 - validation must never block the plan
+        valid = True
+    if not valid:
+        plan = _mock_plan_data(message, existing, existing_mode, project_name)
+        is_mock = True
+    tables = "、".join(item["table"] for item in plan["entities"]) or "无"
+    api_count = len(plan["api"])
+    files = "、".join(item["path"] for item in plan["files"][:6])
+    await emit(
+        "execution",
+        {
+            "id": ex2,
+            "step": "设计数据模型与接口",
+            "status": "success",
+            "log": f"{len(plan['entities'])} 张表 · {api_count} 个 API · {len(plan['files'])} 个文件",
+        },
+    )
+    text = (
+        f"技术方案：{plan['summary']}\n"
+        f"形态：{MODE_LABEL.get(plan['mode'], plan['mode'])}（{plan['mode']}）\n"
+        f"数据表：{tables}\n"
+        f"API：{api_count} 个\n"
+        f"文件：{files}\n\n"
+        "@Alex"
+    )
+    return plan, text, is_mock
+
+
+async def _run_alex(
+    pid: str,
+    message: str,
+    emit: RoleEmitter,
+    *,
+    project_name: str,
+    existing: dict[str, str],
+    existing_mode: str | None,
+    version: int,
+    plan: dict | None,
+    plan_is_mock: bool,
+    bob_text: str = "",
+) -> str:
+    if plan is None:
+        ex = await emit(
+            "execution",
+            {
+                "step": "分析需求与形态",
+                "status": "running",
+                "log": "读取现有项目并规划应用结构…",
+            },
+        )
+        plan, plan_is_mock = await _call_planner(
+            message,
+            emit,
+            project_name=project_name,
+            existing=existing,
+            existing_mode=existing_mode,
+        )
+        await emit(
+            "execution",
+            {
+                "id": ex,
+                "step": "分析需求与形态",
+                "status": "success",
+                "log": f"{plan['summary']} → {plan['mode']}",
+            },
+        )
+        ex2 = await emit(
+            "execution",
+            {
+                "step": "规划数据与接口",
+                "status": "running",
+                "log": "确定表结构、API 与文件范围…",
+            },
+        )
+        await emit(
+            "execution",
+            {
+                "id": ex2,
+                "step": "规划数据与接口",
+                "status": "success",
+                "log": f"{len(plan['entities'])} 张表 · {len(plan['api'])} 个 API",
+            },
+        )
+    else:
+        ex = await emit(
+            "execution",
+            {
+                "step": "接收架构方案",
+                "status": "running",
+                "log": "读取 Bob 的技术方案…",
+            },
+        )
+        await emit(
+            "execution",
+            {
+                "id": ex,
+                "step": "接收架构方案",
+                "status": "success",
+                "log": f"{plan['mode']} · {len(plan['files'])} 个文件"
+                + ("（Mock 方案）" if plan_is_mock else ""),
+            },
+        )
+
+    state: dict = {}
+    return await _build_project(
+        pid,
+        message,
+        plan,
+        emit,
+        existing=existing,
+        existing_mode=existing_mode,
+        project_name=project_name,
+        version=version,
+        llm=get_llm(),
+        state=state,
+        plan_is_mock=plan_is_mock,
+        bob_text=bob_text,
+    )
+
+
+async def _install_mock_fallback(
+    pid: str,
+    version: int,
+    existing: dict[str, str],
+    message: str,
+    existing_mode: str | None,
+    project_name: str,
+    emit: RoleEmitter,
+    toolbox: Toolbox,
+) -> dict:
+    plan = _mock_plan_data(message, existing, existing_mode, project_name)
+    scaffolds = _scaffold_files(plan, existing)
+    contents = _mock_contents(plan)
+    published = _prune({**existing, **scaffolds, **contents}, plan["mode"])
+    for path, content in {**scaffolds, **contents}.items():
+        if existing.get(path) != content:
+            await toolbox.call("write_file", path=path, content=content)
+    await toolbox.call("publish_files", files=published)
+    return {"plan": plan, "published": published, "contents": contents}
+
+
+def _build_error_path(error: str, published: dict[str, str]) -> str | None:
+    match = re.search(r"((?:src/)[^\s:]+\.(?:tsx|ts|jsx|js|css))", error)
+    if not match:
+        return None
+    path = "frontend/" + match.group(1)
+    return path if path in published else None
+
+
+async def _build_project(
+    pid: str,
+    message: str,
+    plan: dict,
+    emit: RoleEmitter,
+    *,
+    existing: dict[str, str],
+    existing_mode: str | None,
+    project_name: str,
+    version: int,
+    llm,
+    state: dict,
+    plan_is_mock: bool,
+    bob_text: str = "",
+) -> str:
+    toolbox = emit.toolbox()
     existing = _prune(existing, plan["mode"])
-    force_mock = bool(state.get("degraded"))
+    force_mock = plan_is_mock or bool(state.get("degraded"))
 
-    # 2) Scaffold + app files ------------------------------------------------
+    if bob_text:
+        await emit(
+            "execution",
+            {
+                "step": "对齐 Bob 的方案",
+                "status": "success",
+                "log": bob_text.replace("\n", " ")[:140],
+            },
+        )
+
+    # 1) Scaffold ------------------------------------------------------------
     scaffolds = _scaffold_files(plan, existing)
     scaffold_ex = await emit(
         "execution",
         {
-            "agent": "Coder",
             "step": "生成项目脚手架",
             "status": "running",
             "log": "Vite / FastAPI / SQLite 基础文件",
@@ -935,18 +1234,18 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
     )
     for path, content in scaffolds.items():
         if existing.get(path) != content:
-            await _emit_artifact(pid, version, path, content, emit)
+            await toolbox.call("write_file", path=path, content=content)
     await emit(
         "execution",
         {
             "id": scaffold_ex,
-            "agent": "Coder",
             "step": "生成项目脚手架",
             "status": "success",
             "log": f"{len(scaffolds)} 个基础文件 · {plan['mode']}",
         },
     )
 
+    # 2) Application files ---------------------------------------------------
     contents: dict[str, str] = {}
     for item in plan["files"]:
         path = item["path"]
@@ -954,7 +1253,7 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
             continue
         step_ex = await emit(
             "execution",
-            {"agent": "Coder", "step": f"生成 {path}", "status": "running", "log": item["purpose"]},
+            {"step": f"生成 {path}", "status": "running", "log": item["purpose"]},
         )
         await emit("file_start", {"filename": path, "purpose": item["purpose"]})
         known = {**existing, **contents}
@@ -977,12 +1276,11 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         )
         content = _clean_file_content(raw)
         contents[path] = content
-        await _emit_artifact(pid, version, path, content, emit)
+        await toolbox.call("write_file", path=path, content=content)
         await emit(
             "execution",
             {
                 "id": step_ex,
-                "agent": "Coder",
                 "step": f"生成 {path}",
                 "status": "success",
                 "log": f"{len(content):,} 字符",
@@ -993,7 +1291,14 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
 
     if state.get("degraded") and not force_mock:
         fallback = await _install_mock_fallback(
-            pid, version, existing, message, existing_mode, project_name, emit
+            pid,
+            version,
+            existing,
+            message,
+            existing_mode,
+            project_name,
+            emit,
+            toolbox,
         )
         plan = fallback["plan"]
         published = fallback["published"]
@@ -1002,7 +1307,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         await emit(
             "execution",
             {
-                "agent": "Orchestrator",
                 "step": "整轮回退 Mock 模板",
                 "status": "warning",
                 "log": "LLM 输出异常，已替换为一致的可运行模板",
@@ -1016,13 +1320,12 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         updated = _scaffold_files(plan, existing)
         published = _prune({**existing, **updated, **contents}, plan["mode"])
         for path, content in contents.items():
-            await _emit_artifact(pid, version, path, content, emit)
+            await toolbox.call("write_file", path=path, content=content)
 
     # 3) Reviewer: deterministic checks + auto repair ------------------------
     review_ex = await emit(
         "execution",
         {
-            "agent": "Reviewer",
             "step": "结构与联调检查",
             "status": "running",
             "log": "检查文件、样式、API 路径与 Python 语法…",
@@ -1036,7 +1339,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
             repair_ex = await emit(
                 "execution",
                 {
-                    "agent": "Coder",
                     "step": "修复 styles.css",
                     "status": "running",
                     "log": ("Reviewer 自动回修：" + "；".join(issues))[:180],
@@ -1076,8 +1378,8 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                     break
                 published["frontend/src/styles.css"] = repaired
                 contents["frontend/src/styles.css"] = repaired
-                await _emit_artifact(
-                    pid, version, "frontend/src/styles.css", repaired, emit
+                await toolbox.call(
+                    "write_file", path="frontend/src/styles.css", content=repaired
                 )
                 issues = _review(published, plan["mode"])
             repair_notes.append("样式缺口与移动端规则已自动回修")
@@ -1085,7 +1387,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                 "execution",
                 {
                     "id": repair_ex,
-                    "agent": "Coder",
                     "step": "修复 styles.css",
                     "status": "success" if not _needs_style_repair(issues) else "warning",
                     "log": (
@@ -1101,7 +1402,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
             repair_ex = await emit(
                 "execution",
                 {
-                    "agent": "Coder",
                     "step": f"修复 {target_path}",
                     "status": "running",
                     "log": "；".join(issues)[:180],
@@ -1134,14 +1434,13 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
             if repaired:
                 published[target_path] = repaired
                 contents[target_path] = repaired
-                await _emit_artifact(pid, version, target_path, repaired, emit)
+                await toolbox.call("write_file", path=target_path, content=repaired)
                 issues = _review(published, plan["mode"])
                 repair_notes.append("前后端 API 调用已自动回修")
             await emit(
                 "execution",
                 {
                     "id": repair_ex,
-                    "agent": "Coder",
                     "step": f"修复 {target_path}",
                     "status": "success" if not _needs_app_repair(issues) else "warning",
                     "log": "联调检查通过" if not _needs_app_repair(issues) else "；".join(issues)[:160],
@@ -1157,7 +1456,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
             repair_ex = await emit(
                 "execution",
                 {
-                    "agent": "Coder",
                     "step": "修复 backend/main.py",
                     "status": "running",
                     "log": "；".join(backend_issues)[:180],
@@ -1190,7 +1488,9 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
             if repaired and not state.get("degraded"):
                 published["backend/main.py"] = repaired
                 contents["backend/main.py"] = repaired
-                await _emit_artifact(pid, version, "backend/main.py", repaired, emit)
+                await toolbox.call(
+                    "write_file", path="backend/main.py", content=repaired
+                )
                 issues = _review(published, plan["mode"])
                 backend_issues = [
                     issue
@@ -1202,7 +1502,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                 "execution",
                 {
                     "id": repair_ex,
-                    "agent": "Coder",
                     "step": "修复 backend/main.py",
                     "status": "success" if not backend_issues else "warning",
                     "log": "后端检查通过" if not backend_issues else "回修后仍有问题",
@@ -1213,7 +1512,14 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
     # hybrid (real files + mock file): replace the whole round consistently.
     if state.get("degraded") and not force_mock:
         fallback = await _install_mock_fallback(
-            pid, version, existing, message, existing_mode, project_name, emit
+            pid,
+            version,
+            existing,
+            message,
+            existing_mode,
+            project_name,
+            emit,
+            toolbox,
         )
         plan = fallback["plan"]
         published = fallback["published"]
@@ -1224,7 +1530,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         await emit(
             "execution",
             {
-                "agent": "Orchestrator",
                 "step": "整轮回退 Mock 模板",
                 "status": "warning",
                 "log": "回修阶段 LLM 输出异常，已替换为一致的可运行模板",
@@ -1235,12 +1540,9 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         "execution",
         {
             "id": review_ex,
-            "agent": "Reviewer",
             "step": "结构与联调检查",
             "status": "warning" if issues else "success",
-            "log": (
-                "；".join(issues) if issues else f"{len(published)} 个文件通过检查"
-            )
+            "log": ("；".join(issues) if issues else f"{len(published)} 个文件通过检查")
             + ("（已自动回修）" if repair_notes else ""),
         },
     )
@@ -1249,30 +1551,26 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
     deploy_ex = await emit(
         "execution",
         {
-            "agent": "Deployer",
             "step": "发布项目",
             "status": "running",
             "log": f"写入 /apps/{pid}/ 并准备运行时",
         },
     )
-    await _publish(pid, published)
+    await toolbox.call("publish_files", files=published)
     if plan["mode"] == "backend":
-        await asyncio.to_thread(
-            frontend_builder.publish_api_page, pid, plan["title"], plan["api"]
-        )
+        await toolbox.call("build_preview", plan=plan)
 
     if plan["mode"] in ("frontend", "fullstack"):
         build_ex = await emit(
             "execution",
             {
-                "agent": "Deployer",
                 "step": "构建前端预览",
                 "status": "running",
                 "log": "esbuild 打包 React + TypeScript…",
             },
         )
         try:
-            await _build_preview(pid, plan)
+            await toolbox.call("build_preview", plan=plan)
         except frontend_builder.BuildError as exc:
             error_text = str(exc)
             repaired = False
@@ -1309,17 +1607,26 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                     if fixed and not state.get("degraded"):
                         published[target_path] = fixed
                         contents[target_path] = fixed
-                        await _emit_artifact(pid, version, target_path, fixed, emit)
-                        await _publish(pid, published)
+                        await toolbox.call(
+                            "write_file", path=target_path, content=fixed
+                        )
+                        await toolbox.call("publish_files", files=published)
                         try:
-                            await _build_preview(pid, plan)
+                            await toolbox.call("build_preview", plan=plan)
                             repaired = True
                         except frontend_builder.BuildError:
                             repaired = False
             if not repaired:
                 if not force_mock:
                     fallback = await _install_mock_fallback(
-                        pid, version, existing, message, existing_mode, project_name, emit
+                        pid,
+                        version,
+                        existing,
+                        message,
+                        existing_mode,
+                        project_name,
+                        emit,
+                        toolbox,
                     )
                     plan = fallback["plan"]
                     published = fallback["published"]
@@ -1328,20 +1635,18 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                     await emit(
                         "execution",
                         {
-                            "agent": "Orchestrator",
                             "step": "整轮回退 Mock 模板",
                             "status": "warning",
                             "log": f"前端构建失败，已回退：{error_text[:140]}",
                         },
                     )
-                    await _build_preview(pid, plan)
+                    await toolbox.call("build_preview", plan=plan)
                 else:
                     await emit("error", {"message": f"前端预览构建失败：{error_text[:300]}"})
             await emit(
                 "execution",
                 {
                     "id": build_ex,
-                    "agent": "Deployer",
                     "step": "构建前端预览",
                     "status": "success" if (repaired or force_mock or not error_text) else "warning",
                     "log": "预览产物已生成",
@@ -1352,7 +1657,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                 "execution",
                 {
                     "id": build_ex,
-                    "agent": "Deployer",
                     "step": "构建前端预览",
                     "status": "success",
                     "log": "预览产物已生成",
@@ -1363,7 +1667,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         start_ex = await emit(
             "execution",
             {
-                "agent": "Deployer",
                 "step": "启动后端运行时",
                 "status": "running",
                 "log": "独立 uvicorn 进程 · SQLite 跟随项目",
@@ -1372,8 +1675,8 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         started = False
         last_error = ""
         try:
-            port = await runtime.runtime.ensure(pid)
-            await _check_health(port)
+            port = await toolbox.call("start_runtime")
+            await toolbox.call("check_health", port=port)
             started = True
         except (runtime.AppRuntimeError, RuntimeError) as exc:
             last_error = str(exc)
@@ -1408,18 +1711,27 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                 if fixed and not state.get("degraded"):
                     published["backend/main.py"] = fixed
                     contents["backend/main.py"] = fixed
-                    await _emit_artifact(pid, version, "backend/main.py", fixed, emit)
-                    await _publish(pid, published)
+                    await toolbox.call(
+                        "write_file", path="backend/main.py", content=fixed
+                    )
+                    await toolbox.call("publish_files", files=published)
                     try:
-                        port = await runtime.runtime.ensure(pid)
-                        await _check_health(port)
+                        port = await toolbox.call("start_runtime")
+                        await toolbox.call("check_health", port=port)
                         started = True
                     except (runtime.AppRuntimeError, RuntimeError) as retry_exc:
                         last_error = str(retry_exc)
         if not started:
             if not force_mock:
                 fallback = await _install_mock_fallback(
-                    pid, version, existing, message, existing_mode, project_name, emit
+                    pid,
+                    version,
+                    existing,
+                    message,
+                    existing_mode,
+                    project_name,
+                    emit,
+                    toolbox,
                 )
                 plan = fallback["plan"]
                 published = fallback["published"]
@@ -1428,17 +1740,16 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
                 await emit(
                     "execution",
                     {
-                        "agent": "Orchestrator",
                         "step": "整轮回退 Mock 模板",
                         "status": "warning",
                         "log": f"后端启动失败，已回退：{last_error[:140]}",
                     },
                 )
                 try:
-                    await _build_preview(pid, plan)
+                    await toolbox.call("build_preview", plan=plan)
                     if plan["mode"] in ("backend", "fullstack"):
-                        port = await runtime.runtime.ensure(pid)
-                        await _check_health(port)
+                        port = await toolbox.call("start_runtime")
+                        await toolbox.call("check_health", port=port)
                     started = True
                 except (
                     runtime.AppRuntimeError,
@@ -1452,7 +1763,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
             "execution",
             {
                 "id": start_ex,
-                "agent": "Deployer",
                 "step": "启动后端运行时",
                 "status": "success" if started else "warning",
                 "log": (
@@ -1472,7 +1782,6 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         "execution",
         {
             "id": deploy_ex,
-            "agent": "Deployer",
             "step": "发布项目",
             "status": "success",
             "log": f"v{version} 可访问：{preview_url}",
@@ -1480,14 +1789,9 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
     )
     await emit("preview", {"url": preview_url, "version": version, "mode": plan["mode"]})
 
-    mode_label = {
-        "frontend": "纯前端",
-        "fullstack": "前后端一体",
-        "backend": "纯后端 API",
-    }[plan["mode"]]
     assistant = (
         f"已完成 v{version}：{plan['summary']}\n"
-        f"形态：{mode_label}（{plan['mode']}）\n"
+        f"形态：{MODE_LABEL[plan['mode']]}（{plan['mode']}）\n"
         f"文件：{', '.join(contents)}\n"
         + ("\n".join(f"{note}。" for note in repair_notes) + "\n" if repair_notes else "")
         + (
@@ -1497,5 +1801,462 @@ async def run_generation(pid: str, message: str, emit: Emit) -> None:
         )
         + "右侧可以直接预览；如果想调整，继续告诉我就行。"
     )
-    await db.add_conversation(pid, "assistant", assistant)
-    await emit("message", {"role": "assistant", "content": assistant})
+    return assistant
+
+
+# ---------------------------------------------------------------------------
+# Consult mode: every mentioned agent answers independently (in parallel)
+# ---------------------------------------------------------------------------
+
+def _consult_context(
+    agent: str,
+    project_name: str,
+    existing: dict[str, str],
+    mode: str | None,
+    version: int,
+    recent: list[dict],
+) -> str:
+    lines = [
+        f"项目：{project_name}",
+        f"形态：{mode or '空项目'}",
+        f"版本：v{version}",
+        f"文件（{len(existing)}）：{', '.join(sorted(existing)[:40]) or '（空）'}",
+    ]
+    if recent:
+        lines.append("最近对话：")
+        for item in recent[-4:]:
+            content = str(item.get("content") or "").replace("\n", " ")[:160]
+            who = item.get("agent") or item.get("role") or "user"
+            lines.append(f"- {who}: {content}")
+    if agent == "bob":
+        for path in ("backend/schema.sql", "backend/main.py", "frontend/src/App.tsx"):
+            if path in existing:
+                lines.append(f"\n--- {path} 摘录 ---\n{existing[path][:2000]}")
+    elif agent == "alex":
+        for path in ("frontend/src/App.tsx", "frontend/src/styles.css", "backend/main.py"):
+            if path in existing:
+                lines.append(f"\n--- {path} 摘录 ---\n{existing[path][:1500]}")
+    return "\n".join(lines)
+
+
+async def _run_consult_agent(
+    pid: str,
+    message: str,
+    agent: str,
+    run_id: str,
+    base_emit: Emit,
+    *,
+    project_name: str,
+    existing: dict[str, str],
+    mode: str | None,
+    version: int,
+    recent: list[dict],
+    index: int = 0,
+) -> None:
+    emit = RoleEmitter(pid, run_id, agent, base_emit, version, index)
+    spec = agent_roster.AGENTS[agent]
+    try:
+        ex = await emit(
+            "execution",
+            {
+                "step": "理解问题",
+                "status": "running",
+                "log": f"问题：{message.replace(chr(10), ' ')[:80]}",
+            },
+        )
+        context = _consult_context(agent, project_name, existing, mode, version, recent)
+        user = f"用户问题：\n{message}\n\n项目上下文：\n{context}"
+        state: dict = {}
+        text = await _llm_text(
+            get_llm(),
+            role="consult",
+            system=agent_roster.CONSULT_SYSTEMS[agent],
+            user=user,
+            meta={
+                "agent": agent,
+                "prompt": message,
+                "project_name": project_name,
+                "mode": mode or "frontend",
+                "files": sorted(existing),
+                "version": version,
+            },
+            emit=emit,
+            emit_tokens=False,
+            state=state,
+        )
+        text = text.strip()
+        if not text:
+            fallback = "当前上下文不足，暂时无法回答这个问题。"
+            text = f"{fallback}\n\n补充：请在消息里 @Mike、@Bob 或 @Alex 指定角色。"
+        await emit(
+            "execution",
+            {
+                "id": ex,
+                "step": "理解问题",
+                "status": "success",
+                "log": f"{len(existing)} 个文件 · 最近 {len(recent)} 条对话",
+            },
+        )
+        ex2 = await emit(
+            "execution",
+            {
+                "step": "整理回答",
+                "status": "running",
+                "log": "按角色视角组织答案…",
+            },
+        )
+        await emit(
+            "execution",
+            {
+                "id": ex2,
+                "step": "整理回答",
+                "status": "success",
+                "log": f"{len(text)} 字符",
+            },
+        )
+        await emit("message", {"role": "assistant", "content": text})
+        await base_emit(
+            "agent_end",
+            {
+                "run_id": run_id,
+                "agent": agent,
+                "run_index": index,
+                "status": "success",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - one consult failure must not stop others
+        await emit(
+            "execution",
+            {
+                "step": "回答失败",
+                "status": "error",
+                "log": f"{type(exc).__name__}: {str(exc)[:180]}",
+            },
+        )
+        await base_emit(
+            "message",
+            {
+                "role": "assistant",
+                "agent": agent,
+                "run_id": run_id,
+                "content": f"回答失败：{type(exc).__name__}: {str(exc)[:200]}",
+            },
+        )
+        await base_emit(
+            "agent_end",
+            {
+                "run_id": run_id,
+                "agent": agent,
+                "run_index": index,
+                "status": "error",
+            },
+        )
+
+
+async def _run_consult_segments(
+    pid: str,
+    segments: list[agent_roster.Segment],
+    emit: Emit,
+    *,
+    project_name: str,
+    existing: dict[str, str],
+    mode: str | None,
+    version: int,
+    recent: list[dict],
+    index_state: dict[str, int],
+) -> None:
+    """Run all consult tasks in parallel, one group per agent.
+
+    Multiple segments addressed to the same agent are merged into one prompt,
+    so the agent answers exactly the sub-questions that mention it.
+    """
+    merged: dict[str, list[str]] = {}
+    order: list[str] = []
+    for segment in segments:
+        for agent in segment.agents:
+            if agent not in merged:
+                merged[agent] = []
+                order.append(agent)
+            if segment.text and segment.text not in merged[agent]:
+                merged[agent].append(segment.text)
+
+    tasks = []
+    for agent in order:
+        run_id = _new_run_id()
+        run_index = index_state["next"]
+        index_state["next"] += 1
+        spec = agent_roster.AGENTS[agent]
+        await emit(
+            "agent_start",
+            {
+                "run_id": run_id,
+                "agent": agent,
+                "name": spec.name,
+                "role": spec.role,
+                "index": run_index,
+            },
+        )
+        tasks.append(
+            _run_consult_agent(
+                pid,
+                "\n\n".join(merged[agent]),
+                agent,
+                run_id,
+                emit,
+                project_name=project_name,
+                existing=existing,
+                mode=mode,
+                version=version,
+                recent=recent,
+                index=run_index,
+            )
+        )
+    if len(tasks) == 1:
+        await tasks[0]
+    else:
+        await asyncio.gather(*tasks)
+
+
+# ---------------------------------------------------------------------------
+# Build mode: dependency-ordered runs with trailing @ hand-off
+# ---------------------------------------------------------------------------
+
+async def _run_build_turn(
+    pid: str,
+    message: str,
+    emit: Emit,
+    *,
+    project_name: str,
+    existing: dict[str, str],
+    mode: str | None,
+    version: int,
+    targets: list[str] | None = None,
+    index_state: dict[str, int] | None = None,
+) -> None:
+    targets = agent_roster.dependency_order(
+        targets or agent_roster.initial_targets(message, "build")
+    )
+    index_state = index_state or {"next": 0}
+    queue: deque[str] = deque(targets)
+    runs: Counter[str] = Counter()
+    plan: dict | None = None
+    plan_is_mock = False
+    mike_text = ""
+    bob_text = ""
+    last_emitter: RoleEmitter | None = None
+
+    while queue and sum(runs.values()) < MAX_TOTAL_RUNS:
+        agent = queue.popleft()
+        if runs[agent] >= MAX_RUNS_PER_AGENT:
+            if last_emitter is not None:
+                await last_emitter(
+                    "execution",
+                    {
+                        "step": "自动交接",
+                        "status": "warning",
+                        "log": f"@{agent_roster.AGENT_NAMES[agent]} 已达单轮上限，跳过",
+                    },
+                )
+            continue
+
+        runs[agent] += 1
+        run_id = _new_run_id()
+        spec = agent_roster.AGENTS[agent]
+        run_index = index_state["next"]
+        index_state["next"] += 1
+        await emit(
+            "agent_start",
+            {
+                "run_id": run_id,
+                "agent": agent,
+                "name": spec.name,
+                "role": spec.role,
+                "index": run_index,
+            },
+        )
+        emitter = RoleEmitter(pid, run_id, agent, emit, version, run_index)
+        try:
+            if agent == "mike":
+                text = await _run_mike(
+                    pid,
+                    message,
+                    emitter,
+                    project_name=project_name,
+                    existing=existing,
+                    existing_mode=mode,
+                    current_version=max(0, version - 1),
+                )
+                mike_text = text
+            elif agent == "bob":
+                plan, text, plan_is_mock = await _run_bob(
+                    pid,
+                    message,
+                    emitter,
+                    project_name=project_name,
+                    existing=existing,
+                    existing_mode=mode,
+                    mike_text=mike_text,
+                )
+                bob_text = text
+            else:
+                text = await _run_alex(
+                    pid,
+                    message,
+                    emitter,
+                    project_name=project_name,
+                    existing=existing,
+                    existing_mode=mode,
+                    version=version,
+                    plan=plan,
+                    plan_is_mock=plan_is_mock,
+                    bob_text=bob_text,
+                )
+        except Exception as exc:  # noqa: BLE001 - surface the failing role only
+            await emitter(
+                "execution",
+                {
+                    "step": "执行失败",
+                    "status": "error",
+                    "log": f"{type(exc).__name__}: {str(exc)[:180]}",
+                },
+            )
+            text = f"执行失败：{type(exc).__name__}: {str(exc)[:240]}"
+            await emit(
+                "message",
+                {
+                    "role": "assistant",
+                    "agent": agent,
+                    "run_id": run_id,
+                    "run_index": run_index,
+                    "content": text,
+                },
+            )
+            await emit(
+                "agent_end",
+                {
+                    "run_id": run_id,
+                    "agent": agent,
+                    "run_index": run_index,
+                    "status": "error",
+                },
+            )
+            last_emitter = emitter
+            break
+
+        await emit(
+            "message",
+            {
+                "role": "assistant",
+                "agent": agent,
+                "run_id": run_id,
+                "run_index": run_index,
+                "content": text,
+            },
+        )
+        await emit(
+            "agent_end",
+            {
+                "run_id": run_id,
+                "agent": agent,
+                "run_index": run_index,
+                "status": "success",
+            },
+        )
+        last_emitter = emitter
+        next_targets = agent_roster.parse_mentions(text, tail_only=True)
+        queue = deque(
+            agent_roster.merge_targets(
+                list(queue), next_targets, current=agent, intent="build"
+            )
+        )
+
+    if queue and last_emitter is not None:
+        await last_emitter(
+            "execution",
+            {
+                "step": "自动交接",
+                "status": "warning",
+                "log": "已达自动交接上限，未执行 "
+                + "、".join(f"@{agent_roster.AGENT_NAMES[key]}" for key in queue),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+async def run_turn(pid: str, message: str, emit: Emit) -> None:
+    project = await db.get_project(pid)
+    project_name = (project or {}).get("name") or "未命名项目"
+    existing = await db.latest_artifacts(pid)
+    mode = _existing_mode(existing)
+    next_version = await db.next_version(pid)
+
+    segments = agent_roster.split_segments(message) or [
+        agent_roster.Segment(("mike",), message)
+    ]
+    has_project = bool(existing)
+    intents = [
+        (segment, agent_roster.classify_intent(segment.text, has_project=has_project))
+        for segment in segments
+    ]
+
+    index_state: dict[str, int] = {"next": 0}
+    recent = [
+        item
+        for item in await db.recent_conversations(pid, 8)
+        if not (item.get("role") == "user" and item.get("content") == message)
+    ]
+
+    if all(intent == "consult" for _, intent in intents):
+        await _run_consult_segments(
+            pid,
+            segments,
+            emit,
+            project_name=project_name,
+            existing=existing,
+            mode=mode,
+            version=max(0, next_version - 1),
+            recent=recent,
+            index_state=index_state,
+        )
+        return
+
+    # Mixed build + consult: keep the user's order. Builds change files, so
+    # refresh the project snapshot and re-classify before the next segment.
+    for segment, _ in intents:
+        intent = agent_roster.classify_intent(segment.text, has_project=bool(existing))
+        if intent == "consult":
+            await _run_consult_segments(
+                pid,
+                [segment],
+                emit,
+                project_name=project_name,
+                existing=existing,
+                mode=mode,
+                version=max(0, next_version - 1),
+                recent=recent,
+                index_state=index_state,
+            )
+            continue
+
+        await _run_build_turn(
+            pid,
+            segment.text,
+            emit,
+            project_name=project_name,
+            existing=existing,
+            mode=mode,
+            version=next_version,
+            targets=list(segment.agents),
+            index_state=index_state,
+        )
+        existing = await db.latest_artifacts(pid)
+        mode = _existing_mode(existing)
+        next_version = await db.next_version(pid)
+        recent = [
+            item
+            for item in await db.recent_conversations(pid, 8)
+            if not (item.get("role") == "user" and item.get("content") == message)
+        ]

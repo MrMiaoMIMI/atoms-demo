@@ -65,6 +65,7 @@ class CreateProjectBody(BaseModel):
 
 class GenerateBody(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    team_mode: bool = True  # kept for UI parity; routing is always team-routed
 
 
 def _project_mode(paths: set[str]) -> str:
@@ -167,14 +168,27 @@ async def generate(pid: str, body: GenerateBody):
                                 payload["step"],
                                 payload["status"],
                                 payload.get("log") or "",
+                                payload.get("run_id"),
                             ),
                         }
+                elif event == "message":
+                    role = payload.get("role")
+                    content = payload.get("content")
+                    if role == "assistant" and isinstance(content, str) and content:
+                        await db.add_conversation(
+                            pid,
+                            "assistant",
+                            content,
+                            agent=payload.get("agent"),
+                            run_id=payload.get("run_id"),
+                            run_index=payload.get("run_index"),
+                        )
                 await queue.put((event, payload))
                 return payload.get("id")
 
             async def worker():
                 try:
-                    await agent.run_generation(pid, message, emit)
+                    await agent.run_turn(pid, message, emit)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - surface everything to the UI

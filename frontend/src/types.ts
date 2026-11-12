@@ -1,4 +1,5 @@
 export type Role = "user" | "assistant";
+export type AgentKey = "mike" | "bob" | "alex";
 export type ExecutionStatus = "running" | "success" | "warning" | "error";
 export type ProjectMode = "frontend" | "fullstack" | "backend";
 
@@ -6,6 +7,9 @@ export interface Conversation {
   id: number;
   role: Role;
   content: string;
+  agent?: AgentKey | string | null;
+  run_id?: string | null;
+  run_index?: number | null;
   created_at?: string;
 }
 
@@ -22,6 +26,7 @@ export interface Execution {
   step: string;
   status: ExecutionStatus;
   log: string;
+  run_id?: string | null;
   created_at?: string;
 }
 

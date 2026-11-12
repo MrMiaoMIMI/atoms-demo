@@ -1,39 +1,62 @@
+import type { AgentKey } from "../types";
+
 export interface AgentPersona {
-  key: string;
+  key: AgentKey;
   name: string;
   role: string;
-  emoji: string;
+  avatar: string;
   bg: string;
+  ring: string;
 }
 
 export const AGENTS: AgentPersona[] = [
-  { key: "orchestrator", name: "Mike", role: "团队领导", emoji: "🐶", bg: "#F7DFC4" },
-  { key: "planner", name: "Emma", role: "产品规划", emoji: "🐱", bg: "#FBE7B3" },
-  { key: "coder", name: "Alex", role: "工程师", emoji: "🐻", bg: "#E9E4DE" },
-  { key: "reviewer", name: "Iris", role: "质量审查", emoji: "🐰", bg: "#F9DCE8" },
-  { key: "deployer", name: "Bob", role: "发布工程师", emoji: "🐼", bg: "#E6E8EF" },
-  { key: "researcher", name: "Sophie", role: "研究员", emoji: "🦊", bg: "#DCEBFB" },
-  { key: "designer", name: "Leo", role: "设计师", emoji: "🐸", bg: "#DFF0D8" },
-  { key: "data", name: "Nina", role: "数据分析", emoji: "🐯", bg: "#E8DDF7" },
+  {
+    key: "mike",
+    name: "Mike",
+    role: "团队领导",
+    avatar: "/agents/mike.webp",
+    bg: "#F7DFC4",
+    ring: "#F1D3B3",
+  },
+  {
+    key: "bob",
+    name: "Bob",
+    role: "架构师",
+    avatar: "/agents/bob.webp",
+    bg: "#E9E4DE",
+    ring: "#DCD4CB",
+  },
+  {
+    key: "alex",
+    name: "Alex",
+    role: "工程师",
+    avatar: "/agents/alex.webp",
+    bg: "#DCEBFB",
+    ring: "#C9DFF7",
+  },
 ];
 
 const BY_KEY = new Map(AGENTS.map((agent) => [agent.key, agent]));
 
+export const AGENT_KEYS = AGENTS.map((agent) => agent.key);
+
 export function agentFor(raw: string | null | undefined): AgentPersona {
   const value = (raw ?? "").toLowerCase();
-  if (BY_KEY.has(value)) return BY_KEY.get(value)!;
-  if (value.includes("plan")) return BY_KEY.get("planner")!;
-  if (value.includes("cod") || value.includes("engineer")) return BY_KEY.get("coder")!;
-  if (value.includes("review") || value.includes("qa")) return BY_KEY.get("reviewer")!;
-  if (value.includes("deploy") || value.includes("publish")) return BY_KEY.get("deployer")!;
-  if (value.includes("research")) return BY_KEY.get("researcher")!;
-  if (value.includes("design")) return BY_KEY.get("designer")!;
-  if (value.includes("data")) return BY_KEY.get("data")!;
-  return BY_KEY.get("orchestrator")!;
+  if (BY_KEY.has(value as AgentKey)) return BY_KEY.get(value as AgentKey)!;
+  for (const persona of BY_KEY.values()) {
+    if (value === persona.name.toLowerCase()) return persona;
+  }
+  if (value.includes("bob") || value.includes("architect")) return BY_KEY.get("bob")!;
+  if (value.includes("alex") || value.includes("engineer")) return BY_KEY.get("alex")!;
+  return BY_KEY.get("mike")!;
 }
 
-export function agentKeyFromName(name: string | null | undefined): string {
+export function agentKeyFromName(name: string | null | undefined): AgentKey {
   return agentFor(name).key;
+}
+
+export function isAgentKey(value: string | null | undefined): value is AgentKey {
+  return value === "mike" || value === "bob" || value === "alex";
 }
 
 export const AGENT_RAIL = AGENTS;

@@ -1,8 +1,9 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, generate } from "../api";
+import { agentFor, isAgentKey } from "../lib/agents";
 import { copyText } from "../lib/clipboard";
-import { buildTurns, type Turn } from "../lib/turns";
+import { buildGroups, type ChatGroup } from "../lib/groups";
 import type {
   Artifact,
   Conversation,
@@ -75,7 +76,7 @@ export default function Workspace({
 }: Props) {
   const [project, setProject] = useState<Project | null>(null);
   const [mode, setMode] = useState<ProjectMode>("frontend");
-  const [turns, setTurns] = useState<Turn[]>([]);
+  const [groups, setGroups] = useState<ChatGroup[]>([]);
   const [artifacts, setArtifacts] = useState<Record<string, Artifact>>({});
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -128,7 +129,7 @@ export default function Workspace({
         if (state.artifacts.length > 0) {
           setPreviewUrl(state.preview_url ?? `/apps/${projectId}/?v=${version || 1}`);
         }
-        setTurns(buildTurns(state.conversations, state.executions));
+        setGroups(buildGroups(state.conversations, state.executions));
         setLoaded(true);
       })
       .catch((err: Error) => {
@@ -203,7 +204,6 @@ export default function Workspace({
       const message = text.trim();
       if (!message) return;
 
-      const liveId = `live-${Date.now()}`;
       const now = new Date().toISOString();
       const userMessage: Conversation = {
         id: -Date.now(),
@@ -216,29 +216,88 @@ export default function Workspace({
       setRunning(true);
       setStreamingFile(null);
       setStreamingBuffer("");
-      setTurns((prev) => [
+      setGroups((prev) => [
         ...prev,
-        { id: liveId, user: userMessage, assistant: null, executions: [], live: true },
+        {
+          id: `live-user-${Date.now()}`,
+          kind: "user",
+          user: userMessage,
+          executions: [],
+          messages: [],
+          createdAt: now,
+        },
       ]);
 
       const controller = new AbortController();
       abortRef.current = controller;
+
+      const normalizeAgent = (raw: unknown) => {
+        const value = typeof raw === "string" ? raw : "mike";
+        return isAgentKey(value) ? value : agentFor(value).key;
+      };
 
       try {
         await generate(
           projectId,
           message,
           (event, data) => {
+            if (event === "agent_start") {
+              const runId = typeof data.run_id === "string" ? data.run_id : null;
+              if (!runId) return;
+              const agent = normalizeAgent(data.agent);
+              const index = typeof data.index === "number" ? data.index : undefined;
+              setGroups((prev) => {
+                if (prev.some((group) => group.runId === runId)) return prev;
+                return [
+                  ...prev,
+                  {
+                    id: `live-${runId}`,
+                    kind: "agent",
+                    agent,
+                    runId,
+                    executions: [],
+                    messages: [],
+                    createdAt: new Date().toISOString(),
+                    live: true,
+                    status: "running",
+                    index,
+                  },
+                ];
+              });
+              return;
+            }
             if (event === "execution") {
               const execution = data as unknown as Execution;
               if (typeof execution.id !== "number") return;
-              setTurns((prev) =>
-                prev.map((turn) =>
-                  turn.id === liveId
-                    ? { ...turn, executions: upsertExecution(turn.executions, execution) }
-                    : turn
-                )
-              );
+              const runId = typeof execution.run_id === "string" ? execution.run_id : null;
+              if (!runId) return;
+              setGroups((prev) => {
+                let found = false;
+                const next = prev.map((group) => {
+                  if (group.runId !== runId) return group;
+                  found = true;
+                  return {
+                    ...group,
+                    executions: upsertExecution(group.executions, execution),
+                  };
+                });
+                if (found) return next;
+                const agent = normalizeAgent(execution.agent);
+                return [
+                  ...next,
+                  {
+                    id: `live-${runId}`,
+                    kind: "agent",
+                    agent,
+                    runId,
+                    executions: [execution],
+                    messages: [],
+                    createdAt: execution.created_at ?? new Date().toISOString(),
+                    live: true,
+                    status: "running",
+                  },
+                ];
+              });
               return;
             }
             if (event === "token") {
@@ -278,21 +337,30 @@ export default function Workspace({
               return;
             }
             if (event === "message") {
-              if (typeof data.content !== "string") return;
-              setTurns((prev) =>
-                prev.map((turn) =>
-                  turn.id === liveId
-                    ? {
-                        ...turn,
-                        assistant: {
-                          id: turn.assistant?.id ?? -Date.now(),
-                          role: "assistant",
-                          content: data.content as string,
-                          created_at: turn.assistant?.created_at ?? new Date().toISOString(),
-                        },
-                        live: false,
-                      }
-                    : turn
+              const runId = typeof data.run_id === "string" ? data.run_id : null;
+              const content = typeof data.content === "string" ? data.content : null;
+              if (!runId || !content) return;
+              setGroups((prev) =>
+                prev.map((group) =>
+                  group.runId === runId
+                    ? { ...group, messages: [...group.messages, content] }
+                    : group
+                )
+              );
+              return;
+            }
+            if (event === "agent_end") {
+              const runId = typeof data.run_id === "string" ? data.run_id : null;
+              if (!runId) return;
+              const status =
+                data.status === "error"
+                  ? ("error" as const)
+                  : data.status === "warning"
+                    ? ("warning" as const)
+                    : ("success" as const);
+              setGroups((prev) =>
+                prev.map((group) =>
+                  group.runId === runId ? { ...group, live: false, status } : group
                 )
               );
               return;
@@ -306,19 +374,20 @@ export default function Workspace({
       } catch (err) {
         if ((err as Error).name === "AbortError") {
           setError("已停止本轮生成。");
-          setTurns((prev) =>
-            prev.map((turn) =>
-              turn.id === liveId
+          setGroups((prev) =>
+            prev.map((group) =>
+              group.live
                 ? {
-                    ...turn,
+                    ...group,
                     live: false,
-                    executions: turn.executions.map((execution) =>
+                    status: "warning" as const,
+                    executions: group.executions.map((execution) =>
                       execution.status === "running"
-                        ? { ...execution, status: "warning", log: "已手动停止" }
+                        ? { ...execution, status: "warning" as const, log: "已手动停止" }
                         : execution
                     ),
                   }
-                : turn
+                : group
             )
           );
         } else {
@@ -328,8 +397,16 @@ export default function Workspace({
         setRunning(false);
         setStreamingFile(null);
         abortRef.current = null;
-        setTurns((prev) =>
-          prev.map((turn) => (turn.id === liveId ? { ...turn, live: false } : turn))
+        setGroups((prev) =>
+          prev.map((group) =>
+            group.live
+              ? {
+                  ...group,
+                  live: false,
+                  status: group.messages.length ? ("success" as const) : ("warning" as const),
+                }
+              : group
+          )
         );
       }
     },
@@ -340,8 +417,8 @@ export default function Workspace({
     if (!loaded || !initialPrompt || startedRef.current) return;
     startedRef.current = true;
     onPromptUsed();
-    if (turns.length === 0) void run(initialPrompt);
-  }, [loaded, initialPrompt, turns.length, onPromptUsed, run]);
+    if (groups.length === 0) void run(initialPrompt);
+  }, [loaded, initialPrompt, groups.length, onPromptUsed, run]);
 
   useEffect(
     () => () => {
@@ -594,7 +671,7 @@ export default function Workspace({
       <div className="flex min-h-0 flex-1">
         <div style={{ width: chatWidth }} className="flex min-h-0 min-w-0 flex-none flex-col">
           <ChatPanel
-            turns={turns}
+            groups={groups}
             running={running}
             error={error}
             onSend={(text) => void run(text)}

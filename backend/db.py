@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     project_id  TEXT NOT NULL,
     role        TEXT NOT NULL,
     content     TEXT NOT NULL,
+    agent       TEXT,
+    run_id      TEXT,
+    run_index   INTEGER,
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, id);
@@ -40,6 +43,7 @@ CREATE TABLE IF NOT EXISTS executions (
     step        TEXT NOT NULL,
     status      TEXT NOT NULL,
     log         TEXT,
+    run_id      TEXT,
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_executions_project ON executions(project_id, id);
@@ -61,12 +65,27 @@ async def _connect():
         await conn.close()
 
 
+async def _migrate(conn) -> None:
+    """Add agent/run_id columns to databases created before the agent UI."""
+    migrations = {
+        "conversations": {"agent": "TEXT", "run_id": "TEXT", "run_index": "INTEGER"},
+        "executions": {"run_id": "TEXT"},
+    }
+    for table, columns in migrations.items():
+        async with conn.execute(f"PRAGMA table_info({table})") as cur:
+            existing = {row[1] for row in await cur.fetchall()}
+        for name, declaration in columns.items():
+            if name not in existing:
+                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 async def init_db() -> None:
     async with _connect() as conn:
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA synchronous=NORMAL")
         await conn.execute("PRAGMA foreign_keys=ON")
         await conn.executescript(SCHEMA)
+        await _migrate(conn)
         await conn.commit()
 
 
@@ -111,7 +130,7 @@ async def get_state(pid: str) -> dict | None:
         return None
     async with _connect() as conn:
         async with conn.execute(
-            "SELECT id, role, content, created_at FROM conversations WHERE project_id = ? ORDER BY id",
+            "SELECT id, role, content, agent, run_id, run_index, created_at FROM conversations WHERE project_id = ? ORDER BY id",
             (pid,),
         ) as cur:
             conversations = [dict(r) for r in await cur.fetchall()]
@@ -131,7 +150,7 @@ async def get_state(pid: str) -> dict | None:
         ) as cur:
             artifacts = [dict(r) for r in await cur.fetchall()]
         async with conn.execute(
-            "SELECT id, agent, step, status, log, created_at FROM executions WHERE project_id = ? ORDER BY id",
+            "SELECT id, agent, step, status, log, run_id, created_at FROM executions WHERE project_id = ? ORDER BY id",
             (pid,),
         ) as cur:
             executions = [dict(r) for r in await cur.fetchall()]
@@ -166,14 +185,30 @@ async def next_version(pid: str) -> int:
             return int(row[0])
 
 
-async def add_conversation(pid: str, role: str, content: str) -> int:
+async def add_conversation(
+    pid: str,
+    role: str,
+    content: str,
+    agent: str | None = None,
+    run_id: str | None = None,
+    run_index: int | None = None,
+) -> int:
     async with _connect() as conn:
         cur = await conn.execute(
-            "INSERT INTO conversations (project_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (pid, role, content, now()),
+            "INSERT INTO conversations (project_id, role, content, agent, run_id, run_index, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pid, role, content, agent, run_id, run_index, now()),
         )
         await conn.commit()
         return int(cur.lastrowid)
+
+
+async def recent_conversations(pid: str, limit: int = 8) -> list[dict]:
+    async with _connect() as conn:
+        async with conn.execute(
+            "SELECT id, role, content, agent, run_id, run_index, created_at FROM conversations WHERE project_id = ? ORDER BY id DESC LIMIT ?",
+            (pid, limit),
+        ) as cur:
+            return [dict(r) for r in reversed(await cur.fetchall())]
 
 
 async def add_artifact(pid: str, filename: str, content: str, version: int) -> None:
@@ -190,11 +225,18 @@ async def add_artifact(pid: str, filename: str, content: str, version: int) -> N
         await conn.commit()
 
 
-async def add_execution(pid: str, agent: str, step: str, status: str, log: str) -> int:
+async def add_execution(
+    pid: str,
+    agent: str,
+    step: str,
+    status: str,
+    log: str,
+    run_id: str | None = None,
+) -> int:
     async with _connect() as conn:
         cur = await conn.execute(
-            "INSERT INTO executions (project_id, agent, step, status, log, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (pid, agent, step, status, log, now()),
+            "INSERT INTO executions (project_id, agent, step, status, log, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pid, agent, step, status, log, run_id, now()),
         )
         await conn.commit()
         return int(cur.lastrowid)

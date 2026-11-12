@@ -1,10 +1,11 @@
-import type { FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
+import type { FormEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { timeAgo } from "../lib/format";
 import type { Health, ProjectSummary } from "../types";
 import { AgentRail } from "./Avatar";
 import HomeSidebar from "./HomeSidebar";
+import MentionComposer from "./MentionComposer";
 import {
   ApiIcon,
   ArrowUp,
@@ -278,13 +279,6 @@ export default function Home({ health, onStart, onOpen }: HomeProps) {
   }, []);
 
   useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
-  }, [prompt]);
-
-  useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setPlusOpen(false);
@@ -315,13 +309,6 @@ export default function Home({ health, onStart, onOpen }: HomeProps) {
     } catch (err) {
       setError((err as Error).message || "创建项目失败");
       setCreating(false);
-    }
-  }
-
-  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      void submit();
     }
   }
 
@@ -447,14 +434,16 @@ export default function Home({ health, onStart, onOpen }: HomeProps) {
             <form onSubmit={submit} className="mt-6 w-full max-w-[720px]">
               <div className="rounded-[24px] border border-line-12 bg-white shadow-composer">
                 <div className="px-4 pb-3 pt-4">
-                  <textarea
-                    ref={textareaRef}
+                  <MentionComposer
                     value={prompt}
-                    onChange={(event) => setPrompt(event.target.value)}
-                    onKeyDown={handleKeyDown}
+                    onChange={setPrompt}
+                    onSubmit={() => void submit()}
+                    textareaRef={textareaRef}
                     rows={2}
                     maxLength={4000}
-                    placeholder="描述你想构建的应用，例如：做一个待办清单，数据保存到 SQLite…"
+                    maxHeight={180}
+                    disabled={creating}
+                    placeholder="让智能体团队实现你的想法，输入 @ 指定 Mike / Bob / Alex…"
                     className="max-h-[180px] min-h-[58px] w-full resize-none bg-transparent px-1 text-[15px] leading-[24px] text-ink-95 outline-none placeholder:text-ink-30"
                   />
 
@@ -519,8 +508,8 @@ export default function Home({ health, onStart, onOpen }: HomeProps) {
                             <div className="absolute bottom-full right-0 z-30 mb-2 w-[270px] rounded-xl border border-line-6 bg-white p-3 shadow-float">
                               <p className="text-[13px] font-medium text-ink-95">自动选择项目形态</p>
                               <p className="mt-1.5 text-[12px] leading-[19px] text-ink-55">
-                                Planner 会根据需求判断生成纯前端、全栈或纯 API，并自动准备
-                                Vite / FastAPI / SQLite 脚手架。
+                                Mike 会判断需求复杂度，再交给 Bob 设计架构或由 Alex 直接
+                                实现；自动准备 Vite / FastAPI / SQLite 脚手架。
                               </p>
                               <div className="mt-2.5 flex flex-wrap gap-1.5">
                                 {["前端", "全栈", "API"].map((mode) => (

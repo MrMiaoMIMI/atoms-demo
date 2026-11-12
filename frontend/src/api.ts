@@ -24,10 +24,17 @@ export const api = {
   },
 
   createProject: async (prompt: string): Promise<Project> => {
+    const cleaned = prompt.replace(/@(?:mike|bob|alex)(?![A-Za-z0-9])/gi, "").trim();
+    const firstLine =
+      cleaned
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean) ?? cleaned;
+    const name = firstLine.replace(/^[\s,，。.;；:：]+/, "").trim().slice(0, 24);
     const res = await fetch("/api/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, name: prompt.slice(0, 24) }),
+      body: JSON.stringify({ prompt, name: name || prompt.slice(0, 24) }),
     });
     if (!res.ok) throw new Error(await readError(res));
     return (await res.json()) as Project;
