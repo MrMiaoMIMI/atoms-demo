@@ -3,7 +3,7 @@ import { api } from "./api";
 import Home from "./components/Home";
 import ProjectsPage from "./components/ProjectsPage";
 import Workspace from "./components/Workspace";
-import type { Health } from "./types";
+import type { Health, ProjectSummary } from "./types";
 
 type Route =
   | { name: "home" }
@@ -48,6 +48,16 @@ function normalizeRoute(): void {
   if (!known) window.history.replaceState({}, "", "/dashboard");
 }
 
+const SIDEBAR_COLLAPSED_KEY = "atoms.sidebar.collapsed";
+
+function readSidebarCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const [route, setRoute] = useState<Route>(() => {
     normalizeRoute();
@@ -55,12 +65,50 @@ export default function App() {
   });
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
+  // Shared project list for the sidebar. Polling keeps "正在处理" spinners in
+  // sync on every page, including builds that outlive a page visit.
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  // Home and the projects list share one collapse state; the workspace keeps
+  // its own sidebar closed by default.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    readSidebarCollapsed
+  );
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        SIDEBAR_COLLAPSED_KEY,
+        sidebarCollapsed ? "1" : "0"
+      );
+    } catch {
+      // Storage may be unavailable; the state still works for this session.
+    }
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     api
       .health()
       .then(setHealth)
       .catch(() => setHealth(null));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (document.hidden) return;
+      try {
+        const items = await api.listProjects();
+        if (!cancelled) setProjects(items);
+      } catch {
+        // Keep the previous list; the next tick retries.
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -120,6 +168,9 @@ export default function App() {
         onPromptUsed={() => setPendingPrompt(null)}
         health={health}
         onExit={goHome}
+        projects={projects}
+        onOpenProject={openProject}
+        onOpenProjects={goProjects}
       />
     );
   }
@@ -128,6 +179,9 @@ export default function App() {
     return (
       <ProjectsPage
         health={health}
+        sidebarProjects={projects}
+        sidebarCollapsed={sidebarCollapsed}
+        onSidebarCollapsed={setSidebarCollapsed}
         onHome={goHome}
         onNewProject={goHome}
         onOpenProject={openProject}
@@ -138,6 +192,9 @@ export default function App() {
   return (
     <Home
       health={health}
+      sidebarProjects={projects}
+      sidebarCollapsed={sidebarCollapsed}
+      onSidebarCollapsed={setSidebarCollapsed}
       onStart={start}
       onOpen={openProject}
       onBrowseAllProjects={goProjects}

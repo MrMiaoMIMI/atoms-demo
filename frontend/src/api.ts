@@ -37,6 +37,12 @@ export const api = {
 
   getProject: (pid: string) => getJson<ProjectState>(`/api/projects/${pid}`),
 
+  // Generation outlives the SSE connection; stopping it needs an explicit call.
+  cancelGeneration: async (pid: string): Promise<void> => {
+    const res = await fetch(`/api/projects/${pid}/cancel`, { method: "POST" });
+    if (!res.ok) throw new Error(await readError(res));
+  },
+
   deleteProject: async (pid: string): Promise<void> => {
     const res = await fetch(`/api/projects/${pid}`, { method: "DELETE" });
     if (!res.ok) throw new Error(await readError(res));
@@ -85,18 +91,12 @@ function parseBlock(block: string, onEvent: StreamHandler): void {
   }
 }
 
-export async function generate(
-  projectId: string,
-  message: string,
-  onEvent: StreamHandler,
-  signal?: AbortSignal
+async function readEventStream(
+  url: string,
+  init: RequestInit,
+  onEvent: StreamHandler
 ): Promise<void> {
-  const res = await fetch(`/api/projects/${projectId}/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
-    signal,
-  });
+  const res = await fetch(url, init);
   if (!res.ok) throw new Error(await readError(res));
   if (!res.body) throw new Error("浏览器不支持流式响应");
 
@@ -117,4 +117,35 @@ export async function generate(
     }
   }
   if (buffer.trim()) parseBlock(buffer, onEvent);
+}
+
+export async function generate(
+  projectId: string,
+  message: string,
+  onEvent: StreamHandler,
+  signal?: AbortSignal
+): Promise<void> {
+  return readEventStream(
+    `/api/projects/${projectId}/generate`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+      signal,
+    },
+    onEvent
+  );
+}
+
+/** Re-attach to a build that is still running after a page reload. */
+export async function resumeGeneration(
+  projectId: string,
+  onEvent: StreamHandler,
+  signal?: AbortSignal
+): Promise<void> {
+  return readEventStream(
+    `/api/projects/${projectId}/events`,
+    { signal },
+    onEvent
+  );
 }

@@ -43,9 +43,67 @@ CORS_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 
-_locks: dict[str, asyncio.Lock] = {}
 # Project id -> background naming task, kept alive until it resolves.
 _title_tasks: dict[str, asyncio.Task] = {}
+# Project id -> in-flight generation task. It deliberately outlives the SSE
+# connection so closing the workspace tab does not abort a running build.
+_generation_tasks: dict[str, asyncio.Task] = {}
+
+
+class _GenerationHub:
+    """Fan-out for one project's generation events.
+
+    Any number of clients can subscribe. Late subscribers get a snapshot of the
+    persisted state plus the in-flight file buffer, then continue with live
+    events (tokens included), so a re-opened workspace behaves like the
+    original one.
+    """
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.seq = 0
+        self.done = False
+        self.stream_file: str | None = None
+        self.stream_buffer = ""
+        self._subscribers: set[asyncio.Queue] = set()
+
+    def subscribe(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self._subscribers.discard(queue)
+
+    def publish(self, event: str, payload: dict) -> None:
+        """Broadcast while holding ``lock`` so snapshots stay consistent."""
+        self.seq += 1
+        self._track(event, payload)
+        for queue in list(self._subscribers):
+            queue.put_nowait((self.seq, event, payload))
+
+    def _track(self, event: str, payload: dict) -> None:
+        if event == "file_start":
+            self.stream_file = payload.get("filename")
+            self.stream_buffer = ""
+        elif event == "token":
+            name = payload.get("filename")
+            if self.stream_file is None or name == self.stream_file:
+                self.stream_buffer += payload.get("delta") or ""
+        elif event == "token_reset":
+            self.stream_buffer = ""
+        elif event == "artifact":
+            self.stream_file = None
+            self.stream_buffer = ""
+
+
+# Project id -> hub for the generation currently running in this process.
+_hubs: dict[str, _GenerationHub] = {}
+
+
+def _is_generating(pid: str) -> bool:
+    task = _generation_tasks.get(pid)
+    return task is not None and not task.done()
 
 
 def _sse(event: str, payload: dict) -> str:
@@ -55,6 +113,8 @@ def _sse(event: str, payload: dict) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db()
+    # No generation task survives a process restart; make stale rows honest.
+    await db.interrupt_running_executions()
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5.0, read=600.0, write=60.0, pool=30.0),
         follow_redirects=False,
@@ -62,11 +122,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        pending = list(_title_tasks.values())
+        pending = [*_title_tasks.values(), *_generation_tasks.values()]
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        _generation_tasks.clear()
+        _hubs.clear()
         await runtime.runtime.stop_all()
         await app.state.http.aclose()
 
@@ -115,6 +177,7 @@ async def list_projects() -> dict:
             project["mode"] = "backend"
         else:
             project["mode"] = "frontend"
+        project["generating"] = _is_generating(project["id"])
     return {"projects": projects}
 
 
@@ -151,6 +214,11 @@ async def create_project(body: CreateProjectBody) -> dict:
     return project
 
 
+def _preview_ready(pid: str) -> bool:
+    """Preview is only served after the builder wrote its static shell."""
+    return (config.APPS_DIR / pid / ".preview" / "index.html").exists()
+
+
 @app.get("/api/projects/{pid}")
 async def get_project(pid: str) -> dict:
     state = await db.get_state(pid)
@@ -160,7 +228,11 @@ async def get_project(pid: str) -> dict:
     artifacts = state["artifacts"]
     version = max((artifact["version"] for artifact in artifacts), default=0)
     state["mode"] = _project_mode(paths)
-    state["preview_url"] = f"/apps/{pid}/?v={version or 1}" if artifacts else None
+    ready = _preview_ready(pid)
+    state["preview_url"] = (
+        f"/apps/{pid}/?v={version or 1}" if artifacts and ready else None
+    )
+    state["generating"] = _is_generating(pid)
     return state
 
 
@@ -218,42 +290,20 @@ async def generate(pid: str, body: GenerateBody):
     if not message:
         raise HTTPException(status_code=400, detail="需求不能为空")
 
-    lock = _locks.setdefault(pid, asyncio.Lock())
-
     async def event_stream():
-        if lock.locked():
+        if _is_generating(pid):
             yield _sse("error", {"message": "该项目正在生成中，请稍候。"})
             yield _sse("done", {"project_id": pid})
             return
 
-        async with lock:
-            await db.add_conversation(pid, "user", message)
-            queue: asyncio.Queue = asyncio.Queue()
+        hub = _GenerationHub()
+        _hubs[pid] = hub
+        queue = hub.subscribe()
 
-            # Send the current name at once (it may already hold the resolved
-            # background title), then push a second event if naming finishes
-            # while this run is still streaming.
-            # Read the task reference before the row: if naming finishes in
-            # between, the row already carries the final name.
-            naming_task = _title_tasks.get(pid)
-            current = await db.get_project(pid)
-            if current:
-                await queue.put(("project", current))
-
-            async def notify_rename() -> None:
-                if naming_task is None:
-                    return
-                try:
-                    await asyncio.shield(naming_task)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - naming already logged it
-                    return
-                project = await db.get_project(pid)
-                if project:
-                    await queue.put(("project", project))
-
-            async def emit(event: str, payload: dict):
+        async def emit(event: str, payload: dict):
+            # Holding the hub lock keeps the DB rows and the broadcast order in
+            # sync, so a late subscriber never sees a half-applied step.
+            async with hub.lock:
                 if event == "execution":
                     if payload.get("id"):
                         await db.update_execution(
@@ -275,7 +325,7 @@ async def generate(pid: str, body: GenerateBody):
                     role = payload.get("role")
                     content = payload.get("content")
                     if role == "assistant" and isinstance(content, str) and content:
-                        await db.add_conversation(
+                        row_id = await db.add_conversation(
                             pid,
                             "assistant",
                             content,
@@ -283,40 +333,161 @@ async def generate(pid: str, body: GenerateBody):
                             run_id=payload.get("run_id"),
                             run_index=payload.get("run_index"),
                         )
-                await queue.put((event, payload))
-                return payload.get("id")
+                        payload = {**payload, "id": row_id}
+                hub.publish(event, payload)
+            return payload.get("id")
 
-            async def worker():
-                try:
-                    await agent.run_turn(pid, message, emit)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - surface everything to the UI
-                    await emit("error", {"message": f"{type(exc).__name__}: {exc}"})
-                finally:
-                    await queue.put(("done", {"project_id": pid}))
-                    await queue.put(None)
-
-            task = asyncio.create_task(worker())
-            watcher = asyncio.create_task(notify_rename())
+        async def worker():
             try:
-                while True:
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=15)
-                    except asyncio.TimeoutError:
-                        yield ": keep-alive\n\n"
-                        continue
-                    if item is None:
-                        break
-                    event, payload = item
-                    yield _sse(event, payload)
+                await db.interrupt_running_executions(pid=pid)
+                await db.add_conversation(pid, "user", message)
+                await agent.run_turn(pid, message, emit)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - surface everything to the UI
+                await emit("error", {"message": f"{type(exc).__name__}: {exc}"})
             finally:
-                if not task.done():
-                    task.cancel()
-                if not watcher.done():
-                    watcher.cancel()
+                # Closed subscribers do not block the worker: publish() never
+                # awaits, it just appends to live queues.
+                async with hub.lock:
+                    hub.done = True
+                    hub.publish("done", {"project_id": pid})
+                _hubs.pop(pid, None)
+                _generation_tasks.pop(pid, None)
+
+        # Register before the first await so concurrent requests cannot start
+        # two builds for the same project.
+        task = asyncio.create_task(worker())
+        _generation_tasks[pid] = task
+
+        # Send the current name at once (it may already hold the resolved
+        # background title), then push a second event if naming finishes
+        # while this run is still streaming.
+        # Read the task reference before the row: if naming finishes in
+        # between, the row already carries the final name.
+        naming_task = _title_tasks.get(pid)
+        current = await db.get_project(pid)
+        if current:
+            async with hub.lock:
+                hub.publish("project", current)
+
+        async def notify_rename() -> None:
+            if naming_task is None:
+                return
+            try:
+                await asyncio.shield(naming_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - naming already logged it
+                return
+            project = await db.get_project(pid)
+            if project:
+                async with hub.lock:
+                    hub.publish("project", project)
+
+        watcher = asyncio.create_task(notify_rename())
+        try:
+            while True:
+                try:
+                    _, event, payload = await asyncio.wait_for(
+                        queue.get(), timeout=15
+                    )
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                yield _sse(event, payload)
+                if event == "done":
+                    break
+        finally:
+            # Do NOT cancel `task`: the build must survive a page navigation.
+            hub.unsubscribe(queue)
+            if not watcher.done():
+                watcher.cancel()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+async def _resume_event_stream(pid: str, hub: _GenerationHub):
+    """Attach to an in-flight build: snapshot first, then live events."""
+    queue = hub.subscribe()
+    try:
+        async with hub.lock:
+            snap_seq = hub.seq
+            stream = {
+                "filename": hub.stream_file,
+                "content": hub.stream_buffer,
+            }
+            state = await db.get_state(pid)
+        if state:
+            paths = {artifact["filename"] for artifact in state["artifacts"]}
+            version = max(
+                (artifact["version"] for artifact in state["artifacts"]), default=0
+            )
+            state["mode"] = _project_mode(paths)
+            state["preview_url"] = (
+                f"/apps/{pid}/?v={version or 1}"
+                if state["artifacts"] and _preview_ready(pid)
+                else None
+            )
+            state["generating"] = True
+            yield _sse(
+                "snapshot",
+                {"state": state, "stream": stream, "seq": snap_seq},
+            )
+        if hub.done:
+            return
+        while True:
+            try:
+                seq, event, payload = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+            if seq <= snap_seq:
+                continue
+            yield _sse(event, payload)
+            if event == "done":
+                break
+    finally:
+        hub.unsubscribe(queue)
+
+
+@app.get("/api/projects/{pid}/events")
+async def generation_events(pid: str):
+    if not await db.get_project(pid):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    hub = _hubs.get(pid)
+    if hub is None:
+        # The build finished between the page load and the subscribe call.
+        async def finished():
+            yield _sse("done", {"project_id": pid})
+
+        return StreamingResponse(
+            finished(), media_type="text/event-stream", headers=SSE_HEADERS
+        )
+    return StreamingResponse(
+        _resume_event_stream(pid, hub),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+@app.post("/api/projects/{pid}/cancel")
+async def cancel_generation(pid: str) -> dict:
+    """Explicitly stop a build. The SSE stream alone only detaches."""
+    if not await db.get_project(pid):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    task = _generation_tasks.get(pid)
+    if task is None or task.done():
+        return {"ok": True, "cancelled": False}
+    task.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True), timeout=3
+        )
+    except asyncio.TimeoutError:
+        pass
+    await db.interrupt_running_executions(log="生成已取消", pid=pid)
+    return {"ok": True, "cancelled": True}
 
 
 # ---------------------------------------------------------------------------

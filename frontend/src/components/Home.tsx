@@ -161,6 +161,9 @@ function TemplatePreview({ template }: { template: Template }) {
 
 interface HomeProps {
   health: Health | null;
+  sidebarProjects: ProjectSummary[];
+  sidebarCollapsed: boolean;
+  onSidebarCollapsed: (collapsed: boolean) => void;
   onStart: (projectId: string, prompt: string) => void;
   onOpen: (projectId: string) => void;
   onBrowseAllProjects: () => void;
@@ -180,6 +183,9 @@ function readBannerVisible(): boolean {
 
 export default function Home({
   health,
+  sidebarProjects,
+  sidebarCollapsed,
+  onSidebarCollapsed,
   onStart,
   onOpen,
   onBrowseAllProjects,
@@ -191,7 +197,6 @@ export default function Home({
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('projects');
-  const [collapsed, setCollapsed] = useState(false);
   const [banner, setBanner] = useState(readBannerVisible);
   const [connector, setConnector] = useState(true);
   const [plusOpen, setPlusOpen] = useState(false);
@@ -270,6 +275,11 @@ export default function Home({
     }
   }
 
+  function goHomeContent() {
+    setTab('projects');
+    mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
   function dismissBanner() {
     setBanner(false);
     try {
@@ -289,22 +299,22 @@ export default function Home({
 
   return (
     <div className="flex h-full overflow-hidden bg-base">
-      {collapsed ? (
+      {sidebarCollapsed ? (
         <CollapsedSidebar
           health={health}
-          onExpand={() => setCollapsed(false)}
+          section="home"
+          onHome={goHomeContent}
+          onProjects={onBrowseAllProjects}
+          onExpand={() => onSidebarCollapsed(false)}
         />
       ) : (
         <HomeSidebar
-          projects={projects}
+          projects={sidebarProjects}
           section="home"
-          onHome={() => {
-            setTab('projects');
-            mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-          }}
+          onHome={goHomeContent}
           onProjects={onBrowseAllProjects}
           onOpenProject={onOpen}
-          onCollapse={() => setCollapsed(true)}
+          onCollapse={() => onSidebarCollapsed(true)}
         />
       )}
 

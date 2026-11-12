@@ -12,11 +12,12 @@ import {
   PanelLeft,
   Plus,
   Settings,
+  Spinner,
 } from './Icons';
 
 interface Props {
   projects: ProjectSummary[];
-  section: 'home' | 'projects';
+  section: 'home' | 'projects' | 'workspace';
   onHome: () => void;
   onProjects: () => void;
   onOpenProject: (id: string) => void;
@@ -64,11 +65,32 @@ function NavItem({
 
 export function CollapsedSidebar({
   health,
+  section,
+  onHome,
+  onProjects,
   onExpand,
 }: {
   health: Health | null;
+  section: 'home' | 'projects';
+  onHome: () => void;
+  onProjects: () => void;
   onExpand: () => void;
 }) {
+  const navItems = [
+    {
+      key: 'home' as const,
+      label: '首页',
+      icon: <Home size={18} />,
+      onClick: onHome,
+    },
+    {
+      key: 'projects' as const,
+      label: '项目',
+      icon: <Folder size={18} />,
+      onClick: onProjects,
+    },
+  ];
+
   return (
     <div className="flex h-full w-[56px] flex-none flex-col items-center bg-base-sidebar py-3">
       <button
@@ -79,6 +101,27 @@ export function CollapsedSidebar({
       >
         <AtomsMark size={20} />
       </button>
+
+      <nav className="mt-3 flex flex-col items-center gap-1">
+        {navItems.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            onClick={item.onClick}
+            title={item.label}
+            aria-label={item.label}
+            aria-current={section === item.key ? 'page' : undefined}
+            className={`grid h-9 w-9 place-items-center rounded-lg transition ${
+              section === item.key
+                ? 'bg-line-6 text-ink-95'
+                : 'text-ink-80 hover:bg-line-4 hover:text-ink-95'
+            }`}
+          >
+            {item.icon}
+          </button>
+        ))}
+      </nav>
+
       <div className="mt-auto flex flex-col items-center gap-3 pb-1">
         <span
           className={`h-1.5 w-1.5 rounded-full ${
@@ -177,9 +220,14 @@ export default function HomeSidebar({
                 key={project.id}
                 type="button"
                 onClick={() => onOpenProject(project.id)}
+                title={project.generating ? '正在处理' : undefined}
                 className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-left text-[14px] text-ink-80 transition hover:bg-line-4 hover:text-ink-95"
               >
-                <Chat size={15} className="flex-none text-ink-30" />
+                {project.generating ? (
+                  <Spinner size={15} className="flex-none text-brand" />
+                ) : (
+                  <Chat size={15} className="flex-none text-ink-30" />
+                )}
                 <span className="truncate">{project.name}</span>
               </button>
             ))
@@ -191,7 +239,7 @@ export default function HomeSidebar({
 
       <div className="px-2 pb-3">
         <div className="mt-3 flex items-center gap-2 px-1">
-          <InitialAvatar size={28} label="A" />
+          <InitialAvatar size={28} label="你" />
           <div className="min-w-0 flex-1">
             <p className="truncate text-[13px] font-medium text-ink-95">
               Atoms Demo

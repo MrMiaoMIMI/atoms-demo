@@ -43,6 +43,7 @@ export interface ProjectState {
   executions: Execution[];
   mode: ProjectMode;
   preview_url: string | null;
+  generating?: boolean;
 }
 
 export interface ProjectSummary {
@@ -55,6 +56,7 @@ export interface ProjectSummary {
   mode?: ProjectMode;
   has_frontend?: number;
   has_backend?: number;
+  generating?: boolean;
 }
 
 export interface Health {

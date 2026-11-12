@@ -87,6 +87,7 @@ export function buildGroups(
 
   const groups: ChatGroup[] = [];
   const used = new Set<number>();
+  const runsWithMessages = new Set<string>();
   let current: ChatGroup | null = null;
   let cursor = "";
 
@@ -110,6 +111,7 @@ export function buildGroups(
     let matched: Execution[] = [];
     if (runId) {
       matched = byRun.get(runId) ?? [];
+      runsWithMessages.add(runId);
     } else {
       matched = legacySteps.filter(
         (step) => !used.has(step.id) && inWindow(step.created_at, cursor, message.created_at ?? "")
@@ -159,6 +161,27 @@ export function buildGroups(
         createdAt: groupCreatedAt(leftovers, []),
       });
     }
+  }
+
+  // A run that is still in flight has execution rows but no final assistant
+  // message yet. Surface it immediately so a re-opened workspace can show who
+  // is working right now instead of waiting for the next live event.
+  const pendingRuns = [...byRun.entries()]
+    .filter(([runId]) => !runsWithMessages.has(runId))
+    .sort((a, b) => (a[1][0]?.id ?? 0) - (b[1][0]?.id ?? 0));
+  for (const [runId, runSteps] of pendingRuns) {
+    const running = runSteps.some((step) => step.status === "running");
+    groups.push({
+      id: `run-${runId}`,
+      kind: "agent",
+      agent: agentFor(runSteps[0]?.agent).key,
+      runId,
+      executions: runSteps,
+      messages: [],
+      createdAt: groupCreatedAt(runSteps, []),
+      live: running,
+      status: running ? "running" : undefined,
+    });
   }
 
   return groups;

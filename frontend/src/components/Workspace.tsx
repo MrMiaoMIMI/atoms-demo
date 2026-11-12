@@ -1,6 +1,6 @@
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, generate } from '../api';
+import { api, generate, resumeGeneration } from '../api';
 import { AGENT_KEYS, agentFor, isAgentKey } from '../lib/agents';
 import { copyText } from '../lib/clipboard';
 import { buildGroups, type ChatGroup } from '../lib/groups';
@@ -12,10 +12,13 @@ import type {
   Health,
   Project,
   ProjectMode,
+  ProjectState,
+  ProjectSummary,
 } from '../types';
 import { PresenceBar } from './Avatar';
 import ChatPanel from './ChatPanel';
 import FilePanel from './FilePanel';
+import HomeSidebar from './HomeSidebar';
 import {
   AtomsMark,
   ChevronDown,
@@ -23,6 +26,7 @@ import {
   Eye,
   ExternalLink,
   Home,
+  PanelLeft,
   Spinner,
 } from './Icons';
 import PreviewPane from './PreviewPane';
@@ -33,6 +37,9 @@ interface Props {
   onPromptUsed: () => void;
   health: Health | null;
   onExit: () => void;
+  projects: ProjectSummary[];
+  onOpenProject: (id: string) => void;
+  onOpenProjects: () => void;
 }
 
 const MIN_CHAT = 340;
@@ -72,6 +79,9 @@ export default function Workspace({
   onPromptUsed,
   health,
   onExit,
+  projects,
+  onOpenProject,
+  onOpenProjects,
 }: Props) {
   const [project, setProject] = useState<Project | null>(null);
   const [mode, setMode] = useState<ProjectMode>('frontend');
@@ -99,9 +109,16 @@ export default function Workspace({
   const [dragging, setDragging] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
   const [projectMenu, setProjectMenu] = useState(false);
+  // True when a build that outlived a previous page visit is still running on
+  // the server; we re-attach to its live event stream below.
+  const [watching, setWatching] = useState(false);
+  // The home sidebar is the workspace's optional third column, hidden until
+  // the top-left toggle is clicked.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const startedRef = useRef(false);
+  const resumeStartedRef = useRef(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
 
   const latestVersion = useMemo(
@@ -121,35 +138,53 @@ export default function Workspace({
     return AGENT_KEYS.filter((key) => seen.has(key));
   }, [groups]);
 
+  // Reflect a local run in the sidebar immediately, without waiting for the
+  // shared 2s project poll in App.
+  const sidebarProjects = useMemo(
+    () =>
+      running || watching
+        ? projects.map((item) =>
+            item.id === projectId ? { ...item, generating: true } : item,
+          )
+        : projects,
+    [projects, projectId, running, watching],
+  );
+
   useEffect(() => {
     if (project?.name) document.title = `${project.name} · Atoms`;
   }, [project?.name]);
+
+  const applyState = useCallback((state: ProjectState) => {
+    setProject(state.project);
+    setMode(state.mode ?? 'frontend');
+    const map: Record<string, Artifact> = {};
+    for (const artifact of state.artifacts) map[artifact.filename] = artifact;
+    setArtifacts(map);
+    setActiveFile((current) =>
+      current && map[current] ? current : pickDefaultFile(state.artifacts),
+    );
+    // The backend only exposes preview_url once .preview/index.html exists, so
+    // an in-flight build cannot point the iframe at a missing file.
+    setPreviewUrl(state.preview_url ?? null);
+    setGroups(buildGroups(state.conversations, state.executions));
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     setLoaded(false);
     setLoadError(null);
+    setPreviewUrl(null);
+    setActiveFile(null);
     api
       .getProject(projectId)
       .then((state) => {
         if (cancelled) return;
-        setProject(state.project);
-        setMode(state.mode ?? 'frontend');
-        const map: Record<string, Artifact> = {};
-        for (const artifact of state.artifacts)
-          map[artifact.filename] = artifact;
-        setArtifacts(map);
-        setActiveFile(pickDefaultFile(state.artifacts));
-        const version = state.artifacts.reduce(
-          (max, artifact) => Math.max(max, artifact.version),
-          0,
-        );
-        if (state.artifacts.length > 0) {
-          setPreviewUrl(
-            state.preview_url ?? `/apps/${projectId}/?v=${version || 1}`,
-          );
+        applyState(state);
+        if (state.generating) {
+          // A build kept running after the previous page was closed.
+          setRunning(true);
+          setWatching(true);
         }
-        setGroups(buildGroups(state.conversations, state.executions));
         setLoaded(true);
       })
       .catch((err: Error) => {
@@ -160,7 +195,7 @@ export default function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, [projectId, applyState]);
 
   useEffect(() => {
     window.localStorage.setItem('atoms-chat-width', String(chatWidth));
@@ -231,6 +266,190 @@ export default function Workspace({
     setDragging(true);
   }
 
+  const normalizeAgent = useCallback((raw: unknown) => {
+    const value = typeof raw === 'string' ? raw : 'mike';
+    return isAgentKey(value) ? value : agentFor(value).key;
+  }, []);
+
+  const handleEvent = useCallback(
+    (event: string, data: Record<string, unknown>) => {
+      if (event === 'snapshot') {
+        const state = data.state as ProjectState | undefined;
+        if (!state) return;
+        applyState(state);
+        setGroups((prev) =>
+          prev.map((group) =>
+            group.executions.some((execution) => execution.status === 'running')
+              ? { ...group, live: true, status: 'running' as const }
+              : group,
+          ),
+        );
+        const stream = data.stream as
+          | { filename?: unknown; content?: unknown }
+          | undefined;
+        if (typeof stream?.filename === 'string') {
+          setStreamingFile(stream.filename);
+          setActiveFile(stream.filename);
+        }
+        if (typeof stream?.content === 'string') {
+          setStreamingBuffer(stream.content);
+        }
+        return;
+      }
+      if (event === 'project') {
+        // The backend names the project from the full first prompt in
+        // the background; adopt the resolved title when it arrives.
+        const name = typeof data.name === 'string' ? data.name.trim() : '';
+        if (name) {
+          setProject((prev) => (prev ? { ...prev, name } : prev));
+        }
+        return;
+      }
+      if (event === 'agent_start') {
+        const runId =
+          typeof data.run_id === 'string' ? data.run_id : null;
+        if (!runId) return;
+        const agent = normalizeAgent(data.agent);
+        const index =
+          typeof data.index === 'number' ? data.index : undefined;
+        setGroups((prev) => {
+          if (prev.some((group) => group.runId === runId)) return prev;
+          return [
+            ...prev,
+            {
+              id: `live-${runId}`,
+              kind: 'agent',
+              agent,
+              runId,
+              executions: [],
+              messages: [],
+              createdAt: new Date().toISOString(),
+              live: true,
+              status: 'running',
+              index,
+            },
+          ];
+        });
+        return;
+      }
+      if (event === 'execution') {
+        const execution = data as unknown as Execution;
+        if (typeof execution.id !== 'number') return;
+        const runId =
+          typeof execution.run_id === 'string' ? execution.run_id : null;
+        if (!runId) return;
+        setGroups((prev) => {
+          let found = false;
+          const next = prev.map((group) => {
+            if (group.runId !== runId) return group;
+            found = true;
+            return {
+              ...group,
+              executions: upsertExecution(group.executions, execution),
+            };
+          });
+          if (found) return next;
+          const agent = normalizeAgent(execution.agent);
+          return [
+            ...next,
+            {
+              id: `live-${runId}`,
+              kind: 'agent',
+              agent,
+              runId,
+              executions: [execution],
+              messages: [],
+              createdAt: execution.created_at ?? new Date().toISOString(),
+              live: true,
+              status: 'running',
+            },
+          ];
+        });
+        return;
+      }
+      if (event === 'token') {
+        const delta = typeof data.delta === 'string' ? data.delta : '';
+        if (delta) setStreamingBuffer((prev) => prev + delta);
+        return;
+      }
+      if (event === 'token_reset') {
+        setStreamingBuffer('');
+        return;
+      }
+      if (event === 'file_start') {
+        const filename =
+          typeof data.filename === 'string' ? data.filename : null;
+        setStreamingFile(filename);
+        setStreamingBuffer('');
+        if (filename) setActiveFile(filename);
+        return;
+      }
+      if (event === 'artifact') {
+        const artifact = data as unknown as Artifact;
+        if (!artifact.filename) return;
+        setArtifacts((prev) => ({
+          ...prev,
+          [artifact.filename]: artifact,
+        }));
+        setActiveFile((prev) => prev ?? artifact.filename);
+        setStreamingFile(null);
+        setStreamingBuffer('');
+        return;
+      }
+      if (event === 'preview') {
+        if (typeof data.url === 'string') setPreviewUrl(data.url);
+        if (
+          data.mode === 'frontend' ||
+          data.mode === 'fullstack' ||
+          data.mode === 'backend'
+        ) {
+          setMode(data.mode);
+        }
+        return;
+      }
+      if (event === 'message') {
+        const runId =
+          typeof data.run_id === 'string' ? data.run_id : null;
+        const content =
+          typeof data.content === 'string' ? data.content : null;
+        if (!runId || !content) return;
+        setGroups((prev) =>
+          prev.map((group) =>
+            group.runId === runId
+              ? { ...group, messages: [...group.messages, content] }
+              : group,
+          ),
+        );
+        return;
+      }
+      if (event === 'agent_end') {
+        const runId =
+          typeof data.run_id === 'string' ? data.run_id : null;
+        if (!runId) return;
+        const status =
+          data.status === 'error'
+            ? ('error' as const)
+            : data.status === 'warning'
+              ? ('warning' as const)
+              : ('success' as const);
+        setGroups((prev) =>
+          prev.map((group) =>
+            group.runId === runId
+              ? { ...group, live: false, status }
+              : group,
+          ),
+        );
+        return;
+      }
+      if (event === 'error') {
+        setError(
+          typeof data.message === 'string' ? data.message : '生成失败',
+        );
+      }
+    },
+    [applyState, normalizeAgent],
+  );
+
   const run = useCallback(
     async (text: string) => {
       const message = text.trim();
@@ -263,169 +482,8 @@ export default function Workspace({
       const controller = new AbortController();
       abortRef.current = controller;
 
-      const normalizeAgent = (raw: unknown) => {
-        const value = typeof raw === 'string' ? raw : 'mike';
-        return isAgentKey(value) ? value : agentFor(value).key;
-      };
-
       try {
-        await generate(
-          projectId,
-          message,
-          (event, data) => {
-            if (event === 'project') {
-              // The backend names the project from the full first prompt in
-              // the background; adopt the resolved title when it arrives.
-              const name = typeof data.name === 'string' ? data.name.trim() : '';
-              if (name) {
-                setProject((prev) => (prev ? { ...prev, name } : prev));
-              }
-              return;
-            }
-            if (event === 'agent_start') {
-              const runId =
-                typeof data.run_id === 'string' ? data.run_id : null;
-              if (!runId) return;
-              const agent = normalizeAgent(data.agent);
-              const index =
-                typeof data.index === 'number' ? data.index : undefined;
-              setGroups((prev) => {
-                if (prev.some((group) => group.runId === runId)) return prev;
-                return [
-                  ...prev,
-                  {
-                    id: `live-${runId}`,
-                    kind: 'agent',
-                    agent,
-                    runId,
-                    executions: [],
-                    messages: [],
-                    createdAt: new Date().toISOString(),
-                    live: true,
-                    status: 'running',
-                    index,
-                  },
-                ];
-              });
-              return;
-            }
-            if (event === 'execution') {
-              const execution = data as unknown as Execution;
-              if (typeof execution.id !== 'number') return;
-              const runId =
-                typeof execution.run_id === 'string' ? execution.run_id : null;
-              if (!runId) return;
-              setGroups((prev) => {
-                let found = false;
-                const next = prev.map((group) => {
-                  if (group.runId !== runId) return group;
-                  found = true;
-                  return {
-                    ...group,
-                    executions: upsertExecution(group.executions, execution),
-                  };
-                });
-                if (found) return next;
-                const agent = normalizeAgent(execution.agent);
-                return [
-                  ...next,
-                  {
-                    id: `live-${runId}`,
-                    kind: 'agent',
-                    agent,
-                    runId,
-                    executions: [execution],
-                    messages: [],
-                    createdAt: execution.created_at ?? new Date().toISOString(),
-                    live: true,
-                    status: 'running',
-                  },
-                ];
-              });
-              return;
-            }
-            if (event === 'token') {
-              const delta = typeof data.delta === 'string' ? data.delta : '';
-              if (delta) setStreamingBuffer((prev) => prev + delta);
-              return;
-            }
-            if (event === 'token_reset') {
-              setStreamingBuffer('');
-              return;
-            }
-            if (event === 'file_start') {
-              const filename =
-                typeof data.filename === 'string' ? data.filename : null;
-              setStreamingFile(filename);
-              setStreamingBuffer('');
-              if (filename) setActiveFile(filename);
-              return;
-            }
-            if (event === 'artifact') {
-              const artifact = data as unknown as Artifact;
-              if (!artifact.filename) return;
-              setArtifacts((prev) => ({
-                ...prev,
-                [artifact.filename]: artifact,
-              }));
-              setActiveFile((prev) => prev ?? artifact.filename);
-              setStreamingFile(null);
-              setStreamingBuffer('');
-              return;
-            }
-            if (event === 'preview') {
-              if (typeof data.url === 'string') setPreviewUrl(data.url);
-              if (
-                data.mode === 'frontend' ||
-                data.mode === 'fullstack' ||
-                data.mode === 'backend'
-              ) {
-                setMode(data.mode);
-              }
-              return;
-            }
-            if (event === 'message') {
-              const runId =
-                typeof data.run_id === 'string' ? data.run_id : null;
-              const content =
-                typeof data.content === 'string' ? data.content : null;
-              if (!runId || !content) return;
-              setGroups((prev) =>
-                prev.map((group) =>
-                  group.runId === runId
-                    ? { ...group, messages: [...group.messages, content] }
-                    : group,
-                ),
-              );
-              return;
-            }
-            if (event === 'agent_end') {
-              const runId =
-                typeof data.run_id === 'string' ? data.run_id : null;
-              if (!runId) return;
-              const status =
-                data.status === 'error'
-                  ? ('error' as const)
-                  : data.status === 'warning'
-                    ? ('warning' as const)
-                    : ('success' as const);
-              setGroups((prev) =>
-                prev.map((group) =>
-                  group.runId === runId
-                    ? { ...group, live: false, status }
-                    : group,
-                ),
-              );
-              return;
-            }
-            if (event === 'error') {
-              setError(
-                typeof data.message === 'string' ? data.message : '生成失败',
-              );
-            }
-          },
-          controller.signal,
-        );
+        await generate(projectId, message, handleEvent, controller.signal);
       } catch (err) {
         if ((err as Error).name === 'AbortError') {
           setError('已停止本轮生成。');
@@ -471,15 +529,85 @@ export default function Workspace({
         );
       }
     },
-    [projectId],
+    [projectId, handleEvent],
   );
 
+  const resume = useCallback(async () => {
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setRunning(true);
+    setError(null);
+    let aborted = false;
+    try {
+      await resumeGeneration(projectId, handleEvent, controller.signal);
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') {
+        aborted = true;
+        setError('已停止本轮生成。');
+        setGroups((prev) =>
+          prev.map((group) =>
+            group.live
+              ? {
+                  ...group,
+                  live: false,
+                  status: 'warning' as const,
+                  executions: group.executions.map((execution) =>
+                    execution.status === 'running'
+                      ? {
+                          ...execution,
+                          status: 'warning' as const,
+                          log: '已手动停止',
+                        }
+                      : execution,
+                  ),
+                }
+              : group,
+          ),
+        );
+      } else {
+        setError((err as Error).message || '恢复生成失败，请重试。');
+      }
+    } finally {
+      setRunning(false);
+      setStreamingFile(null);
+      setStreamingBuffer('');
+      abortRef.current = null;
+      setGroups((prev) =>
+        prev.map((group) =>
+          group.live
+            ? {
+                ...group,
+                live: false,
+                status: group.messages.length
+                  ? ('success' as const)
+                  : ('warning' as const),
+              }
+            : group,
+        ),
+      );
+      if (!aborted) {
+        // The build may have finished just before the stream attached.
+        try {
+          applyState(await api.getProject(projectId));
+        } catch {
+          // Ignore; the next user action will refresh the workspace.
+        }
+      }
+    }
+  }, [projectId, handleEvent, applyState]);
+
   useEffect(() => {
-    if (!loaded || !initialPrompt || startedRef.current) return;
+    if (!watching || resumeStartedRef.current) return;
+    resumeStartedRef.current = true;
+    void resume().finally(() => setWatching(false));
+  }, [watching, resume]);
+
+  useEffect(() => {
+    if (!loaded || !initialPrompt || startedRef.current || watching) return;
     startedRef.current = true;
     onPromptUsed();
     if (groups.length === 0) void run(initialPrompt);
-  }, [loaded, initialPrompt, groups.length, onPromptUsed, run]);
+  }, [loaded, initialPrompt, groups.length, onPromptUsed, run, watching]);
 
   useEffect(
     () => () => {
@@ -487,6 +615,12 @@ export default function Workspace({
     },
     [],
   );
+
+  const stop = useCallback(() => {
+    abortRef.current?.abort();
+    // Aborting the fetch only detaches this page; tell the server to stop too.
+    void api.cancelGeneration(projectId).catch(() => undefined);
+  }, [projectId]);
 
   function refreshPreview() {
     setRefreshKey((value) => value + 1);
@@ -534,7 +668,19 @@ export default function Workspace({
   }
 
   return (
-    <div className="flex h-full flex-col overflow-hidden bg-base">
+    <div className="flex h-full overflow-hidden bg-base">
+      {sidebarOpen ? (
+        <HomeSidebar
+          projects={sidebarProjects}
+          section="workspace"
+          onHome={onExit}
+          onProjects={onOpenProjects}
+          onOpenProject={onOpenProject}
+          onCollapse={() => setSidebarOpen(false)}
+        />
+      ) : null}
+
+      <div className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-base">
       <header className="flex h-11 flex-none items-center bg-base">
         <div
           style={{ width: chatWidth }}
@@ -542,11 +688,21 @@ export default function Workspace({
         >
           <button
             type="button"
-            onClick={onExit}
-            title="返回首页"
-            className="grid h-7 w-7 flex-none place-items-center rounded-md text-ink-95 transition hover:bg-line-6"
+            onClick={() => setSidebarOpen((value) => !value)}
+            title={sidebarOpen ? '收起侧边栏' : '展开侧边栏'}
+            aria-label={sidebarOpen ? '收起侧边栏' : '展开侧边栏'}
+            aria-pressed={sidebarOpen}
+            className="group grid h-7 w-7 flex-none place-items-center rounded-md text-ink-95 transition hover:bg-line-6"
           >
-            <AtomsMark size={20} />
+            <AtomsMark size={20} className={sidebarOpen ? 'hidden' : 'group-hover:hidden'} />
+            <PanelLeft
+              size={18}
+              className={
+                sidebarOpen
+                  ? 'block text-ink-80'
+                  : 'hidden text-ink-80 group-hover:block'
+              }
+            />
           </button>
 
           <div className="relative min-w-0 flex-1">
@@ -587,7 +743,7 @@ export default function Workspace({
                     type="button"
                     onClick={() => {
                       setProjectMenu(false);
-                      onExit();
+                      onOpenProjects();
                     }}
                     className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-ink-80 transition hover:bg-line-4 hover:text-ink-95"
                   >
@@ -691,7 +847,7 @@ export default function Workspace({
             running={running}
             error={error}
             onSend={(text) => void run(text)}
-            onStop={() => abortRef.current?.abort()}
+            onStop={stop}
             onOpenCode={() => setPane('code')}
           />
         </div>
@@ -725,6 +881,7 @@ export default function Workspace({
             streamingBuffer={streamingBuffer}
           />
         )}
+      </div>
       </div>
     </div>
   );

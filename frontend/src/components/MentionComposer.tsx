@@ -48,6 +48,9 @@ export default function MentionComposer({
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const [triggerStart, setTriggerStart] = useState<number | null>(null);
+  // True while an IME (e.g. Chinese/Japanese input) is composing. Enter there
+  // confirms the candidate, it must never submit the message.
+  const composingRef = useRef(false);
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -109,6 +112,11 @@ export default function MentionComposer({
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    // Safari reports isComposing=false and keyCode=229 when Enter ends a
+    // composition, so check the ref and the legacy keyCode as well.
+    if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) {
+      return;
+    }
     if (open) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -152,7 +160,19 @@ export default function MentionComposer({
         onChange={(event) => {
           const next = event.target.value;
           onChange(next);
-          syncCursor(next, event.target.selectionStart);
+          if (
+            !composingRef.current &&
+            !(event.nativeEvent as InputEvent).isComposing
+          ) {
+            syncCursor(next, event.target.selectionStart);
+          }
+        }}
+        onCompositionStart={() => {
+          composingRef.current = true;
+        }}
+        onCompositionEnd={(event) => {
+          composingRef.current = false;
+          syncCursor(event.currentTarget.value, event.currentTarget.selectionStart);
         }}
         onClick={(event) => syncCursor(value, event.currentTarget.selectionStart)}
         onKeyUp={(event) => {

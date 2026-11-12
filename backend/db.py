@@ -257,6 +257,23 @@ async def update_execution(exec_id: int, status: str, log: str | None) -> None:
         await conn.commit()
 
 
+async def interrupt_running_executions(
+    log: str = "生成被中断，请重新发送需求", pid: str | None = None
+) -> None:
+    """Flush rows left in ``running`` by an interrupted or crashed build."""
+    sql = (
+        "UPDATE executions SET status = 'warning', "
+        "log = CASE WHEN log = '' THEN ? ELSE log END WHERE status = 'running'"
+    )
+    params: list[object] = [log]
+    if pid is not None:
+        sql += " AND project_id = ?"
+        params.append(pid)
+    async with _connect() as conn:
+        await conn.execute(sql, params)
+        await conn.commit()
+
+
 async def delete_artifacts_except(pid: str, keep: set[str]) -> None:
     """Drop latest-file rows for paths that no longer exist on disk."""
     async with _connect() as conn:

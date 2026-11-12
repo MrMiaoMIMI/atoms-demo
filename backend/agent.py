@@ -40,13 +40,13 @@ JSON 结构：
   "mode": "frontend | fullstack | backend",
   "reason": "为什么选择这个形态",
   "entities": [
-    {"table": "todos", "fields": [
+    {"table": "items", "fields": [
       {"name": "id", "type": "INTEGER", "primary_key": true, "autoincrement": true},
       {"name": "title", "type": "TEXT", "not_null": true},
-      {"name": "done", "type": "INTEGER", "not_null": true, "default": 0}
+      {"name": "created_at", "type": "TEXT", "not_null": true}
     ]}
   ],
-  "api": [{"method": "GET", "path": "/api/todos", "description": "获取列表"}],
+  "api": [{"method": "GET", "path": "/api/items", "description": "获取列表"}],
   "files": [{"path": "frontend/src/App.tsx", "purpose": "该文件的职责"}]
 }
 
@@ -65,7 +65,7 @@ JSON 结构：
 3. frontend 形态必须规划 frontend/src/App.tsx 与 frontend/src/styles.css。
    fullstack 形态还必须规划 backend/main.py。
 4. 前端只能 import react / react-dom 和本轮规划中的本地文件；禁止第三方库。
-5. 前端所有后端请求使用相对路径 "api/..."（不要以 / 开头），例如 fetch("api/todos")。
+5. 前端所有后端请求使用相对路径 "api/..."（不要以 / 开头），例如 fetch("api/items")。
 6. 后端只能使用 fastapi、pydantic、aiosqlite、uvicorn 与 Python 标准库。
 7. 用户是在续改已有项目时，列出所有需要新增或修改的文件；不要重复列出不需要改的文件。
 8. 如果已有项目是 fullstack，除非用户明确要求去掉后端，否则继续保持 fullstack。
@@ -79,7 +79,7 @@ FRONTEND_SYSTEM = """你是 "Coder" Agent，负责写出一个 React + TypeScrip
 - 只 import react / react-dom 以及本轮文件清单中的本地文件；禁止任何第三方库。
 - 不要 import CSS（样式统一写在 frontend/src/styles.css，由 main.tsx 引入）。
 - 所有 className 使用字面量字符串（条件样式用 "a" + (cond ? " b" : "")），不要在运行时拼出未定义的类名。
-- 全栈项目必须调用后端 API：所有请求使用相对路径 "api/..."，例如 fetch("api/todos")，禁止以 / 开头。
+- 全栈项目必须调用后端 API：所有请求使用相对路径 "api/..."，例如 fetch("api/items")，禁止以 / 开头。
 - fetch 后必须检查 res.ok；要有加载中、空数据、错误三种状态。
 - 禁止 localStorage / sessionStorage；持久化只能走后端 SQLite。
 - 视觉现代、精致、响应式，文案使用真实内容，不要 Lorem ipsum 占位。
@@ -124,6 +124,14 @@ RETRY_HINT = (
 FENCE = re.compile(r"^```[a-zA-Z0-9]*\s*\n?")
 REMOVE_BACKEND = ("不要后端", "去掉后端", "纯前端", "只做前端", "只要前端")
 REMOVE_FRONTEND = ("只做后端", "只要后端", "纯后端", "只写后端", "不要前端", "没有前端", "只提供api")
+# Models occasionally concatenate several planned files into one reply, each
+# introduced by a comment such as ``// frontend/src/App.tsx`` or
+# ``/* frontend/src/styles.css */``. Appending CSS to a .tsx file breaks esbuild.
+FILE_MARKER = re.compile(
+    r"^[ \t]*(?://|/\*)[ \t]*((?:frontend|backend)/[\w./-]+\.(?:tsx|ts|jsx|js|css|py))"
+    r"[ \t]*(?:\*/)?[ \t]*$",
+    re.M,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +143,29 @@ def _clean_file_content(text: str) -> str:
     content = FENCE.sub("", content)
     content = re.sub(r"\n?```\s*$", "", content)
     return content.strip()
+
+
+def _extract_requested_file(text: str, path: str) -> str:
+    """Keep only the block that belongs to ``path`` when the model emits more
+    than one file in a single reply.
+
+    The requested block starts at its own file marker; everything from the next
+    foreign file marker onward is dropped. Without markers the text is returned
+    unchanged, so this is safe for models that answer with bare file content.
+    """
+    cleaned = _clean_file_content(text)
+    markers = list(FILE_MARKER.finditer(cleaned))
+    own = [m for m in markers if m.group(1) == path]
+    if not own:
+        return cleaned
+    start = own[0].end()
+    end = len(cleaned)
+    for marker in markers:
+        if marker.start() >= start and marker.group(1) != path:
+            end = marker.start()
+            break
+    body = cleaned[start:end].strip()
+    return body or cleaned
 
 
 def _existing_mode(existing: dict[str, str]) -> str | None:
@@ -583,6 +614,8 @@ def _coder_user(
         f"项目形态：{plan['mode']}（title: {plan['title']}）",
         f"需要生成的文件：{path}（{purpose}）",
         f"本轮文件清单：{', '.join(item['path'] for item in plan['files'])}",
+        f"注意：本轮只输出 {path} 这一个文件的完整内容；清单中的其他文件会在后续单独生成，"
+        "不要把它们拼进同一个回复里。",
         _contract(plan),
     ]
     if path in existing:
@@ -641,6 +674,23 @@ def _offending_frontend_file(files: dict[str, str], issues: list[str]) -> str:
             if name.startswith("frontend/src/") and re.search(r"""["'`]/api/""", content):
                 return name
     return "frontend/src/App.tsx"
+
+
+def _repair_build_user(
+    message: str, plan: dict, target: str, error: str, files: dict[str, str]
+) -> str:
+    return "\n\n".join(
+        [
+            f"用户需求：\n{message}",
+            f"项目概述：{plan['summary']}",
+            _contract(plan),
+            f"前端构建失败，错误如下：\n{error[:3000]}",
+            f"当前 {target} 的完整内容（必须在此基础上修复，不要重写业务内容）：\n"
+            f"<current>\n{files.get(target, '')[:16000]}\n</current>",
+            f"要求：只修复导致构建失败的语法/结构问题；保留现有页面主题、文案、布局与交互；"
+            f"只输出 {target} 的完整内容，不要输出其他文件、代码围栏或解释。",
+        ]
+    )
 
 
 def _repair_app_user(
@@ -1272,9 +1322,11 @@ async def _build_project(
             emit=emit,
             emit_tokens=True,
             state=state,
-            validator=lambda text, p=path: _valid_content(p, _clean_file_content(text)),
+            validator=lambda text, p=path: _valid_content(
+                p, _extract_requested_file(text, p)
+            ),
         )
-        content = _clean_file_content(raw)
+        content = _extract_requested_file(raw, path)
         contents[path] = content
         await toolbox.call("write_file", path=path, content=content)
         await emit(
@@ -1370,10 +1422,11 @@ async def _build_project(
                     emit_tokens=True,
                     state=state,
                     validator=lambda text: _valid_content(
-                        "frontend/src/styles.css", _clean_file_content(text)
+                        "frontend/src/styles.css",
+                        _extract_requested_file(text, "frontend/src/styles.css"),
                     ),
                 )
-                repaired = _clean_file_content(raw)
+                repaired = _extract_requested_file(raw, "frontend/src/styles.css")
                 if not repaired:
                     break
                 published["frontend/src/styles.css"] = repaired
@@ -1427,10 +1480,10 @@ async def _build_project(
                 emit_tokens=True,
                 state=state,
                 validator=lambda text, p=target_path: _valid_content(
-                    p, _clean_file_content(text)
+                    p, _extract_requested_file(text, p)
                 ),
             )
-            repaired = _clean_file_content(raw)
+            repaired = _extract_requested_file(raw, target_path)
             if repaired:
                 published[target_path] = repaired
                 contents[target_path] = repaired
@@ -1481,10 +1534,10 @@ async def _build_project(
                 emit_tokens=True,
                 state=state,
                 validator=lambda text: _valid_content(
-                    "backend/main.py", _clean_file_content(text)
+                    "backend/main.py", _extract_requested_file(text, "backend/main.py")
                 ),
             )
-            repaired = _clean_file_content(raw)
+            repaired = _extract_requested_file(raw, "backend/main.py")
             if repaired and not state.get("degraded"):
                 published["backend/main.py"] = repaired
                 contents["backend/main.py"] = repaired
@@ -1581,13 +1634,20 @@ async def _build_project(
                         "file_start",
                         {"filename": target_path, "purpose": "修复构建错误"},
                     )
+                    repair_ex = await emit(
+                        "execution",
+                        {
+                            "step": f"修复构建错误：{target_path}",
+                            "status": "running",
+                            "log": error_text.replace("\n", " ")[:180],
+                        },
+                    )
                     raw = await _llm_text(
                         llm,
                         role="coder",
                         system=_system_for(target_path),
-                        user=(
-                            f"前端构建失败，错误如下：\n{error_text[:3000]}\n\n"
-                            f"请修复 {target_path}，保留现有功能与视觉，只输出该文件完整内容。"
+                        user=_repair_build_user(
+                            message, plan, target_path, error_text, published
                         ),
                         meta={
                             "prompt": message,
@@ -1600,10 +1660,10 @@ async def _build_project(
                         emit_tokens=True,
                         state=state,
                         validator=lambda text, p=target_path: _valid_content(
-                            p, _clean_file_content(text)
+                            p, _extract_requested_file(text, p)
                         ),
                     )
-                    fixed = _clean_file_content(raw)
+                    fixed = _extract_requested_file(raw, target_path)
                     if fixed and not state.get("degraded"):
                         published[target_path] = fixed
                         contents[target_path] = fixed
@@ -1616,6 +1676,22 @@ async def _build_project(
                             repaired = True
                         except frontend_builder.BuildError:
                             repaired = False
+                        remaining = _review(published, plan["mode"])
+                        if remaining:
+                            repair_notes.append(
+                                f"构建错误修复后仍有 {len(remaining)} 项检查未通过"
+                            )
+                    await emit(
+                        "execution",
+                        {
+                            "id": repair_ex,
+                            "step": f"修复构建错误：{target_path}",
+                            "status": "success" if repaired else "warning",
+                            "log": "已修复并重新构建"
+                            if repaired
+                            else "修复后仍无法构建，准备回退",
+                        },
+                    )
             if not repaired:
                 if not force_mock:
                     fallback = await _install_mock_fallback(
@@ -1704,10 +1780,10 @@ async def _build_project(
                     emit_tokens=True,
                     state=state,
                     validator=lambda text: _valid_content(
-                        "backend/main.py", _clean_file_content(text)
+                        "backend/main.py", _extract_requested_file(text, "backend/main.py")
                     ),
                 )
-                fixed = _clean_file_content(raw)
+                fixed = _extract_requested_file(raw, "backend/main.py")
                 if fixed and not state.get("degraded"):
                     published["backend/main.py"] = fixed
                     contents["backend/main.py"] = fixed

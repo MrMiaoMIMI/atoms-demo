@@ -11,6 +11,9 @@ type ModeFilter = ProjectMode | 'all';
 
 interface Props {
   health: Health | null;
+  sidebarProjects: ProjectSummary[];
+  sidebarCollapsed: boolean;
+  onSidebarCollapsed: (collapsed: boolean) => void;
   onHome: () => void;
   onNewProject: () => void;
   onOpenProject: (id: string) => void;
@@ -18,6 +21,9 @@ interface Props {
 
 export default function ProjectsPage({
   health,
+  sidebarProjects,
+  sidebarCollapsed,
+  onSidebarCollapsed,
   onHome,
   onNewProject,
   onOpenProject,
@@ -28,7 +34,6 @@ export default function ProjectsPage({
   const [deleting, setDeleting] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState<ModeFilter>('all');
-  const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,16 +101,22 @@ export default function ProjectsPage({
 
   return (
     <div className="flex h-full overflow-hidden bg-base">
-      {collapsed ? (
-        <CollapsedSidebar health={health} onExpand={() => setCollapsed(false)} />
+      {sidebarCollapsed ? (
+        <CollapsedSidebar
+          health={health}
+          section="projects"
+          onHome={onHome}
+          onProjects={() => undefined}
+          onExpand={() => onSidebarCollapsed(false)}
+        />
       ) : (
         <HomeSidebar
-          projects={projects}
+          projects={sidebarProjects}
           section="projects"
           onHome={onHome}
           onProjects={() => undefined}
           onOpenProject={onOpenProject}
-          onCollapse={() => setCollapsed(true)}
+          onCollapse={() => onSidebarCollapsed(true)}
         />
       )}
 
