@@ -116,10 +116,39 @@ BACKEND_SYSTEM = """你是 "Coder" Agent，负责写出一个 FastAPI 后端文�
 - 如果提供了当前文件内容或启动报错，在保留原有可用功能的基础上修复。
 """
 
+SPLIT_SYSTEM = """你是 "Coder" Agent，负责把一个过大的前端文件拆分为多个可编译的文件。
+只输出 JSON，不要 markdown 代码围栏，不要任何解释。
+
+JSON 结构：
+{"files":[{"path":"frontend/src/App.tsx","content":"完整文件内容"},{"path":"frontend/src/components/Foo.tsx","content":"完整文件内容"}]}
+
+规则：
+1. 必须包含原文件路径；如果原文件是 App.tsx，必须保留 `export default`。
+2. 新文件只能放在 frontend/src/components/ 或 frontend/src/hooks/，扩展名 .tsx/.ts/.jsx/.js。
+3. 保留现有功能、文案、className 与样式依赖；拆出的组件通过 import 使用。
+4. 每个文件尽量控制在 6,000 字符以内；结构完整闭合，不要省略实现。
+5. 不要输出 package.json、main.tsx、styles.css 或任何解释。
+"""
+
 RETRY_HINT = (
     "\n\n重要：上一次输出被截断或不完整。请重新输出完整文件，"
     "确保所有标签与括号闭合，不要省略任何部分，也不要加解释。"
 )
+PLANNER_RETRY_HINT = (
+    "\n\n重要：上一次输出不是合法 JSON 或缺少 mode / files。"
+    "请只输出一个完整 JSON 对象，不要 markdown 代码围栏或解释。"
+)
+ANSWER_RETRY_HINT = (
+    "\n\n重要：上一次回答为空或不完整。请重新完整回答，不要重复已输出内容。"
+)
+SPLIT_RETRY_HINT = (
+    "\n\n重要：上一次输出不是合法 JSON，或没有同时包含原文件与新组件。"
+    '请只输出 {"files":[{"path":"...","content":"..."}]}，并保留原文件路径。'
+)
+
+
+class GenerationError(RuntimeError):
+    """A generation round failed; the project keeps its last good version."""
 
 FENCE = re.compile(r"^```[a-zA-Z0-9]*\s*\n?")
 REMOVE_BACKEND = ("不要后端", "去掉后端", "纯前端", "只做前端", "只要前端")
@@ -364,6 +393,27 @@ def _normalize_files(raw: Any, mode: str) -> list[dict]:
     return files
 
 
+def _parse_plan_json(text: str) -> dict | None:
+    """Parse the first JSON object in a model reply, tolerating prose around it."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text[start:])
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _planner_text_valid(text: str) -> bool:
+    """Reject prose / broken JSON so the planner call is retried."""
+    data = _parse_plan_json(text)
+    return bool(
+        data
+        and str(data.get("mode") or "").strip().lower() in scaffold.MODES
+    )
+
+
 def _plan_from_text(
     text: str,
     message: str,
@@ -371,15 +421,7 @@ def _plan_from_text(
     existing_mode: str | None,
     project_name: str,
 ) -> dict:
-    data: dict = {}
-    match = re.search(r"\{.*\}", text, re.S)
-    if match:
-        try:
-            loaded = json.loads(match.group(0))
-            if isinstance(loaded, dict):
-                data = loaded
-        except (ValueError, TypeError):
-            data = {}
+    data: dict = _parse_plan_json(text) or {}
 
     planned_mode = str(data.get("mode") or "").strip().lower()
     if planned_mode not in scaffold.MODES:
@@ -411,42 +453,6 @@ def _plan_from_text(
         "api": api,
         "files": files,
     }
-
-
-def _mock_plan_data(
-    message: str,
-    existing: dict[str, str],
-    existing_mode: str | None,
-    project_name: str,
-) -> dict:
-    mode = _resolve_mode(templates.pick_mode(message, existing_mode), message, existing_mode)
-    entities = templates.entities_for(mode, message)
-    api = templates.api_for(mode, entities)
-    title = _existing_title(existing) or templates.extract_title(message, mode)
-    return {
-        "summary": "LLM 输出异常，已整轮回退到一致的 Mock 模板，保证项目完整可运行。",
-        "title": title or (project_name or "Atoms App"),
-        "mode": mode,
-        "entities": entities,
-        "api": api,
-        "files": _normalize_files(None, mode),
-    }
-
-
-def _mock_contents(plan: dict) -> dict[str, str]:
-    contents: dict[str, str] = {}
-    for item in plan["files"]:
-        path = item["path"]
-        content = templates.mock_file(
-            "",
-            path,
-            None,
-            mode=plan["mode"],
-            title=plan["title"],
-        )
-        if content:
-            contents[path] = content
-    return contents
 
 
 def _scaffold_files(
@@ -740,9 +746,17 @@ async def _llm_text(
     meta: dict,
     emit: Emit,
     emit_tokens: bool,
-    state: dict,
     validator: Callable[[str], bool] | None = None,
+    retry_hint: str = RETRY_HINT,
 ) -> str:
+    """One LLM call with bounded retries and no silent Mock fallback.
+
+    MockLLM is used only when the deployment has no API key, so it is never
+    retried. A real model gets ``LLM_MAX_RETRIES`` extra attempts; when every
+    attempt fails the round raises ``GenerationError`` and the caller keeps
+    the project's last published version.
+    """
+
     async def run(current, prompt_user: str) -> str:
         parts: list[str] = []
         async for chunk in current.stream(role=role, system=system, user=prompt_user, meta=meta):
@@ -754,50 +768,49 @@ async def _llm_text(
             raise RuntimeError("LLM returned empty content")
         return text
 
-    if state.get("degraded"):
-        return await run(MockLLM(), user)
-
+    attempts = 1 if isinstance(llm, MockLLM) else config.LLM_MAX_RETRIES + 1
     last_error: Exception | None = None
-    for attempt in range(2):
-        prompt_user = user if attempt == 0 else user + RETRY_HINT
+    for attempt in range(attempts):
+        prompt_user = user if attempt == 0 else user + retry_hint
         try:
             text = await run(llm, prompt_user)
+            candidate = _clean_file_content(text) if validator else text
+            if validator is None or validator(candidate):
+                return text
+            last_error = RuntimeError("LLM output incomplete")
         except Exception as exc:
             last_error = exc
-            if isinstance(llm, MockLLM):
-                raise
-            break
-        candidate = _clean_file_content(text) if validator else text
-        if validator is None or validator(candidate):
-            return text
-        last_error = RuntimeError("LLM output incomplete")
+
         if emit_tokens:
             await emit("token_reset", {"filename": meta.get("filename")})
-        if attempt == 0:
-            await emit(
-                "execution",
-                {
-                    "agent": "Coder" if role == "coder" else "Orchestrator",
-                    "step": f"重试 {meta.get('filename') or role}",
-                    "status": "warning",
-                    "log": "输出缺少闭合结构，自动重试一次",
-                },
-            )
+        if attempt + 1 >= attempts:
+            break
 
-    state["degraded"] = True
+        delay = min(
+            config.LLM_RETRY_BACKOFF * (2 ** attempt),
+            config.LLM_RETRY_BACKOFF_MAX,
+        )
+        assert last_error is not None
+        await emit(
+            "execution",
+            {
+                "agent": "Coder" if role == "coder" else "Orchestrator",
+                "step": f"重试 {meta.get('filename') or role}",
+                "status": "warning",
+                "log": (
+                    f"第 {attempt + 1}/{attempts - 1} 次重试："
+                    f"{type(last_error).__name__}: {str(last_error)[:140]}"
+                ),
+            },
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
     assert last_error is not None
-    await emit(
-        "execution",
-        {
-            "agent": "Orchestrator",
-            "step": "降级 Mock Agent",
-            "status": "warning",
-            "log": f"{type(last_error).__name__}: {str(last_error)[:180]}",
-        },
+    raise GenerationError(
+        f"LLM 调用失败（已尝试 {attempts} 次）："
+        f"{type(last_error).__name__}: {str(last_error)[:200]}"
     )
-    if emit_tokens:
-        await emit("token_reset", {"filename": meta.get("filename")})
-    return await run(MockLLM(), user)
 
 
 # ---------------------------------------------------------------------------
@@ -951,23 +964,34 @@ async def _run_mike(
         f"项目上下文：\n{context}\n\n"
         "请按角色要求输出；最后一行给出 @Bob 或 @Alex。"
     )
-    state: dict = {}
-    text = await _llm_text(
-        get_llm(),
-        role="mike",
-        system=agent_roster.MIKE_SYSTEM,
-        user=user,
-        meta={
-            "prompt": message,
-            "project_name": project_name,
-            "mode": existing_mode,
-            "files": sorted(existing),
-            "version": current_version,
-        },
-        emit=emit,
-        emit_tokens=False,
-        state=state,
-    )
+    try:
+        text = await _llm_text(
+            get_llm(),
+            role="mike",
+            system=agent_roster.MIKE_SYSTEM,
+            user=user,
+            meta={
+                "prompt": message,
+                "project_name": project_name,
+                "mode": existing_mode,
+                "files": sorted(existing),
+                "version": current_version,
+            },
+            emit=emit,
+            emit_tokens=False,
+            retry_hint=ANSWER_RETRY_HINT,
+        )
+    except Exception as exc:
+        await emit(
+            "execution",
+            {
+                "id": ex,
+                "step": "理解需求",
+                "status": "error",
+                "log": f"{type(exc).__name__}: {str(exc)[:160]}",
+            },
+        )
+        raise
     text = text.strip()
     if not text:
         target = _fallback_route(message, existing_mode)
@@ -1017,7 +1041,7 @@ async def _call_planner(
     existing: dict[str, str],
     existing_mode: str | None,
     extra_context: str = "",
-) -> tuple[dict, bool]:
+) -> dict:
     planner_user = (
         f"用户需求：\n{message}\n\n"
         + (f"{extra_context}\n\n" if extra_context else "")
@@ -1025,7 +1049,6 @@ async def _call_planner(
         + f"当前形态：{existing_mode or '（空项目）'}\n\n"
         + "输出 JSON。"
     )
-    state: dict = {}
     plan_text = await _llm_text(
         get_llm(),
         role="planner",
@@ -1038,13 +1061,10 @@ async def _call_planner(
         },
         emit=emit,
         emit_tokens=False,
-        state=state,
+        validator=_planner_text_valid,
+        retry_hint=PLANNER_RETRY_HINT,
     )
-    plan = _plan_from_text(plan_text, message, existing, existing_mode, project_name)
-    is_mock = bool(state.get("degraded"))
-    if is_mock:
-        plan = _mock_plan_data(message, existing, existing_mode, project_name)
-    return plan, is_mock
+    return _plan_from_text(plan_text, message, existing, existing_mode, project_name)
 
 
 async def _run_bob(
@@ -1056,7 +1076,7 @@ async def _run_bob(
     existing: dict[str, str],
     existing_mode: str | None,
     mike_text: str,
-) -> tuple[dict, str, bool]:
+) -> tuple[dict, str]:
     ex = await emit(
         "execution",
         {
@@ -1065,14 +1085,26 @@ async def _run_bob(
             "log": "阅读现有结构，判断前端 / 全栈 / 后端…",
         },
     )
-    plan, is_mock = await _call_planner(
-        message,
-        emit,
-        project_name=project_name,
-        existing=existing,
-        existing_mode=existing_mode,
-        extra_context=(f"Mike 的计划：\n{mike_text}" if mike_text else ""),
-    )
+    try:
+        plan = await _call_planner(
+            message,
+            emit,
+            project_name=project_name,
+            existing=existing,
+            existing_mode=existing_mode,
+            extra_context=(f"Mike 的计划：\n{mike_text}" if mike_text else ""),
+        )
+    except Exception as exc:
+        await emit(
+            "execution",
+            {
+                "id": ex,
+                "step": "分析项目形态",
+                "status": "error",
+                "log": f"{type(exc).__name__}: {str(exc)[:160]}",
+            },
+        )
+        raise
     await emit(
         "execution",
         {
@@ -1097,8 +1129,7 @@ async def _run_bob(
     except Exception:  # noqa: BLE001 - validation must never block the plan
         valid = True
     if not valid:
-        plan = _mock_plan_data(message, existing, existing_mode, project_name)
-        is_mock = True
+        raise GenerationError("架构方案校验失败：缺少必需文件或形态不合法")
     tables = "、".join(item["table"] for item in plan["entities"]) or "无"
     api_count = len(plan["api"])
     files = "、".join(item["path"] for item in plan["files"][:6])
@@ -1119,7 +1150,7 @@ async def _run_bob(
         f"文件：{files}\n\n"
         "@Alex"
     )
-    return plan, text, is_mock
+    return plan, text
 
 
 async def _run_alex(
@@ -1132,7 +1163,6 @@ async def _run_alex(
     existing_mode: str | None,
     version: int,
     plan: dict | None,
-    plan_is_mock: bool,
     bob_text: str = "",
 ) -> str:
     if plan is None:
@@ -1144,13 +1174,25 @@ async def _run_alex(
                 "log": "读取现有项目并规划应用结构…",
             },
         )
-        plan, plan_is_mock = await _call_planner(
-            message,
-            emit,
-            project_name=project_name,
-            existing=existing,
-            existing_mode=existing_mode,
-        )
+        try:
+            plan = await _call_planner(
+                message,
+                emit,
+                project_name=project_name,
+                existing=existing,
+                existing_mode=existing_mode,
+            )
+        except Exception as exc:
+            await emit(
+                "execution",
+                {
+                    "id": ex,
+                    "step": "分析需求与形态",
+                    "status": "error",
+                    "log": f"{type(exc).__name__}: {str(exc)[:160]}",
+                },
+            )
+            raise
         await emit(
             "execution",
             {
@@ -1192,47 +1234,113 @@ async def _run_alex(
                 "id": ex,
                 "step": "接收架构方案",
                 "status": "success",
-                "log": f"{plan['mode']} · {len(plan['files'])} 个文件"
-                + ("（Mock 方案）" if plan_is_mock else ""),
+                "log": f"{plan['mode']} · {len(plan['files'])} 个文件",
             },
         )
 
-    state: dict = {}
-    return await _build_project(
-        pid,
-        message,
-        plan,
-        emit,
-        existing=existing,
-        existing_mode=existing_mode,
-        project_name=project_name,
-        version=version,
-        llm=get_llm(),
-        state=state,
-        plan_is_mock=plan_is_mock,
-        bob_text=bob_text,
-    )
+    progress = {"published": False}
+    try:
+        return await _build_project(
+            pid,
+            message,
+            plan,
+            emit,
+            existing=existing,
+            version=version,
+            llm=get_llm(),
+            progress=progress,
+            bob_text=bob_text,
+        )
+    except Exception:
+        await _rollback_round(
+            pid,
+            version,
+            existing,
+            project_name,
+            emit,
+            emit.toolbox(),
+            progress["published"],
+        )
+        raise
 
 
-async def _install_mock_fallback(
+async def _rollback_round(
     pid: str,
     version: int,
-    existing: dict[str, str],
-    message: str,
-    existing_mode: str | None,
+    previous: dict[str, str],
     project_name: str,
     emit: RoleEmitter,
     toolbox: Toolbox,
-) -> dict:
-    plan = _mock_plan_data(message, existing, existing_mode, project_name)
-    scaffolds = _scaffold_files(plan, existing)
-    contents = _mock_contents(plan)
-    published = _prune({**existing, **scaffolds, **contents}, plan["mode"])
-    for path, content in {**scaffolds, **contents}.items():
-        if existing.get(path) != content:
-            await toolbox.call("write_file", path=path, content=content)
-    await toolbox.call("publish_files", files=published)
-    return {"plan": plan, "published": published, "contents": contents}
+    had_published: bool,
+) -> None:
+    """Restore the last good source tree after a failed build round.
+
+    The project's SQLite data directory is preserved by ``publish_files``. Any
+    artifacts written for the failed version are discarded so a refresh shows
+    the same code that is on disk.
+    """
+    restore_error: Exception | None = None
+    try:
+        if had_published:
+            await toolbox.call("publish_files", files=previous)
+            title = _existing_title(previous) or project_name
+            try:
+                if any(path.startswith("frontend/") for path in previous):
+                    await frontend_builder.build(pid, title)
+                elif any(path.startswith("backend/") for path in previous):
+                    await toolbox.call(
+                        "build_preview",
+                        plan={"mode": "backend", "title": title, "api": []},
+                    )
+            except Exception as exc:  # noqa: BLE001 - preview restore is best effort
+                await emit(
+                    "execution",
+                    {
+                        "step": "恢复预览",
+                        "status": "warning",
+                        "log": f"{type(exc).__name__}: {str(exc)[:140]}",
+                    },
+                )
+            if any(path.startswith("backend/") for path in previous):
+                try:
+                    await toolbox.call("start_runtime")
+                except Exception as exc:  # noqa: BLE001 - best effort
+                    await emit(
+                        "execution",
+                        {
+                            "step": "恢复后端运行时",
+                            "status": "warning",
+                            "log": f"{type(exc).__name__}: {str(exc)[:140]}",
+                        },
+                    )
+    except Exception as exc:  # noqa: BLE001 - rollback must not mask the cause
+        restore_error = exc
+    try:
+        await db.delete_artifacts_version(pid, version)
+    except Exception as exc:  # noqa: BLE001
+        restore_error = restore_error or exc
+    if restore_error is not None:
+        await emit(
+            "execution",
+            {
+                "step": "回滚本轮改动",
+                "status": "error",
+                "log": f"回滚失败：{type(restore_error).__name__}: {str(restore_error)[:160]}",
+            },
+        )
+    else:
+        await emit(
+            "execution",
+            {
+                "step": "回滚本轮改动",
+                "status": "warning",
+                "log": (
+                    "已恢复上一个可用版本"
+                    if had_published
+                    else "本轮尚未发布，已清理生成的草稿文件"
+                ),
+            },
+        )
 
 
 def _build_error_path(error: str, published: dict[str, str]) -> str | None:
@@ -1243,6 +1351,197 @@ def _build_error_path(error: str, published: dict[str, str]) -> str | None:
     return path if path in published else None
 
 
+# ---------------------------------------------------------------------------
+# Large-file guard: warn at 12K chars, split frontend TS/TSX at 20K
+# ---------------------------------------------------------------------------
+
+_SPLIT_EXTS = {".tsx", ".ts", ".jsx", ".js"}
+
+
+def _split_path_allowed(path: str, original: str) -> bool:
+    if path == original:
+        return True
+    if not path.startswith(("frontend/src/components/", "frontend/src/hooks/")):
+        return False
+    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return ext in _SPLIT_EXTS and scaffold.safe_project_path(path)
+
+
+def _split_manifest(text: str, original: str) -> dict[str, str] | None:
+    """Validate a split reply; the original path must be present and valid."""
+    data = _parse_plan_json(text)
+    if not data:
+        return None
+    raw_files = data.get("files")
+    if (
+        not isinstance(raw_files, list)
+        or not 2 <= len(raw_files) <= config.FILE_SPLIT_MAX_FILES
+    ):
+        return None
+    files: dict[str, str] = {}
+    for item in raw_files:
+        if not isinstance(item, dict):
+            return None
+        path = str(item.get("path") or "").strip().replace("\\", "/")
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        if not _split_path_allowed(path, original):
+            return None
+        if not _valid_content(path, content):
+            return None
+        files[path] = content
+    return files if len(files) >= 2 and original in files else None
+
+
+def _split_user(path: str, content: str, plan: dict) -> str:
+    return "\n\n".join(
+        [
+            f"项目概述：{plan['summary']}",
+            f"项目形态：{plan['mode']}（title: {plan['title']}）",
+            f"需要拆分的前端文件：{path}（{len(content):,} 字符，"
+            f"超过单文件上限 {config.FILE_SIZE_SPLIT_CHARS:,} 字符）",
+            f"当前完整内容：\n<current>\n{content[:60000]}\n</current>",
+            f"要求：拆成 2-{config.FILE_SPLIT_MAX_FILES} 个文件，"
+            "保持功能与视觉不变；只输出 JSON。",
+        ]
+    )
+
+
+def _splittable(path: str) -> bool:
+    if not path.startswith("frontend/src/"):
+        return False
+    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return ext in _SPLIT_EXTS
+
+
+async def _split_large_file(
+    path: str,
+    content: str,
+    plan: dict,
+    message: str,
+    llm,
+    emit: RoleEmitter,
+    toolbox: Toolbox,
+) -> dict[str, str] | None:
+    step = await emit(
+        "execution",
+        {
+            "step": f"拆分超大文件：{path}",
+            "status": "running",
+            "log": f"{len(content):,} 字符超过 {config.FILE_SIZE_SPLIT_CHARS:,}",
+        },
+    )
+    try:
+        raw = await _llm_text(
+            llm,
+            role="coder",
+            system=SPLIT_SYSTEM,
+            user=_split_user(path, content, plan),
+            meta={
+                "prompt": message,
+                "filename": path,
+                "existing": {},
+                "mode": plan["mode"],
+                "title": plan["title"],
+            },
+            emit=emit,
+            emit_tokens=False,
+            validator=lambda text: _split_manifest(text, path) is not None,
+            retry_hint=SPLIT_RETRY_HINT,
+        )
+    except GenerationError as exc:
+        await emit(
+            "execution",
+            {
+                "id": step,
+                "step": f"拆分超大文件：{path}",
+                "status": "warning",
+                "log": f"拆分失败，保留原文件：{str(exc)[:120]}",
+            },
+        )
+        return None
+
+    files = _split_manifest(raw, path)
+    if not files:
+        await emit(
+            "execution",
+            {
+                "id": step,
+                "step": f"拆分超大文件：{path}",
+                "status": "warning",
+                "log": "拆分结果不合法，保留原文件",
+            },
+        )
+        return None
+
+    for new_path, new_content in files.items():
+        await toolbox.call("write_file", path=new_path, content=new_content)
+    await emit(
+        "execution",
+        {
+            "id": step,
+            "step": f"拆分超大文件：{path}",
+            "status": "success",
+            "log": f"{len(content):,} 字符 → {len(files)} 个文件",
+        },
+    )
+    return files
+
+
+async def _guard_large_files(
+    contents: dict[str, str],
+    plan: dict,
+    message: str,
+    llm,
+    emit: RoleEmitter,
+    toolbox: Toolbox,
+) -> None:
+    """Warn on large files and split frontend TS/TSX before review/build."""
+    for path, content in list(contents.items()):
+        size = len(content)
+        over_warn = bool(
+            config.FILE_SIZE_WARN_CHARS and size > config.FILE_SIZE_WARN_CHARS
+        )
+        over_split = bool(
+            config.FILE_SPLIT
+            and config.FILE_SIZE_SPLIT_CHARS > 0
+            and size > config.FILE_SIZE_SPLIT_CHARS
+        )
+        if not over_warn and not over_split:
+            continue
+        if over_split and not _splittable(path):
+            await emit(
+                "execution",
+                {
+                    "step": "文件较大",
+                    "status": "warning",
+                    "log": (
+                        f"{path} · {size:,} 字符，超过 "
+                        f"{config.FILE_SIZE_SPLIT_CHARS:,} 且该文件类型暂不自动拆分"
+                    ),
+                },
+            )
+            continue
+        if over_warn:
+            await emit(
+                "execution",
+                {
+                    "step": "文件较大",
+                    "status": "warning",
+                    "log": (
+                        f"{path} · {size:,} 字符"
+                        f"（建议 ≤ {config.FILE_SIZE_WARN_CHARS:,}）"
+                    ),
+                },
+            )
+        if not over_split:
+            continue
+        files = await _split_large_file(path, content, plan, message, llm, emit, toolbox)
+        if files:
+            contents.update(files)
+
+
 async def _build_project(
     pid: str,
     message: str,
@@ -1250,17 +1549,13 @@ async def _build_project(
     emit: RoleEmitter,
     *,
     existing: dict[str, str],
-    existing_mode: str | None,
-    project_name: str,
     version: int,
     llm,
-    state: dict,
-    plan_is_mock: bool,
+    progress: dict,
     bob_text: str = "",
 ) -> str:
     toolbox = emit.toolbox()
     existing = _prune(existing, plan["mode"])
-    force_mock = plan_is_mock or bool(state.get("degraded"))
 
     if bob_text:
         await emit(
@@ -1299,33 +1594,42 @@ async def _build_project(
     contents: dict[str, str] = {}
     for item in plan["files"]:
         path = item["path"]
-        if force_mock:
-            continue
         step_ex = await emit(
             "execution",
             {"step": f"生成 {path}", "status": "running", "log": item["purpose"]},
         )
         await emit("file_start", {"filename": path, "purpose": item["purpose"]})
         known = {**existing, **contents}
-        raw = await _llm_text(
-            llm,
-            role="coder",
-            system=_system_for(path),
-            user=_coder_user(path, item["purpose"], plan, message, known),
-            meta={
-                "prompt": message,
-                "filename": path,
-                "existing": known,
-                "mode": plan["mode"],
-                "title": plan["title"],
-            },
-            emit=emit,
-            emit_tokens=True,
-            state=state,
-            validator=lambda text, p=path: _valid_content(
-                p, _extract_requested_file(text, p)
-            ),
-        )
+        try:
+            raw = await _llm_text(
+                llm,
+                role="coder",
+                system=_system_for(path),
+                user=_coder_user(path, item["purpose"], plan, message, known),
+                meta={
+                    "prompt": message,
+                    "filename": path,
+                    "existing": known,
+                    "mode": plan["mode"],
+                    "title": plan["title"],
+                },
+                emit=emit,
+                emit_tokens=True,
+                validator=lambda text, p=path: _valid_content(
+                    p, _extract_requested_file(text, p)
+                ),
+            )
+        except Exception as exc:
+            await emit(
+                "execution",
+                {
+                    "id": step_ex,
+                    "step": f"生成 {path}",
+                    "status": "error",
+                    "log": f"{type(exc).__name__}: {str(exc)[:160]}",
+                },
+            )
+            raise
         content = _extract_requested_file(raw, path)
         contents[path] = content
         await toolbox.call("write_file", path=path, content=content)
@@ -1338,41 +1642,10 @@ async def _build_project(
                 "log": f"{len(content):,} 字符",
             },
         )
-        if state.get("degraded"):
-            break
 
-    if state.get("degraded") and not force_mock:
-        fallback = await _install_mock_fallback(
-            pid,
-            version,
-            existing,
-            message,
-            existing_mode,
-            project_name,
-            emit,
-            toolbox,
-        )
-        plan = fallback["plan"]
-        published = fallback["published"]
-        contents = fallback["contents"]
-        force_mock = True
-        await emit(
-            "execution",
-            {
-                "step": "整轮回退 Mock 模板",
-                "status": "warning",
-                "log": "LLM 输出异常，已替换为一致的可运行模板",
-            },
-        )
-    else:
-        published = _prune({**existing, **scaffolds, **contents}, plan["mode"])
+    await _guard_large_files(contents, plan, message, llm, emit, toolbox)
 
-    if force_mock and not contents:
-        contents = _mock_contents(plan)
-        updated = _scaffold_files(plan, existing)
-        published = _prune({**existing, **updated, **contents}, plan["mode"])
-        for path, content in contents.items():
-            await toolbox.call("write_file", path=path, content=content)
+    published = _prune({**existing, **scaffolds, **contents}, plan["mode"])
 
     # 3) Reviewer: deterministic checks + auto repair ------------------------
     review_ex = await emit(
@@ -1386,7 +1659,7 @@ async def _build_project(
     issues = _review(published, plan["mode"])
     repair_notes: list[str] = []
 
-    if config.AUTO_REPAIR and not force_mock:
+    if config.AUTO_REPAIR:
         if plan["mode"] in ("frontend", "fullstack") and _needs_style_repair(issues):
             repair_ex = await emit(
                 "execution",
@@ -1406,26 +1679,29 @@ async def _build_project(
                         "purpose": f"Reviewer 自动回修（第 {round_index + 1} 轮）",
                     },
                 )
-                raw = await _llm_text(
-                    llm,
-                    role="coder",
-                    system=STYLES_SYSTEM,
-                    user=_repair_styles_user(published, issues),
-                    meta={
-                        "prompt": message,
-                        "filename": "frontend/src/styles.css",
-                        "existing": published,
-                        "mode": plan["mode"],
-                        "title": plan["title"],
-                    },
-                    emit=emit,
-                    emit_tokens=True,
-                    state=state,
-                    validator=lambda text: _valid_content(
-                        "frontend/src/styles.css",
-                        _extract_requested_file(text, "frontend/src/styles.css"),
-                    ),
-                )
+                try:
+                    raw = await _llm_text(
+                        llm,
+                        role="coder",
+                        system=STYLES_SYSTEM,
+                        user=_repair_styles_user(published, issues),
+                        meta={
+                            "prompt": message,
+                            "filename": "frontend/src/styles.css",
+                            "existing": published,
+                            "mode": plan["mode"],
+                            "title": plan["title"],
+                        },
+                        emit=emit,
+                        emit_tokens=True,
+                        validator=lambda text: _valid_content(
+                            "frontend/src/styles.css",
+                            _extract_requested_file(text, "frontend/src/styles.css"),
+                        ),
+                    )
+                except GenerationError as exc:
+                    repair_notes.append(f"样式回修失败：{str(exc)[:80]}")
+                    break
                 repaired = _extract_requested_file(raw, "frontend/src/styles.css")
                 if not repaired:
                     break
@@ -1464,25 +1740,28 @@ async def _build_project(
                 "file_start",
                 {"filename": target_path, "purpose": "Reviewer 联调回修"},
             )
-            raw = await _llm_text(
-                llm,
-                role="coder",
-                system=_system_for(target_path),
-                user=_repair_app_user(published, issues, plan, target_path),
-                meta={
-                    "prompt": message,
-                    "filename": target_path,
-                    "existing": published,
-                    "mode": plan["mode"],
-                    "title": plan["title"],
-                },
-                emit=emit,
-                emit_tokens=True,
-                state=state,
-                validator=lambda text, p=target_path: _valid_content(
-                    p, _extract_requested_file(text, p)
-                ),
-            )
+            try:
+                raw = await _llm_text(
+                    llm,
+                    role="coder",
+                    system=_system_for(target_path),
+                    user=_repair_app_user(published, issues, plan, target_path),
+                    meta={
+                        "prompt": message,
+                        "filename": target_path,
+                        "existing": published,
+                        "mode": plan["mode"],
+                        "title": plan["title"],
+                    },
+                    emit=emit,
+                    emit_tokens=True,
+                    validator=lambda text, p=target_path: _valid_content(
+                        p, _extract_requested_file(text, p)
+                    ),
+                )
+            except GenerationError as exc:
+                raw = ""
+                repair_notes.append(f"联调回修失败：{str(exc)[:80]}")
             repaired = _extract_requested_file(raw, target_path)
             if repaired:
                 published[target_path] = repaired
@@ -1518,27 +1797,30 @@ async def _build_project(
                 "file_start",
                 {"filename": "backend/main.py", "purpose": "Reviewer 后端回修"},
             )
-            raw = await _llm_text(
-                llm,
-                role="coder",
-                system=BACKEND_SYSTEM,
-                user=_repair_backend_user(published, backend_issues, plan),
-                meta={
-                    "prompt": message,
-                    "filename": "backend/main.py",
-                    "existing": published,
-                    "mode": plan["mode"],
-                    "title": plan["title"],
-                },
-                emit=emit,
-                emit_tokens=True,
-                state=state,
-                validator=lambda text: _valid_content(
-                    "backend/main.py", _extract_requested_file(text, "backend/main.py")
-                ),
-            )
+            try:
+                raw = await _llm_text(
+                    llm,
+                    role="coder",
+                    system=BACKEND_SYSTEM,
+                    user=_repair_backend_user(published, backend_issues, plan),
+                    meta={
+                        "prompt": message,
+                        "filename": "backend/main.py",
+                        "existing": published,
+                        "mode": plan["mode"],
+                        "title": plan["title"],
+                    },
+                    emit=emit,
+                    emit_tokens=True,
+                    validator=lambda text: _valid_content(
+                        "backend/main.py", _extract_requested_file(text, "backend/main.py")
+                    ),
+                )
+            except GenerationError as exc:
+                raw = ""
+                repair_notes.append(f"后端回修失败：{str(exc)[:80]}")
             repaired = _extract_requested_file(raw, "backend/main.py")
-            if repaired and not state.get("degraded"):
+            if repaired:
                 published["backend/main.py"] = repaired
                 contents["backend/main.py"] = repaired
                 await toolbox.call(
@@ -1561,34 +1843,6 @@ async def _build_project(
                 },
             )
 
-    # A repair call may itself have degraded to the Mock Agent. Never ship a
-    # hybrid (real files + mock file): replace the whole round consistently.
-    if state.get("degraded") and not force_mock:
-        fallback = await _install_mock_fallback(
-            pid,
-            version,
-            existing,
-            message,
-            existing_mode,
-            project_name,
-            emit,
-            toolbox,
-        )
-        plan = fallback["plan"]
-        published = fallback["published"]
-        contents = fallback["contents"]
-        force_mock = True
-        issues = _review(published, plan["mode"])
-        repair_notes.clear()
-        await emit(
-            "execution",
-            {
-                "step": "整轮回退 Mock 模板",
-                "status": "warning",
-                "log": "回修阶段 LLM 输出异常，已替换为一致的可运行模板",
-            },
-        )
-
     await emit(
         "execution",
         {
@@ -1609,6 +1863,7 @@ async def _build_project(
             "log": f"写入 /apps/{pid}/ 并准备运行时",
         },
     )
+    progress["published"] = True
     await toolbox.call("publish_files", files=published)
     if plan["mode"] == "backend":
         await toolbox.call("build_preview", plan=plan)
@@ -1627,7 +1882,7 @@ async def _build_project(
         except frontend_builder.BuildError as exc:
             error_text = str(exc)
             repaired = False
-            if config.AUTO_REPAIR and not force_mock:
+            if config.AUTO_REPAIR:
                 target_path = _build_error_path(error_text, published)
                 if target_path:
                     await emit(
@@ -1642,39 +1897,44 @@ async def _build_project(
                             "log": error_text.replace("\n", " ")[:180],
                         },
                     )
-                    raw = await _llm_text(
-                        llm,
-                        role="coder",
-                        system=_system_for(target_path),
-                        user=_repair_build_user(
-                            message, plan, target_path, error_text, published
-                        ),
-                        meta={
-                            "prompt": message,
-                            "filename": target_path,
-                            "existing": published,
-                            "mode": plan["mode"],
-                            "title": plan["title"],
-                        },
-                        emit=emit,
-                        emit_tokens=True,
-                        state=state,
-                        validator=lambda text, p=target_path: _valid_content(
-                            p, _extract_requested_file(text, p)
-                        ),
-                    )
-                    fixed = _extract_requested_file(raw, target_path)
-                    if fixed and not state.get("degraded"):
+                    try:
+                        raw = await _llm_text(
+                            llm,
+                            role="coder",
+                            system=_system_for(target_path),
+                            user=_repair_build_user(
+                                message, plan, target_path, error_text, published
+                            ),
+                            meta={
+                                "prompt": message,
+                                "filename": target_path,
+                                "existing": published,
+                                "mode": plan["mode"],
+                                "title": plan["title"],
+                            },
+                            emit=emit,
+                            emit_tokens=True,
+                            validator=lambda text, p=target_path: _valid_content(
+                                p, _extract_requested_file(text, p)
+                            ),
+                        )
+                    except GenerationError as repair_exc:
+                        raw = ""
+                        error_text = f"{error_text}\n自动修复失败：{repair_exc}"
+                    fixed = _extract_requested_file(raw, target_path) if raw else ""
+                    if fixed:
                         published[target_path] = fixed
                         contents[target_path] = fixed
                         await toolbox.call(
                             "write_file", path=target_path, content=fixed
                         )
+                        progress["published"] = True
                         await toolbox.call("publish_files", files=published)
                         try:
                             await toolbox.call("build_preview", plan=plan)
                             repaired = True
-                        except frontend_builder.BuildError:
+                        except frontend_builder.BuildError as retry_exc:
+                            error_text = str(retry_exc)
                             repaired = False
                         remaining = _review(published, plan["mode"])
                         if remaining:
@@ -1689,42 +1949,35 @@ async def _build_project(
                             "status": "success" if repaired else "warning",
                             "log": "已修复并重新构建"
                             if repaired
-                            else "修复后仍无法构建，准备回退",
+                            else "修复后仍无法构建，本轮将回滚",
                         },
                     )
             if not repaired:
-                if not force_mock:
-                    fallback = await _install_mock_fallback(
-                        pid,
-                        version,
-                        existing,
-                        message,
-                        existing_mode,
-                        project_name,
-                        emit,
-                        toolbox,
-                    )
-                    plan = fallback["plan"]
-                    published = fallback["published"]
-                    contents = fallback["contents"]
-                    force_mock = True
-                    await emit(
-                        "execution",
-                        {
-                            "step": "整轮回退 Mock 模板",
-                            "status": "warning",
-                            "log": f"前端构建失败，已回退：{error_text[:140]}",
-                        },
-                    )
-                    await toolbox.call("build_preview", plan=plan)
-                else:
-                    await emit("error", {"message": f"前端预览构建失败：{error_text[:300]}"})
+                await emit(
+                    "execution",
+                    {
+                        "id": build_ex,
+                        "step": "构建前端预览",
+                        "status": "error",
+                        "log": error_text.replace("\n", " ")[:180],
+                    },
+                )
+                await emit(
+                    "execution",
+                    {
+                        "id": deploy_ex,
+                        "step": "发布项目",
+                        "status": "error",
+                        "log": "前端构建失败，本轮改动已回滚",
+                    },
+                )
+                raise GenerationError(f"前端预览构建失败：{error_text[:300]}")
             await emit(
                 "execution",
                 {
                     "id": build_ex,
                     "step": "构建前端预览",
-                    "status": "success" if (repaired or force_mock or not error_text) else "warning",
+                    "status": "success",
                     "log": "预览产物已生成",
                 },
             )
@@ -1756,40 +2009,44 @@ async def _build_project(
             started = True
         except (runtime.AppRuntimeError, RuntimeError) as exc:
             last_error = str(exc)
-            if config.AUTO_REPAIR and not force_mock and "backend/main.py" in published:
+            if config.AUTO_REPAIR and "backend/main.py" in published:
                 await emit(
                     "file_start",
                     {"filename": "backend/main.py", "purpose": "修复后端启动错误"},
                 )
-                raw = await _llm_text(
-                    llm,
-                    role="coder",
-                    system=BACKEND_SYSTEM,
-                    user=(
-                        f"后端启动失败，日志如下：\n{last_error[:3000]}\n\n"
-                        "请修复 backend/main.py，保留现有 API 合约，只输出 main.py 完整内容。"
-                    ),
-                    meta={
-                        "prompt": message,
-                        "filename": "backend/main.py",
-                        "existing": published,
-                        "mode": plan["mode"],
-                        "title": plan["title"],
-                    },
-                    emit=emit,
-                    emit_tokens=True,
-                    state=state,
-                    validator=lambda text: _valid_content(
-                        "backend/main.py", _extract_requested_file(text, "backend/main.py")
-                    ),
-                )
-                fixed = _extract_requested_file(raw, "backend/main.py")
-                if fixed and not state.get("degraded"):
+                try:
+                    raw = await _llm_text(
+                        llm,
+                        role="coder",
+                        system=BACKEND_SYSTEM,
+                        user=(
+                            f"后端启动失败，日志如下：\n{last_error[:3000]}\n\n"
+                            "请修复 backend/main.py，保留现有 API 合约，只输出 main.py 完整内容。"
+                        ),
+                        meta={
+                            "prompt": message,
+                            "filename": "backend/main.py",
+                            "existing": published,
+                            "mode": plan["mode"],
+                            "title": plan["title"],
+                        },
+                        emit=emit,
+                        emit_tokens=True,
+                        validator=lambda text: _valid_content(
+                            "backend/main.py", _extract_requested_file(text, "backend/main.py")
+                        ),
+                    )
+                except GenerationError as repair_exc:
+                    raw = ""
+                    last_error = f"{last_error}\n自动修复失败：{repair_exc}"
+                fixed = _extract_requested_file(raw, "backend/main.py") if raw else ""
+                if fixed:
                     published["backend/main.py"] = fixed
                     contents["backend/main.py"] = fixed
                     await toolbox.call(
                         "write_file", path="backend/main.py", content=fixed
                     )
+                    progress["published"] = True
                     await toolbox.call("publish_files", files=published)
                     try:
                         port = await toolbox.call("start_runtime")
@@ -1798,59 +2055,37 @@ async def _build_project(
                     except (runtime.AppRuntimeError, RuntimeError) as retry_exc:
                         last_error = str(retry_exc)
         if not started:
-            if not force_mock:
-                fallback = await _install_mock_fallback(
-                    pid,
-                    version,
-                    existing,
-                    message,
-                    existing_mode,
-                    project_name,
-                    emit,
-                    toolbox,
-                )
-                plan = fallback["plan"]
-                published = fallback["published"]
-                contents = fallback["contents"]
-                force_mock = True
-                await emit(
-                    "execution",
-                    {
-                        "step": "整轮回退 Mock 模板",
-                        "status": "warning",
-                        "log": f"后端启动失败，已回退：{last_error[:140]}",
-                    },
-                )
-                try:
-                    await toolbox.call("build_preview", plan=plan)
-                    if plan["mode"] in ("backend", "fullstack"):
-                        port = await toolbox.call("start_runtime")
-                        await toolbox.call("check_health", port=port)
-                    started = True
-                except (
-                    runtime.AppRuntimeError,
-                    frontend_builder.BuildError,
-                    RuntimeError,
-                ) as exc:
-                    last_error = str(exc)
-            if not started:
-                await emit("error", {"message": f"后端运行时启动失败：{last_error[:300]}"})
+            await emit(
+                "execution",
+                {
+                    "id": start_ex,
+                    "step": "启动后端运行时",
+                    "status": "error",
+                    "log": last_error[:180],
+                },
+            )
+            await emit(
+                "execution",
+                {
+                    "id": deploy_ex,
+                    "step": "发布项目",
+                    "status": "error",
+                    "log": "后端启动失败，本轮改动已回滚",
+                },
+            )
+            raise GenerationError(f"后端运行时启动失败：{last_error[:300]}")
         await emit(
             "execution",
             {
                 "id": start_ex,
                 "step": "启动后端运行时",
-                "status": "success" if started else "warning",
-                "log": (
-                    "运行时已就绪：/apps/%s/api/*" % pid
-                    if started
-                    else last_error[:180]
-                ),
+                "status": "success",
+                "log": f"运行时已就绪：/apps/{pid}/api/*",
             },
         )
 
     # Keep the artifact table in sync with what is actually on disk (mode
-    # downgrades and mock fallbacks can drop files from the project tree).
+    # downgrades can drop files from the project tree).
     await db.delete_artifacts_except(pid, set(published))
 
     preview_url = f"/apps/{pid}/?v={version}"
@@ -1942,7 +2177,6 @@ async def _run_consult_agent(
         )
         context = _consult_context(agent, project_name, existing, mode, version, recent)
         user = f"用户问题：\n{message}\n\n项目上下文：\n{context}"
-        state: dict = {}
         text = await _llm_text(
             get_llm(),
             role="consult",
@@ -1958,7 +2192,7 @@ async def _run_consult_agent(
             },
             emit=emit,
             emit_tokens=False,
-            state=state,
+            retry_hint=ANSWER_RETRY_HINT,
         )
         text = text.strip()
         if not text:
@@ -2116,7 +2350,6 @@ async def _run_build_turn(
     queue: deque[str] = deque(targets)
     runs: Counter[str] = Counter()
     plan: dict | None = None
-    plan_is_mock = False
     mike_text = ""
     bob_text = ""
     last_emitter: RoleEmitter | None = None
@@ -2164,7 +2397,7 @@ async def _run_build_turn(
                 )
                 mike_text = text
             elif agent == "bob":
-                plan, text, plan_is_mock = await _run_bob(
+                plan, text = await _run_bob(
                     pid,
                     message,
                     emitter,
@@ -2184,19 +2417,30 @@ async def _run_build_turn(
                     existing_mode=mode,
                     version=version,
                     plan=plan,
-                    plan_is_mock=plan_is_mock,
                     bob_text=bob_text,
                 )
         except Exception as exc:  # noqa: BLE001 - surface the failing role only
+            log_detail = f"{type(exc).__name__}: {str(exc)[:240]}"
+            user_detail = (
+                str(exc)[:300]
+                if isinstance(exc, GenerationError)
+                else log_detail
+            )
+            note = (
+                "项目已保留上一个可用版本。"
+                if existing
+                else "本轮没有发布任何文件。"
+            )
             await emitter(
                 "execution",
                 {
                     "step": "执行失败",
                     "status": "error",
-                    "log": f"{type(exc).__name__}: {str(exc)[:180]}",
+                    "log": log_detail,
                 },
             )
-            text = f"执行失败：{type(exc).__name__}: {str(exc)[:240]}"
+            await emit("error", {"message": f"本轮生成失败：{user_detail}。{note}"})
+            text = f"执行失败：{user_detail}\n\n{note}可以调整需求后重试。"
             await emit(
                 "message",
                 {

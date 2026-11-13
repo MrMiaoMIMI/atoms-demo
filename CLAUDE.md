@@ -27,7 +27,8 @@
 - 用户消息按 `@` 位置确定性切段，每个 Agent 只收到自己名下的问题文本；同一 Agent 的多个问题合并为一轮；分段不额外调用 LLM
 - 分段规则：未被 @ 的独立问题默认给 Mike；`请/麻烦/帮我` 等连接词附着到第一个被 @ 的角色；含 `你们/大家/两位/两个人/分别/各自/每个人` 的句子由所有被 @ 角色共同处理；每段再独立判断 build / consult
 - 角色能力靠 `AgentSpec.tools` 白名单 + `Toolbox` 强制隔离（Mike 只读，Bob 可校验方案，Alex 可写文件/构建/启动运行时）；工具是进程内 Python 函数，不用 MCP
-- 所有 AI 调用必须可降级：无 API Key 时走 Mock Agent 返回预置模板；运行中 LLM 失败自动降级并记录 warning；前端构建或后端启动失败也会整轮回退 Mock
+- 所有 AI 调用必须可降级：无 API Key 时走 Mock Agent 返回中性占位模板（不再伪装成 Todo/落地页）；运行中 LLM 失败按 `LLM_MAX_RETRIES`（默认 3 次）重试，仍失败则回滚本轮并保留上一个可用版本，不静默替换项目；前端构建或后端启动失败同样回滚并报错
+- 单次 LLM 输出预算由 `LLM_MAX_TOKENS` 控制（默认 16384，上游 400 时自动降回 8192）；`finish_reason=length` 时按 `LLM_CONTINUATION_PASSES`（默认 3）续写；生成后单文件 >12000 字符告警，>20000 字符的前端 TS/TSX 尝试自动拆分
 
 ## 前端视觉规范（对齐 atoms.dev）
 
@@ -60,7 +61,7 @@ atoms-demo/
 │ ├── llm.py # 流式 LLM 调用
 │ ├── naming.py # 项目命名（LLM 概括 + 启发式回退）
 │ ├── db.py # demo SQLite 封装
-│ ├── mocks/ # Mock 模板（frontend/fullstack/backend + agents.py 角色回复）
+│ ├── mocks/ # Mock 演示模板（仅无 Key 时使用：中性占位页 + agents.py 角色回复）
 │ ├── runtime/frontend/ # 共享 React + esbuild 工具链（node_modules 不入库）
 │ └── data/ # sqlite 与生成项目挂载（apps/{id}/backend/data/app.db）
 ├── nginx/

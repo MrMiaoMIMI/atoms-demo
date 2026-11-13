@@ -116,6 +116,15 @@ export default function ChatPanel({
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-base">
+      {error ? (
+        <div
+          role="alert"
+          className="mx-3 mt-3 flex-none rounded-xl border border-danger/20 bg-danger/5 px-3 py-2.5 text-[12px] leading-[18px] text-danger"
+        >
+          <p className="font-medium">本轮生成未完成</p>
+          <p className="mt-0.5 whitespace-pre-wrap break-words">{error}</p>
+        </div>
+      ) : null}
       <div className="relative min-h-0 flex-1">
         <div
           ref={scrollRef}
@@ -295,12 +304,6 @@ export default function ChatPanel({
       </div>
 
       <div className="flex-none px-2 pb-2">
-        {error ? (
-          <p className="mb-2 rounded-xl border border-danger/20 bg-danger/5 px-3 py-2 text-[12px] leading-[18px] text-danger">
-            {error}
-          </p>
-        ) : null}
-
         <div className="rounded-[24px] border border-line-4 bg-white p-3 shadow-composer transition focus-within:border-line-8">
           <MentionComposer
             value={input}

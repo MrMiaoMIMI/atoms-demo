@@ -274,6 +274,16 @@ async def interrupt_running_executions(
         await conn.commit()
 
 
+async def delete_artifacts_version(pid: str, version: int) -> None:
+    """Discard one in-flight version so a failed round cannot leak files."""
+    async with _connect() as conn:
+        await conn.execute(
+            "DELETE FROM artifacts WHERE project_id = ? AND version = ?",
+            (pid, version),
+        )
+        await conn.commit()
+
+
 async def delete_artifacts_except(pid: str, keep: set[str]) -> None:
     """Drop latest-file rows for paths that no longer exist on disk."""
     async with _connect() as conn:

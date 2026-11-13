@@ -292,7 +292,7 @@ export default function Home({
   const statusText = health
     ? health.ok
       ? health.llm_mode === 'mock'
-        ? 'Mock 模式'
+        ? 'Mock 演示模式'
         : health.model + ' : $99' || '服务在线'
       : '服务离线'
     : '连接中';

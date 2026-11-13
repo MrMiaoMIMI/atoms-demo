@@ -481,11 +481,13 @@ export default function Workspace({
 
       const controller = new AbortController();
       abortRef.current = controller;
+      let aborted = false;
 
       try {
         await generate(projectId, message, handleEvent, controller.signal);
       } catch (err) {
         if ((err as Error).name === 'AbortError') {
+          aborted = true;
           setError('已停止本轮生成。');
           setGroups((prev) =>
             prev.map((group) =>
@@ -527,9 +529,18 @@ export default function Workspace({
               : group,
           ),
         );
+        if (!aborted) {
+          // A failed round rolls the project back on the server; reload so the
+          // file tree and preview match what is actually on disk.
+          try {
+            applyState(await api.getProject(projectId));
+          } catch {
+            // Ignore; the next user action will refresh the workspace.
+          }
+        }
       }
     },
-    [projectId, handleEvent],
+    [projectId, handleEvent, applyState],
   );
 
   const resume = useCallback(async () => {
@@ -733,7 +744,7 @@ export default function Workspace({
                     <p className="mt-0.5 text-[11px] text-ink-55">
                       {MODE_LABEL[mode]} · v{latestVersion || 1} ·{' '}
                       {health?.llm_mode === 'mock'
-                        ? 'Mock Agent'
+                        ? 'Mock 演示模式'
                         : health?.model || 'LLM'}
                     </p>
                   </div>
