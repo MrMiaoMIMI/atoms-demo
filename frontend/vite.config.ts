@@ -9,9 +9,11 @@ export default defineConfig({
     // Preview iframes have an opaque origin ("null"); the dev server must
     // answer CORS preflights for them too.
     cors: { origin: "*" },
+    // Keep the original Host (127.0.0.1:5173) so backend-generated email
+    // links point at the dev server, not at 127.0.0.1:8000.
     proxy: {
-      "/api": { target: "http://127.0.0.1:8000", changeOrigin: true },
-      "/apps": { target: "http://127.0.0.1:8000", changeOrigin: true },
+      "/api": { target: "http://127.0.0.1:8000" },
+      "/apps": { target: "http://127.0.0.1:8000" },
     },
   },
 });

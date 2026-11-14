@@ -8,9 +8,44 @@ import aiosqlite
 from config import DB_PATH
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id              TEXT PRIMARY KEY,
+    email           TEXT NOT NULL COLLATE NOCASE,
+    name            TEXT,
+    password_hash   TEXT,
+    provider        TEXT NOT NULL DEFAULT 'email',
+    email_verified  INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    last_login_at   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    user_agent  TEXT,
+    ip          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS email_tokens (
+    token_hash  TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    email       TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    used_at     TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_email_tokens_user ON email_tokens(user_id, kind);
+
 CREATE TABLE IF NOT EXISTS projects (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
+    user_id     TEXT,
     created_at  TEXT NOT NULL
 );
 
@@ -70,6 +105,7 @@ async def _migrate(conn) -> None:
     migrations = {
         "conversations": {"agent": "TEXT", "run_id": "TEXT", "run_index": "INTEGER"},
         "executions": {"run_id": "TEXT"},
+        "projects": {"user_id": "TEXT"},
     }
     for table, columns in migrations.items():
         async with conn.execute(f"PRAGMA table_info({table})") as cur:
@@ -86,18 +122,209 @@ async def init_db() -> None:
         await conn.execute("PRAGMA foreign_keys=ON")
         await conn.executescript(SCHEMA)
         await _migrate(conn)
+        # This index must be created after _migrate adds projects.user_id to
+        # databases created before accounts existed.
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, created_at)"
+        )
         await conn.commit()
 
 
-async def create_project(name: str) -> dict:
+# ---------------------------------------------------------------------------
+# Users, sessions and one-time email tokens
+# ---------------------------------------------------------------------------
+
+async def create_user(
+    email: str,
+    name: str | None,
+    password_hash: str | None,
+    provider: str = "email",
+    email_verified: bool = False,
+) -> dict:
+    uid = uuid.uuid4().hex
+    stamp = now()
+    async with _connect() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users
+                (id, email, name, password_hash, provider, email_verified, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (uid, email, name, password_hash, provider, 1 if email_verified else 0, stamp),
+        )
+        await conn.commit()
+    return {
+        "id": uid,
+        "email": email,
+        "name": name,
+        "provider": provider,
+        "email_verified": 1 if email_verified else 0,
+        "created_at": stamp,
+    }
+
+
+async def get_user(uid: str) -> dict | None:
+    async with _connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM users WHERE id = ?", (uid,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_user_by_email(email: str) -> dict | None:
+    async with _connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def update_user_password(uid: str, password_hash: str) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, uid)
+        )
+        await conn.commit()
+
+
+async def update_user_login(uid: str, name: str | None = None) -> None:
+    async with _connect() as conn:
+        if name:
+            await conn.execute(
+                "UPDATE users SET last_login_at = ?, name = COALESCE(name, ?) WHERE id = ?",
+                (now(), name, uid),
+            )
+        else:
+            await conn.execute(
+                "UPDATE users SET last_login_at = ? WHERE id = ?", (now(), uid)
+            )
+        await conn.commit()
+
+
+async def mark_email_verified(uid: str) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE users SET email_verified = 1 WHERE id = ?", (uid,)
+        )
+        await conn.commit()
+
+
+async def create_session(
+    token_hash: str,
+    user_id: str,
+    expires_at: str,
+    user_agent: str | None = None,
+    ip: str | None = None,
+) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            """
+            INSERT INTO sessions
+                (token_hash, user_id, created_at, expires_at, user_agent, ip)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (token_hash, user_id, now(), expires_at, user_agent, ip),
+        )
+        await conn.commit()
+
+
+async def get_session_user(token_hash: str) -> dict | None:
+    """Return the user for a live session, cleaning an expired row if found."""
+    async with _connect() as conn:
+        async with conn.execute(
+            """
+            SELECT u.* FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ? AND s.expires_at > ?
+            """,
+            (token_hash, now()),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            await conn.execute(
+                "DELETE FROM sessions WHERE token_hash = ?", (token_hash,)
+            )
+            await conn.commit()
+            return None
+        return dict(row)
+
+
+async def delete_session(token_hash: str) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "DELETE FROM sessions WHERE token_hash = ?", (token_hash,)
+        )
+        await conn.commit()
+
+
+async def delete_user_sessions(uid: str) -> None:
+    async with _connect() as conn:
+        await conn.execute("DELETE FROM sessions WHERE user_id = ?", (uid,))
+        await conn.commit()
+
+
+async def delete_expired_sessions() -> None:
+    async with _connect() as conn:
+        await conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
+        await conn.commit()
+
+
+async def create_email_token(
+    token_hash: str,
+    user_id: str,
+    kind: str,
+    email: str,
+    expires_at: str,
+) -> None:
+    """Issue one token per kind; older unused tokens are invalidated."""
+    async with _connect() as conn:
+        await conn.execute(
+            "DELETE FROM email_tokens WHERE user_id = ? AND kind = ? AND used_at IS NULL",
+            (user_id, kind),
+        )
+        await conn.execute(
+            """
+            INSERT INTO email_tokens
+                (token_hash, user_id, kind, email, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (token_hash, user_id, kind, email, expires_at, now()),
+        )
+        await conn.commit()
+
+
+async def consume_email_token(token_hash: str, kind: str) -> dict | None:
+    """Atomically mark a token used and return its row, or None if invalid."""
+    async with _connect() as conn:
+        cur = await conn.execute(
+            """
+            UPDATE email_tokens SET used_at = ?
+            WHERE token_hash = ? AND kind = ? AND used_at IS NULL AND expires_at > ?
+            """,
+            (now(), token_hash, kind, now()),
+        )
+        if cur.rowcount != 1:
+            await conn.commit()
+            return None
+        async with conn.execute(
+            "SELECT * FROM email_tokens WHERE token_hash = ?", (token_hash,)
+        ) as select:
+            row = await select.fetchone()
+        await conn.commit()
+        return dict(row) if row else None
+
+
+async def create_project(name: str, user_id: str | None = None) -> dict:
     pid = uuid.uuid4().hex[:12]
     async with _connect() as conn:
         await conn.execute(
-            "INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)",
-            (pid, name, now()),
+            "INSERT INTO projects (id, name, user_id, created_at) VALUES (?, ?, ?, ?)",
+            (pid, name, user_id, now()),
         )
         await conn.commit()
-    return {"id": pid, "name": name}
+    return {"id": pid, "name": name, "user_id": user_id}
 
 
 async def update_project_name(pid: str, name: str) -> None:
@@ -106,26 +333,41 @@ async def update_project_name(pid: str, name: str) -> None:
         await conn.commit()
 
 
-async def list_projects() -> list[dict]:
+async def list_projects(user_id: str | None = None) -> list[dict]:
+    """List projects, scoped to one owner for every user-facing route."""
+    where = "WHERE p.user_id = ?" if user_id is not None else ""
+    params: tuple[object, ...] = (user_id,) if user_id is not None else ()
     async with _connect() as conn:
         async with conn.execute(
-            """
-            SELECT p.id, p.name, p.created_at,
+            f"""
+            SELECT p.id, p.name, p.user_id, p.created_at,
                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS message_count,
                    (SELECT COUNT(DISTINCT filename) FROM artifacts a WHERE a.project_id = p.id) AS artifact_count,
                    (SELECT MAX(a.version) FROM artifacts a WHERE a.project_id = p.id) AS latest_version,
                    EXISTS(SELECT 1 FROM artifacts a WHERE a.project_id = p.id AND a.filename LIKE 'frontend/%') AS has_frontend,
                    EXISTS(SELECT 1 FROM artifacts a WHERE a.project_id = p.id AND a.filename LIKE 'backend/%') AS has_backend
             FROM projects p
+            {where}
             ORDER BY p.created_at DESC
-            """
+            """,
+            params,
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
 async def get_project(pid: str) -> dict | None:
+    """Internal lookup. User-facing routes must use ``get_project_for_user``."""
     async with _connect() as conn:
         async with conn.execute("SELECT * FROM projects WHERE id = ?", (pid,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_project_for_user(pid: str, user_id: str) -> dict | None:
+    async with _connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM projects WHERE id = ? AND user_id = ?", (pid, user_id)
+        ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 

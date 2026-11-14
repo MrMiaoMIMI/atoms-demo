@@ -30,9 +30,34 @@ export interface Execution {
   created_at?: string;
 }
 
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string;
+  provider: "email" | "google" | "quick" | string;
+  email_verified: number;
+  created_at?: string;
+  last_login_at?: string | null;
+}
+
+export interface AuthProviders {
+  google: boolean;
+  quick: boolean;
+  quick_password?: string | null;
+  mail: "smtp" | "dev";
+  dev_links: boolean;
+}
+
+export interface QuickLoginResult {
+  user: AuthUser;
+  created: boolean;
+  default_password?: string | null;
+}
+
 export interface Project {
   id: string;
   name: string;
+  user_id?: string | null;
   created_at: string;
 }
 
@@ -49,6 +74,7 @@ export interface ProjectState {
 export interface ProjectSummary {
   id: string;
   name: string;
+  user_id?: string | null;
   created_at: string;
   message_count: number;
   artifact_count: number;
@@ -65,4 +91,9 @@ export interface Health {
   model: string;
   version: string;
   running_apps?: Record<string, number>;
+  auth?: {
+    mail: "smtp" | "dev";
+    google: boolean;
+    quick: boolean;
+  };
 }

@@ -1,27 +1,37 @@
 import type { ReactNode } from 'react';
-import type { Health, ProjectSummary } from '../types';
+import type { AuthUser, Health, ProjectSummary } from '../types';
 import { InitialAvatar } from './Avatar';
 import {
   AtomsMark,
-  Bell,
   Chat,
   Clock,
   Compass,
   Folder,
   Home,
+  LogOut,
   PanelLeft,
   Plus,
-  Settings,
   Spinner,
 } from './Icons';
 
 interface Props {
   projects: ProjectSummary[];
   section: 'home' | 'projects' | 'workspace';
+  user: AuthUser;
   onHome: () => void;
   onProjects: () => void;
   onOpenProject: (id: string) => void;
   onCollapse: () => void;
+  onLogout: () => void;
+}
+
+function userInitial(user: AuthUser): string {
+  const source = user.name?.trim() || user.email || 'A';
+  return source.slice(0, 1).toUpperCase();
+}
+
+function displayName(user: AuthUser): string {
+  return user.name?.trim() || user.email.split('@')[0] || '用户';
 }
 
 function NavItem({
@@ -66,12 +76,14 @@ function NavItem({
 export function CollapsedSidebar({
   health,
   section,
+  user,
   onHome,
   onProjects,
   onExpand,
 }: {
   health: Health | null;
   section: 'home' | 'projects';
+  user: AuthUser;
   onHome: () => void;
   onProjects: () => void;
   onExpand: () => void;
@@ -129,8 +141,8 @@ export function CollapsedSidebar({
           }`}
           title={health?.ok ? '服务在线' : '服务离线'}
         />
-        <span className="grid h-6 w-6 place-items-center rounded-full bg-brand text-[10px] font-medium text-white">
-          A
+        <span title={`${user.email} · 展开侧边栏`}>
+          <InitialAvatar size={24} label={userInitial(user)} />
         </span>
       </div>
     </div>
@@ -140,10 +152,12 @@ export function CollapsedSidebar({
 export default function HomeSidebar({
   projects,
   section,
+  user,
   onHome,
   onProjects,
   onOpenProject,
   onCollapse,
+  onLogout,
 }: Props) {
   const recent = projects.slice(0, 6);
 
@@ -239,28 +253,23 @@ export default function HomeSidebar({
 
       <div className="px-2 pb-3">
         <div className="mt-3 flex items-center gap-2 px-1">
-          <InitialAvatar size={28} label="你" />
+          <InitialAvatar size={28} label={userInitial(user)} />
           <div className="min-w-0 flex-1">
             <p className="truncate text-[13px] font-medium text-ink-95">
-              Atoms Demo
+              {displayName(user)}
             </p>
-            <p className="truncate text-[11px] text-ink-55">本地演示</p>
+            <p className="truncate text-[11px] text-ink-55" title={user.email}>
+              {user.email}
+            </p>
           </div>
           <button
             type="button"
-            disabled
-            title="设置（占位）"
-            className="grid h-7 w-7 place-items-center rounded-md text-ink-30"
+            onClick={onLogout}
+            title="退出登录"
+            aria-label="退出登录"
+            className="grid h-7 w-7 place-items-center rounded-md text-ink-55 transition hover:bg-line-6 hover:text-ink-95"
           >
-            <Settings size={16} />
-          </button>
-          <button
-            type="button"
-            disabled
-            title="通知（占位）"
-            className="grid h-7 w-7 place-items-center rounded-md text-ink-30"
-          >
-            <Bell size={16} />
+            <LogOut size={16} />
           </button>
         </div>
       </div>

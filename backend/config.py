@@ -5,7 +5,22 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+
+# Configuration is layered so local and production share secrets while keeping
+# environment-specific values apart:
+#   process/container env  >  backend/.env.{APP_ENV}  >  backend/.env
+# APP_ENV comes from the process environment (Docker Compose sets it to
+# "production"); running uvicorn directly defaults to "local".
+APP_ENV = os.getenv("APP_ENV", "local").strip().lower()
+_PROFILE_FILE = BASE_DIR / f".env.{APP_ENV}"
+
+# Load the profile first with override=False so it only fills keys that are not
+# already set by the real process environment. Loading the shared file second
+# means it can only fill keys the profile did not define, which gives the
+# precedence above.
+if _PROFILE_FILE.is_file():
+    load_dotenv(_PROFILE_FILE, override=False)
+load_dotenv(BASE_DIR / ".env", override=False)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
 APPS_DIR = DATA_DIR / "apps"
@@ -54,3 +69,53 @@ FRONTEND_BUILD_TIMEOUT = float(os.getenv("FRONTEND_BUILD_TIMEOUT", "120"))
 PREVIEW_NODE_MODULES = Path(
     os.getenv("PREVIEW_NODE_MODULES", str(BASE_DIR / "runtime" / "frontend" / "node_modules"))
 ).resolve()
+
+# ---------------------------------------------------------------------------
+# Accounts, sessions and email
+# ---------------------------------------------------------------------------
+# Public origin used to build verification / reset links and the OAuth
+# redirect. Prefer an explicit value in .env.production; when empty (the local
+# default) the origin of the incoming request is used instead.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "atoms_session")
+# Browsers only send Secure cookies over HTTPS. Keep it off for local HTTP.
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "0") == "1"
+AUTH_SESSION_DAYS = max(1, int(os.getenv("AUTH_SESSION_DAYS", "30")))
+AUTH_VERIFY_TTL_HOURS = max(1, int(os.getenv("AUTH_VERIFY_TTL_HOURS", "24")))
+AUTH_RESET_TTL_MINUTES = max(5, int(os.getenv("AUTH_RESET_TTL_MINUTES", "60")))
+
+# The one-click demo login creates accounts with this password. It is shown
+# to the user in a tip after the account is created.
+AUTH_DEMO_PASSWORD = os.getenv("AUTH_DEMO_PASSWORD", "AtomsDemo2026")
+AUTH_DEMO_QUICK_LOGIN = os.getenv("AUTH_DEMO_QUICK_LOGIN", "1") != "0"
+
+# Verification / reset links are only returned to the browser when mail is
+# not configured (or when explicitly enabled). This keeps the demo flow
+# usable without an SMTP account.
+_auth_dev_links_env = os.getenv("AUTH_DEV_LINKS")
+AUTH_DEV_LINKS = (
+    _auth_dev_links_env == "1"
+    if _auth_dev_links_env is not None
+    else None  # auto: enabled when SMTP is not configured
+)
+
+# Password hashing (stdlib scrypt).
+SCRYPT_N = int(os.getenv("SCRYPT_N", "16384"))
+SCRYPT_R = int(os.getenv("SCRYPT_R", "8"))
+SCRYPT_P = int(os.getenv("SCRYPT_P", "1"))
+
+# Google OAuth (server-side authorization-code flow).
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+
+# SMTP (QQ Mail: smtp.qq.com, 465/ssl, authorization code as password).
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_TLS = os.getenv("SMTP_TLS", "ssl").strip().lower()  # ssl | starttls | none
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip() or SMTP_USER
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Atoms Demo").strip()
+SMTP_TIMEOUT = float(os.getenv("SMTP_TIMEOUT", "15"))

@@ -2,7 +2,7 @@ import type { MouseEvent as ReactMouseEvent } from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import { PROJECT_MODES, MODE_LABEL, projectMode } from '../lib/projects';
-import type { Health, ProjectMode, ProjectSummary } from '../types';
+import type { AuthUser, Health, ProjectMode, ProjectSummary } from '../types';
 import HomeSidebar, { CollapsedSidebar } from './HomeSidebar';
 import { Code, Plus, Search, X } from './Icons';
 import ProjectCard from './ProjectCard';
@@ -13,20 +13,24 @@ interface Props {
   health: Health | null;
   sidebarProjects: ProjectSummary[];
   sidebarCollapsed: boolean;
+  user: AuthUser;
   onSidebarCollapsed: (collapsed: boolean) => void;
   onHome: () => void;
   onNewProject: () => void;
   onOpenProject: (id: string) => void;
+  onLogout: () => void;
 }
 
 export default function ProjectsPage({
   health,
   sidebarProjects,
   sidebarCollapsed,
+  user,
   onSidebarCollapsed,
   onHome,
   onNewProject,
   onOpenProject,
+  onLogout,
 }: Props) {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -105,6 +109,7 @@ export default function ProjectsPage({
         <CollapsedSidebar
           health={health}
           section="projects"
+          user={user}
           onHome={onHome}
           onProjects={() => undefined}
           onExpand={() => onSidebarCollapsed(false)}
@@ -113,10 +118,12 @@ export default function ProjectsPage({
         <HomeSidebar
           projects={sidebarProjects}
           section="projects"
+          user={user}
           onHome={onHome}
           onProjects={() => undefined}
           onOpenProject={onOpenProject}
           onCollapse={() => onSidebarCollapsed(true)}
+          onLogout={onLogout}
         />
       )}
 

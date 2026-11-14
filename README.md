@@ -10,8 +10,22 @@
 - 后端：Python 3.11 + FastAPI + uvicorn（单 worker）
 - 数据库：SQLite（WAL），Atoms 自己的库在 `backend/data/atoms.db`
 - 实时通信：SSE（`StreamingResponse`），不用 WebSocket
-- 部署：Docker Compose + Nginx，单机 2C2G
+- 部署：Docker Compose + Nginx + Let's Encrypt，单机 2C2G
 - LLM：DeepSeek（OpenAI 兼容接口）远程流式调用；无 Key 自动 Mock
+
+## 注册登录与用户隔离
+
+账号体系对齐 atoms.dev 的登录页，包含：
+
+- **邮箱 + 密码**：先判断邮箱是否已注册；已注册进入密码登录，未注册进入「设置密码 → 邮箱验证」。
+- **Google 账号与密码并存**：Google 创建的账号没有初始密码（`password_hash=NULL`）。已注册的 Google 邮箱和其他账号一样进入密码登录页；未设置密码时登录会提示失败，可点「忘记密码」通过邮件设置密码。设置后既可用 Google，也可用邮箱 + 密码登录。
+- **邮箱验证**：注册后发送验证邮件，点击按钮激活账号。未配置 SMTP 时自动进入开发模式，注册后的页面直接展示可点击/复制的验证链接，离线也能完整演示。
+- **忘记密码**：发送带 token 的重置链接（`/password/reset?token=...&email=...`），重置后注销该账号的全部会话。Google 无密码账号也通过同一流程设置首个密码。
+- **快捷登录（演示）**：登录页输入邮箱后点「快捷登录（演示）」。新邮箱自动创建账号并使用默认密码 `AtomsDemo2026`，弹窗明确提示；已有邮箱免密直接登录。用于 HR 快速体验，生产部署建议设置 `AUTH_DEMO_QUICK_LOGIN=0`。
+- **Google OAuth**：配置 `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` 后启用真实的 Authorization Code 流程。Google 不允许公网 IP 的 HTTP 回调，因此需要 HTTPS 域名；项目已内置 Let's Encrypt 配置。
+- **会话安全**：HttpOnly + SameSite=Lax 的随机 token cookie，服务端只存 token 的 SHA-256；密码使用标准库 `scrypt` 加盐哈希；登录/注册/发信接口有内存级限流。
+- **用户隔离**：`projects.user_id` 归属校验覆盖项目列表、详情、生成、SSE、导出、删除和 `/apps/{id}/` HTML 入口，越权统一返回 404。
+- **已知演示边界**：沙箱 iframe 自身的 `fetch()` 默认不携带 cookie，因此 `/apps/{id}/api/*` 和静态资源不额外校验登录；预览 HTML 入口仍要求项目所有者登录。真实生产化需要把生成项目放到独立域名/容器中做隔离。
 
 ## 生成物形态
 
@@ -53,7 +67,8 @@ apps/{project_id}/
 
 ```
 浏览器 (React 工作台)
- ├─ POST /api/projects/{id}/generate ──► FastAPI
+ ├─ /api/auth/* ──► FastAPI 账号 / 会话 / 邮箱验证 / Google OAuth
+ ├─ POST /api/projects/{id}/generate ──► FastAPI（需登录，校验项目归属）
  │                                        ├─ 意图判断：build / consult
  │                                        ├─ build: Mike → (Bob | Alex)，尾部 @ 交接
  │                                        │    Mike: 需求拆解 / 复杂度判断
@@ -62,7 +77,8 @@ apps/{project_id}/
  │                                        └─ consult: 被 @ 的角色并行回答，不修改文件
  │◄────────── SSE: project / agent_start / execution / token / artifact / preview / message / agent_end / done
  │
- ├─ SQLite (WAL): projects / conversations(agent, run_id, run_index) / artifacts / executions(run_id)
+ ├─ SQLite (WAL): users / sessions / email_tokens / projects(user_id) /
+ │                 conversations(agent, run_id, run_index) / artifacts / executions(run_id)
  │
  ├─ iframe /apps/{id}/ ───────────────► Nginx ──► FastAPI 预览静态文件
  │                                        └─► /apps/{id}/api/* ──► 项目 uvicorn 进程
@@ -115,7 +131,8 @@ apps/{project_id}/
 ```bash
 # 1. 配置（不填 Key 也能跑 Mock）
 cp backend/.env.example backend/.env
-# 编辑 backend/.env，填入 LLM_API_KEY
+cp backend/.env.local.example backend/.env.local
+# 编辑 backend/.env，填入 LLM_API_KEY 等两个环境共享的密钥
 
 # 2. 预览构建工具链（一次即可；Docker 镜像内已预装）
 npm --prefix backend/runtime/frontend install
@@ -134,10 +151,25 @@ npm run dev
 
 打开 http://127.0.0.1:5173 。前端 dev server 会把 `/api`、`/apps` 代理到 8000，并允许沙箱 iframe 的 `Origin: null` 预检请求。
 
-### 环境变量（`backend/.env`）
+配置分两层，加载优先级：**进程环境变量 > `backend/.env.{APP_ENV}` > `backend/.env`**。
+
+| 文件 | 内容 | 说明 |
+| --- | --- | --- |
+| `backend/.env` | LLM / SMTP / Google Client ID+Secret 等共享密钥 | 不写环境相关值；本地和线上共用 |
+| `backend/.env.local` | `PUBLIC_BASE_URL=http://127.0.0.1:5173`、`AUTH_COOKIE_SECURE=0`、`AUTH_DEV_LINKS=1` | 模板 `.env.local.example`；本地默认加载 |
+| `backend/.env.production` | `PUBLIC_BASE_URL=https://hajimi.site`、`AUTH_COOKIE_SECURE=1`、`AUTH_DEV_LINKS=0` | 模板 `.env.production.example`；仅服务器使用 |
+
+`APP_ENV` 由进程环境提供（不要写进 `.env`，它在加载文件前读取）：本地默认 `local`，Docker Compose 设为 `production`。
+
+`PUBLIC_BASE_URL` 留空时后端会用请求的 origin，Vite 代理保留了原始 Host，所以本地链接也会是 5173。注意统一使用 `127.0.0.1` 或 `localhost`，不要混用，否则 cookie 与 OAuth 回调的 host 不一致。
+
+登录页：http://127.0.0.1:5173/login 。快捷登录默认密码为 `AtomsDemo2026`。
+
+### 环境变量（`backend/.env` + `backend/.env.{APP_ENV}`）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `APP_ENV` | `local` | 进程环境变量，选择加载 `.env.{APP_ENV}`；Docker Compose 设为 `production` |
 | `LLM_API_KEY` | 空 | 为空时使用 Mock Agent |
 | `LLM_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容地址 |
 | `LLM_MODEL` | `deepseek-flash` | 模型名 |
@@ -148,24 +180,79 @@ npm run dev
 | `RUNTIME_START_TIMEOUT` | `20` | 生成后端启动等待秒数 |
 | `FRONTEND_BUILD_TIMEOUT` | `120` | 预览构建超时秒数 |
 | `PREVIEW_NODE_MODULES` | `backend/runtime/frontend/node_modules` | 共享 esbuild / React 工具链位置 |
+| `PUBLIC_BASE_URL` | 空（用请求 origin） | 验证/重置邮件链接与 OAuth 回调的对外 origin；本地放 `.env.local`（5173 或留空），线上放 `.env.production`（`https://hajimi.site`） |
+| `AUTH_COOKIE_SECURE` | `0` | HTTPS 部署设为 `1`（放 `.env.production`） |
+| `AUTH_SESSION_DAYS` | `30` | 登录会话有效天数 |
+| `AUTH_VERIFY_TTL_HOURS` | `24` | 邮箱验证链接有效小时数 |
+| `AUTH_RESET_TTL_MINUTES` | `60` | 重置密码链接有效分钟数 |
+| `AUTH_DEMO_QUICK_LOGIN` | `1` | 是否开启快捷登录（演示用，生产建议 `0`） |
+| `AUTH_DEMO_PASSWORD` | `AtomsDemo2026` | 快捷登录新账号的默认密码 |
+| `AUTH_DEV_LINKS` | 自动 | SMTP 未配置时自动在页面展示验证/重置链接；设为 `1` 强制开启（即使 SMTP 已配置，邮件仍会真实发送），`0` 关闭（生产） |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | 空 | Google OAuth 凭据（共享 `.env`） |
+| `GOOGLE_REDIRECT_URI` | `{PUBLIC_BASE_URL}/api/auth/google/callback` | 留空即可按环境推导；Google Console 中本地与线上两个回调地址都要登记 |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_TLS` | 空 / `465` / `ssl` | SMTP 服务器；QQ 邮箱用 `smtp.qq.com:465` + SSL |
+| `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | 空 | SMTP 账号、授权码、发件人 |
+| `SMTP_FROM_NAME` | `Atoms Demo` | 发件人显示名 |
 
-## Docker 部署
+## Docker 部署（HTTPS）
+
+生产域名为 `https://hajimi.site`，证书由 Let's Encrypt 自动签发。
+
+前置条件：
+
+1. DNS：`hajimi.site` 的 A 记录指向服务器公网 IP。
+2. 腾讯云安全组放行 TCP `80` 和 `443`。
+3. 服务器上准备 `backend/.env`（共享密钥）和 `backend/.env.production`（线上 origin、Cookie、开发模式开关）。
 
 ```bash
-cp backend/.env.example backend/.env   # 填入 Key（可留空跑 Mock）
-docker compose up -d --build
+cp backend/.env.example backend/.env                         # 填 LLM / SMTP / Google 凭据
+cp backend/.env.production.example backend/.env.production   # 确认 PUBLIC_BASE_URL 等
+docker compose up -d --build               # HTTP 启动，nginx 先使用临时自签名证书
+CERTBOT_EMAIL=you@example.com ./scripts/init-letsencrypt.sh
 ```
 
-打开 `http://服务器IP/` 。`backend/data/` 是宿主机挂载卷，容器重建后项目、demo SQLite 与每个项目自己的 SQLite 都保留。
+> `docker-compose.yml` 的 `env_file` 同时加载 `.env` 与 `.env.production`（后者覆盖前者），并设置 `APP_ENV=production`。缺少 `backend/.env.production` 时 Compose 会直接报错，请先从模板创建。
 
-- `web`：Nginx，托管工作台构建产物，反代 `/api/` 与 `/apps/`；SSE 与生成项目 API 都关闭了缓冲。
+完成后打开 `https://hajimi.site`。证书续期：
+
+```cron
+0 3 * * * cd /path/to/atoms-demo && ./scripts/renew-cert.sh >> /var/log/atoms-cert.log 2>&1
+```
+
+- `web`：Nginx，托管工作台构建产物，反代 `/api/` 与 `/apps/`；80 端口负责 ACME 验证并跳转 HTTPS，443 关闭 SSE 缓冲。
 - `backend`：FastAPI 单 worker + Node 共享 esbuild 工具链；内存上限 1G，生成项目后端另受 LRU 与单进程内存上限约束。
+- `certbot/conf` 与 `certbot/www` 是证书与 ACME 验证目录，已加入 `.gitignore`。
+- `backend/data/` 是宿主机挂载卷，容器重建后账号、项目、demo SQLite 与每个项目自己的 SQLite 都保留。
+
+详细的 Google OAuth、QQ 邮箱 SMTP、DNS/HTTPS 配置步骤见 `docs-local/auth-setup.md`（本地参考文档，不提交到仓库）。
 
 ## API
 
+### 认证
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/health` | 健康检查，返回 LLM 模式与运行中的项目 |
+| POST | `/api/auth/check-email` | 判断邮箱是否已注册 |
+| POST | `/api/auth/register` | `{email,password,redirect?}` 注册并发验证邮件 |
+| POST | `/api/auth/verify-email` | `{token}` 验证邮箱并自动登录 |
+| POST | `/api/auth/resend-verification` | 重新发送验证邮件（60s 冷却） |
+| POST | `/api/auth/login` | `{email,password}` 邮箱密码登录 |
+| POST | `/api/auth/quick` | `{email}` 快捷注册/登录（演示） |
+| POST | `/api/auth/logout` | 注销当前会话 |
+| GET | `/api/auth/me` | 当前登录用户 |
+| POST | `/api/auth/password/forgot` | 发送重置密码邮件 |
+| POST | `/api/auth/password/reset` | `{token,password}` 重置密码并注销全部会话 |
+| GET | `/api/auth/google/start` | 跳转 Google OAuth |
+| GET | `/api/auth/google/callback` | Google OAuth 回调 |
+| GET | `/api/auth/providers` | 当前启用的登录方式 |
+
+> 除 `/api/health` 和 `/api/auth/*` 外，所有 `/api/projects*` 以及 `/apps/{id}/` HTML 入口都需要登录，并校验项目归属。
+
+### 项目
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/health` | 健康检查，返回 LLM 模式、运行中的项目与认证能力 |
 | GET | `/api/projects` | 项目列表（含 `mode`） |
 | POST | `/api/projects` | 创建项目 `{prompt?, name?}`；省略 `name` 时后台用 LLM 把首条需求概括为短名称 |
 | GET | `/api/projects/{id}` | 完整状态（对话、最新文件、执行记录、`mode`、`preview_url`） |
@@ -194,6 +281,7 @@ SSE 事件：
 
 ## 演示脚本
 
+0. 打开首页 → 输入任意邮箱 → 点「快捷登录（演示）」。新邮箱会自动创建账号并提示默认密码 `AtomsDemo2026`；已有邮箱直接登录。也可以走「邮箱 + 密码 + 邮箱验证」或 Google OAuth。
 1. 首页输入「做一个团队任务看板，支持新增/完成/筛选，数据保存到 SQLite」→ 对话按智能体分组：Mike（拆解 + 判定复杂度）→ Bob（形态 / 数据模型 / API）→ Alex（脚手架、代码、回修、构建预览、启动运行时）→ 右侧 iframe 出现可交互应用。
 2. 在应用里新增几条任务 → 刷新页面 / 刷新 iframe → 数据仍在（来自 `apps/{id}/backend/data/app.db`）。
 3. 继续输入「加一个按负责人筛选」→ Mike 判断改动范围，生成 v2，已有任务不丢。
@@ -205,7 +293,10 @@ SSE 事件：
 
 ## 验收对照
 
-- [x] 打开 IP 直接用，无需注册登录
+- [x] 打开域名先登录；支持邮箱密码、快捷登录、真实 Google OAuth
+- [x] 邮箱注册需验证；未配置 SMTP 时开发模式直接展示验证链接
+- [x] 忘记密码 / 重置密码；重置后注销全部会话
+- [x] 用户只能看到自己的项目；越权访问项目、生成、导出、删除与预览入口统一 404
 - [x] 需求 → 按智能体分组的执行时间线 → 代码 → iframe 预览
 - [x] Mike / Bob / Alex 三角色分工，构建链按依赖顺序交接
 - [x] 输入 `@` 指定智能体，支持多 @；咨询类请求并行回答且不修改文件
@@ -220,7 +311,7 @@ SSE 事件：
 
 ## 设计边界与安全说明
 
-- 不做真实鉴权/多用户；不做 Stripe 支付；不接 Kafka/Redis/ES。
-- 生成的前端运行在 `sandbox` iframe 中（不含 `allow-same-origin`），通过 CORS 访问自己的后端。
+- 已有账号、会话与项目归属隔离；不做团队 / 角色权限 / 多租户。快捷登录是演示功能（任意邮箱可免密登录），生产部署应设置 `AUTH_DEMO_QUICK_LOGIN=0`。不做 Stripe 支付；不接 Kafka/Redis/ES。
+- 生成的前端运行在 `sandbox` iframe 中（不含 `allow-same-origin`），通过 CORS 访问自己的后端。因此 iframe 自身的 `fetch()` 不携带 demo 登录 cookie：`/apps/{id}/api/*` 和静态资源不做额外登录校验，预览 HTML 入口仍要求项目所有者登录。
 - 生成的后端是**在本机（Docker 容器内）执行的不可信代码**：它有内存上限、只监听 127.0.0.1、环境变量被裁剪，但没有真正的进程/文件系统沙箱。这个 demo 定位为单用户演示；生产化需要把每个项目放进独立容器或 microVM。
 - 不执行 `npm install` 级别的服务端构建；预览用共享 esbuild 打包生成的前端源码。

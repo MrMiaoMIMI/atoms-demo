@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import io
 import json
 import logging
@@ -13,7 +14,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -25,8 +26,10 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 import agent
+import auth
 import config
 import db
+import mailer
 import naming
 import runtime
 
@@ -146,6 +149,411 @@ class GenerateBody(BaseModel):
     team_mode: bool = True  # kept for UI parity; routing is always team-routed
 
 
+class EmailBody(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class PasswordBody(EmailBody):
+    password: str = Field(min_length=1, max_length=128)
+
+
+class RegisterBody(PasswordBody):
+    redirect: str = Field(default="/dashboard", max_length=500)
+
+
+class LoginBody(PasswordBody):
+    pass
+
+
+class ResendBody(EmailBody):
+    redirect: str = Field(default="/dashboard", max_length=500)
+
+
+class VerifyBody(BaseModel):
+    token: str = Field(min_length=8, max_length=256)
+
+
+class ResetBody(VerifyBody):
+    password: str = Field(min_length=1, max_length=128)
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+def _validated_email(value: str) -> str:
+    email = auth.normalize_email(value)
+    if not auth.is_valid_email(email):
+        raise HTTPException(status_code=400, detail="请输入有效的邮箱地址")
+    return email
+
+
+def _validated_password(value: str) -> str:
+    error = auth.validate_password(value)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return value
+
+
+def _display_name(email: str) -> str:
+    local = email.split("@", 1)[0].strip()
+    return (local[:40] or "Atoms 用户")
+
+
+async def _session_response(user: dict, request: Request, payload: dict) -> JSONResponse:
+    token = await auth.create_session(user, request)
+    response = JSONResponse(payload)
+    auth.set_session_cookie(response, token)
+    await db.delete_expired_sessions()
+    return response
+
+
+@app.get("/api/auth/providers")
+async def auth_providers() -> dict:
+    """Public capabilities so the login page can render honest buttons."""
+    return {
+        "google": auth.google_configured(),
+        "quick": config.AUTH_DEMO_QUICK_LOGIN,
+        "quick_password": (
+            config.AUTH_DEMO_PASSWORD if config.AUTH_DEMO_QUICK_LOGIN else None
+        ),
+        "mail": mailer.mode(),
+        "dev_links": auth.dev_links_enabled(),
+    }
+
+
+@app.post("/api/auth/check-email")
+async def auth_check_email(body: EmailBody, request: Request) -> dict:
+    await auth.enforce_limit(f"check:{auth.client_ip(request)}", 30, 60)
+    email = _validated_email(body.email)
+    user = await db.get_user_by_email(email)
+    return {
+        "registered": bool(user),
+        "provider": user.get("provider") if user else None,
+        "verified": bool(user and user.get("email_verified")),
+    }
+
+
+@app.post("/api/auth/register")
+async def auth_register(body: RegisterBody, request: Request):
+    await auth.enforce_limit(f"register:{auth.client_ip(request)}", 10, 60)
+    email = _validated_email(body.email)
+    password = _validated_password(body.password)
+    existing = await db.get_user_by_email(email)
+
+    if existing and existing.get("email_verified"):
+        raise HTTPException(status_code=409, detail="该邮箱已注册，请直接登录")
+
+    if existing:
+        # Unverified account: let the user correct the password and resend.
+        await db.update_user_password(existing["id"], auth.hash_password(password))
+        user = existing
+    else:
+        user = await db.create_user(
+            email,
+            name=_display_name(email),
+            password_hash=auth.hash_password(password),
+            provider="email",
+            email_verified=False,
+        )
+
+    token = await auth.issue_email_token(user, "verify")
+    url = auth.verification_url(
+        request, token, email, auth.safe_redirect(body.redirect)
+    )
+    delivered = await mailer.send_verification_email(email, url)
+    return {
+        "email": email,
+        "verification_sent": delivered,
+        "already_registered": bool(existing),
+        "dev_verify_url": url if auth.dev_links_enabled() else None,
+        "warning": (
+            None
+            if delivered or auth.dev_links_enabled()
+            else "验证邮件发送失败，请稍后重新发送"
+        ),
+    }
+
+
+@app.post("/api/auth/verify-email")
+async def auth_verify_email(body: VerifyBody, request: Request):
+    row = await db.consume_email_token(auth.token_digest(body.token), "verify")
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail="验证链接已过期或无效，请返回注册页面重新发送。",
+        )
+    user = await db.get_user(row["user_id"])
+    if not user:
+        raise HTTPException(status_code=400, detail="账号不存在")
+    await db.mark_email_verified(user["id"])
+    user["email_verified"] = 1
+    return await _session_response(
+        user,
+        request,
+        {
+            "ok": True,
+            "email": user["email"],
+            "user": auth.public_user(user),
+            "redirect": "/dashboard",
+        },
+    )
+
+
+@app.post("/api/auth/resend-verification")
+async def auth_resend_verification(
+    body: ResendBody, request: Request
+) -> dict:
+    email = _validated_email(body.email)
+    await auth.enforce_limit(f"resend:{email}", 1, 60)
+    user = await db.get_user_by_email(email)
+    if not user or user.get("email_verified"):
+        # Do not reveal whether an address exists.
+        return {"sent": True, "dev_verify_url": None}
+    token = await auth.issue_email_token(user, "verify")
+    url = auth.verification_url(
+        request, token, email, auth.safe_redirect(body.redirect)
+    )
+    delivered = await mailer.send_verification_email(email, url)
+    return {
+        "sent": delivered,
+        "dev_verify_url": url if auth.dev_links_enabled() else None,
+    }
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginBody, request: Request):
+    email = _validated_email(body.email)
+    password = body.password
+    ip = auth.client_ip(request)
+    await auth.enforce_limit(f"login:{ip}", 20, 300)
+    await auth.enforce_limit(f"login:{ip}:{email}", 8, 300)
+
+    user = await db.get_user_by_email(email)
+    if user and not user.get("password_hash"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "password_not_set",
+                "message": "该账号尚未设置密码。请通过「忘记密码」设置密码，或使用 Google 登录。",
+            },
+        )
+    if not user or not auth.verify_password(password, user.get("password_hash")):
+        raise HTTPException(status_code=401, detail="邮箱或密码不正确")
+    if not user.get("email_verified"):
+        raise HTTPException(status_code=403, detail="请先验证邮箱后再登录")
+
+    await auth.limiter.reset(f"login:{ip}:{email}")
+    return await _session_response(
+        user, request, {"user": auth.public_user(user)}
+    )
+
+
+@app.post("/api/auth/quick")
+async def auth_quick_login(body: EmailBody, request: Request):
+    if not config.AUTH_DEMO_QUICK_LOGIN:
+        raise HTTPException(status_code=404, detail="快捷登录未开启")
+    await auth.enforce_limit(f"quick:{auth.client_ip(request)}", 30, 60)
+    email = _validated_email(body.email)
+
+    user = await db.get_user_by_email(email)
+    created = False
+    default_password: str | None = None
+    if user is None:
+        default_password = config.AUTH_DEMO_PASSWORD
+        user = await db.create_user(
+            email,
+            name=_display_name(email),
+            password_hash=auth.hash_password(default_password),
+            provider="quick",
+            email_verified=True,
+        )
+        created = True
+    elif not user.get("email_verified"):
+        await db.mark_email_verified(user["id"])
+        user["email_verified"] = 1
+
+    return await _session_response(
+        user,
+        request,
+        {
+            "user": auth.public_user(user),
+            "created": created,
+            "default_password": default_password,
+        },
+    )
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    token = request.cookies.get(config.AUTH_COOKIE_NAME)
+    if token:
+        await db.delete_session(auth.token_digest(token))
+    response = JSONResponse({"ok": True})
+    auth.clear_session_cookie(response)
+    return response
+
+
+@app.get("/api/auth/me")
+async def auth_me(user: dict = Depends(auth.current_user)) -> dict:
+    return {"user": user}
+
+
+@app.post("/api/auth/password/forgot")
+async def auth_forgot_password(body: EmailBody, request: Request) -> dict:
+    email = _validated_email(body.email)
+    await auth.enforce_limit(f"forgot:{auth.client_ip(request)}", 10, 300)
+    await auth.enforce_limit(f"forgot:{email}", 1, 60)
+
+    user = await db.get_user_by_email(email)
+    dev_url: str | None = None
+    delivered: bool | None = None
+    if user:
+        token = await auth.issue_email_token(user, "reset")
+        url = auth.reset_url(request, token, email)
+        send_ok = await mailer.send_reset_email(email, url)
+        if auth.dev_links_enabled():
+            dev_url = url
+            # Only expose delivery status when the dev link already reveals
+            # that the address exists.
+            delivered = send_ok
+    # Always generic: do not reveal whether an address is registered.
+    return {"sent": True, "dev_reset_url": dev_url, "delivered": delivered}
+
+
+@app.post("/api/auth/password/reset")
+async def auth_reset_password(body: ResetBody):
+    password = _validated_password(body.password)
+    row = await db.consume_email_token(auth.token_digest(body.token), "reset")
+    if not row:
+        raise HTTPException(
+            status_code=400, detail="重置链接已过期或无效，请重新发起。"
+        )
+    user = await db.get_user(row["user_id"])
+    if not user:
+        raise HTTPException(status_code=400, detail="账号不存在")
+    await db.update_user_password(user["id"], auth.hash_password(password))
+    await db.mark_email_verified(user["id"])
+    # A password change invalidates every existing session.
+    await db.delete_user_sessions(user["id"])
+    response = JSONResponse({"ok": True})
+    auth.clear_session_cookie(response)
+    return response
+
+
+@app.get("/api/auth/google/start")
+async def google_start(request: Request, redirect: str = "/dashboard"):
+    if not auth.google_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Google 登录尚未配置，请先设置 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET",
+        )
+    state = auth.new_token(24)
+    response = RedirectResponse(
+        auth.google_auth_url(request, state), status_code=302
+    )
+    cookie_args = {
+        "max_age": 600,
+        "httponly": True,
+        "samesite": "lax",
+        "secure": config.AUTH_COOKIE_SECURE,
+        "path": "/api/auth/google",
+    }
+    response.set_cookie("atoms_oauth_state", state, **cookie_args)
+    response.set_cookie(
+        "atoms_oauth_redirect", auth.safe_redirect(redirect), **cookie_args
+    )
+    return response
+
+
+@app.get("/api/auth/google/callback")
+async def google_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    base = auth.public_base_url(request)
+    redirect_path = auth.safe_redirect(
+        request.cookies.get("atoms_oauth_redirect")
+    )
+    expected = request.cookies.get("atoms_oauth_state")
+
+    def failure(reason: str):
+        response = RedirectResponse(
+            f"{base}/login?error={quote(reason)}", status_code=303
+        )
+        response.delete_cookie("atoms_oauth_state", path="/api/auth/google")
+        response.delete_cookie("atoms_oauth_redirect", path="/api/auth/google")
+        return response
+
+    if error or not code or not state or not expected:
+        return failure("google_failed")
+    if not hmac.compare_digest(state, expected):
+        return failure("google_failed")
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            token_response = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": config.GOOGLE_CLIENT_ID,
+                    "client_secret": config.GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": auth.google_redirect_uri(request),
+                    "grant_type": "authorization_code",
+                },
+            )
+            if token_response.status_code != 200:
+                logger.warning(
+                    "Google token exchange failed: %s %s",
+                    token_response.status_code,
+                    token_response.text[:300],
+                )
+                return failure("google_failed")
+            access_token = token_response.json().get("access_token")
+            if not access_token:
+                return failure("google_failed")
+            info_response = await client.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if info_response.status_code != 200:
+                return failure("google_failed")
+            info = info_response.json()
+    except httpx.HTTPError as exc:
+        logger.warning("Google OAuth request failed: %s", exc)
+        return failure("google_failed")
+
+    email = auth.normalize_email(info.get("email"))
+    if not auth.is_valid_email(email) or not info.get("email_verified"):
+        return failure("google_failed")
+
+    user = await db.get_user_by_email(email)
+    if user is None:
+        user = await db.create_user(
+            email,
+            name=info.get("name") or _display_name(email),
+            password_hash=None,
+            provider="google",
+            email_verified=True,
+        )
+    else:
+        if not user.get("email_verified"):
+            await db.mark_email_verified(user["id"])
+            user["email_verified"] = 1
+        if not user.get("name") and info.get("name"):
+            await db.update_user_login(user["id"], info["name"])
+            user["name"] = info["name"]
+
+    token = await auth.create_session(user, request)
+    response = RedirectResponse(f"{base}{redirect_path}", status_code=303)
+    auth.set_session_cookie(response, token)
+    response.delete_cookie("atoms_oauth_state", path="/api/auth/google")
+    response.delete_cookie("atoms_oauth_redirect", path="/api/auth/google")
+    return response
+
+
 def _project_mode(paths: set[str]) -> str:
     has_frontend = any(path.startswith("frontend/") for path in paths)
     has_backend = any(path.startswith("backend/") for path in paths)
@@ -162,14 +570,19 @@ async def health() -> dict:
         "ok": True,
         "llm_mode": config.LLM_MODE,
         "model": config.LLM_MODEL,
-        "version": "0.2.0",
+        "version": "0.3.0",
         "running_apps": runtime.runtime.running(),
+        "auth": {
+            "mail": mailer.mode(),
+            "google": auth.google_configured(),
+            "quick": config.AUTH_DEMO_QUICK_LOGIN,
+        },
     }
 
 
 @app.get("/api/projects")
-async def list_projects() -> dict:
-    projects = await db.list_projects()
+async def list_projects(user: dict = Depends(auth.current_user)) -> dict:
+    projects = await db.list_projects(user["id"])
     for project in projects:
         if project.get("has_frontend") and project.get("has_backend"):
             project["mode"] = "fullstack"
@@ -195,13 +608,15 @@ async def _name_project(pid: str, prompt: str) -> None:
 
 
 @app.post("/api/projects")
-async def create_project(body: CreateProjectBody) -> dict:
+async def create_project(
+    body: CreateProjectBody, user: dict = Depends(auth.current_user)
+) -> dict:
     prompt = (body.prompt or "").strip()
     name = (body.name or "").strip()
     explicit_name = bool(name)
     if not name:
         name = naming.draft_title(prompt)
-    project = await db.create_project((name[:80] or "未命名项目"))
+    project = await db.create_project((name[:80] or "未命名项目"), user["id"])
 
     # Long first prompts lose intent when cut to N characters; let the LLM
     # summarize one. The workspace opens with the draft name in the meantime.
@@ -220,7 +635,9 @@ def _preview_ready(pid: str) -> bool:
 
 
 @app.get("/api/projects/{pid}")
-async def get_project(pid: str) -> dict:
+async def get_project(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    if not await db.get_project_for_user(pid, user["id"]):
+        raise HTTPException(status_code=404, detail="项目不存在")
     state = await db.get_state(pid)
     if not state:
         raise HTTPException(status_code=404, detail="项目不存在")
@@ -249,8 +666,8 @@ def _zip_artifacts(files: dict[str, str]) -> bytes:
 
 
 @app.get("/api/projects/{pid}/export")
-async def export_project(pid: str):
-    project = await db.get_project(pid)
+async def export_project(pid: str, user: dict = Depends(auth.current_user)):
+    project = await db.get_project_for_user(pid, user["id"])
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
     files = await db.latest_artifacts(pid)
@@ -271,8 +688,8 @@ async def export_project(pid: str):
 
 
 @app.delete("/api/projects/{pid}")
-async def delete_project(pid: str) -> dict:
-    if not await db.get_project(pid):
+async def delete_project(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    if not await db.get_project_for_user(pid, user["id"]):
         raise HTTPException(status_code=404, detail="项目不存在")
     await runtime.runtime.stop(pid)
     await db.delete_project(pid)
@@ -283,8 +700,10 @@ async def delete_project(pid: str) -> dict:
 
 
 @app.post("/api/projects/{pid}/generate")
-async def generate(pid: str, body: GenerateBody):
-    if not await db.get_project(pid):
+async def generate(
+    pid: str, body: GenerateBody, user: dict = Depends(auth.current_user)
+):
+    if not await db.get_project_for_user(pid, user["id"]):
         raise HTTPException(status_code=404, detail="项目不存在")
     message = body.message.strip()
     if not message:
@@ -452,8 +871,10 @@ async def _resume_event_stream(pid: str, hub: _GenerationHub):
 
 
 @app.get("/api/projects/{pid}/events")
-async def generation_events(pid: str):
-    if not await db.get_project(pid):
+async def generation_events(
+    pid: str, user: dict = Depends(auth.current_user)
+):
+    if not await db.get_project_for_user(pid, user["id"]):
         raise HTTPException(status_code=404, detail="项目不存在")
     hub = _hubs.get(pid)
     if hub is None:
@@ -472,9 +893,11 @@ async def generation_events(pid: str):
 
 
 @app.post("/api/projects/{pid}/cancel")
-async def cancel_generation(pid: str) -> dict:
+async def cancel_generation(
+    pid: str, user: dict = Depends(auth.current_user)
+) -> dict:
     """Explicitly stop a build. The SSE stream alone only detaches."""
-    if not await db.get_project(pid):
+    if not await db.get_project_for_user(pid, user["id"]):
         raise HTTPException(status_code=404, detail="项目不存在")
     task = _generation_tasks.get(pid)
     if task is None or task.done():
@@ -645,8 +1068,24 @@ async def _proxy_backend(pid: str, path: str, request: Request):
     )
 
 
+def _is_preview_document(pid: str, path: str) -> bool:
+    """True for the HTML entry (including SPA fallbacks), not subresources.
+
+    The iframe runs in an opaque sandboxed origin, so its own fetch() calls do
+    not carry the demo session cookie. Protecting only the document keeps the
+    generated app working while still requiring a signed-in owner to open it.
+    """
+    clean = path.strip("/")
+    if clean in ("", "index.html"):
+        return True
+    target = _static_target(pid, path)
+    return bool(target and target.name == "index.html")
+
+
 @app.get("/apps/{pid}")
-async def preview_root(pid: str):
+async def preview_root(pid: str, user: dict = Depends(auth.current_user)):
+    if not await db.get_project_for_user(pid, user["id"]):
+        raise HTTPException(status_code=404, detail="项目不存在")
     return RedirectResponse(url=f"/apps/{pid}/", status_code=307)
 
 
@@ -659,4 +1098,8 @@ async def preview(pid: str, path: str, request: Request):
         return await _proxy_backend(pid, path, request)
     if request.method not in {"GET", "HEAD"}:
         raise HTTPException(status_code=405, detail="静态预览只支持 GET")
+    if _is_preview_document(pid, path):
+        user = await auth.current_user(request)
+        if not await db.get_project_for_user(pid, user["id"]):
+            raise HTTPException(status_code=404, detail="项目不存在")
     return await _serve_project_file(pid, path)

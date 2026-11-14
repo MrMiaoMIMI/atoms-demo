@@ -7,6 +7,7 @@ import { buildGroups, type ChatGroup } from '../lib/groups';
 import type {
   AgentKey,
   Artifact,
+  AuthUser,
   Conversation,
   Execution,
   Health,
@@ -38,8 +39,10 @@ interface Props {
   health: Health | null;
   onExit: () => void;
   projects: ProjectSummary[];
+  user: AuthUser;
   onOpenProject: (id: string) => void;
   onOpenProjects: () => void;
+  onLogout: () => void;
 }
 
 const MIN_CHAT = 340;
@@ -80,8 +83,10 @@ export default function Workspace({
   health,
   onExit,
   projects,
+  user,
   onOpenProject,
   onOpenProjects,
+  onLogout,
 }: Props) {
   const [project, setProject] = useState<Project | null>(null);
   const [mode, setMode] = useState<ProjectMode>('frontend');
@@ -684,10 +689,12 @@ export default function Workspace({
         <HomeSidebar
           projects={sidebarProjects}
           section="workspace"
+          user={user}
           onHome={onExit}
           onProjects={onOpenProjects}
           onOpenProject={onOpenProject}
           onCollapse={() => setSidebarOpen(false)}
+          onLogout={onLogout}
         />
       ) : null}
 

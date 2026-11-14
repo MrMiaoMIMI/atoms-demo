@@ -1,4 +1,5 @@
 import type { ReactNode, SVGProps } from "react";
+import { useId } from "react";
 
 export type IconProps = SVGProps<SVGSVGElement> & { size?: number };
 
@@ -210,6 +211,36 @@ export function Eye(props: IconProps) {
   );
 }
 
+export function EyeOff(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M3.2 3.2 20.8 20.8" />
+      <path d="M10.6 6.2A9.9 9.9 0 0 1 12 6.1c6 0 9.2 5.9 9.2 5.9a15.4 15.4 0 0 1-3.1 3.6" />
+      <path d="M6.6 6.8C4.2 8.3 2.8 12 2.8 12s3.2 6.1 9.2 6.1c1.5 0 2.9-.35 4.1-.95" />
+      <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+    </Icon>
+  );
+}
+
+export function LogOut(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M9 4H5.8A1.8 1.8 0 0 0 4 5.8v12.4A1.8 1.8 0 0 0 5.8 20H9" />
+      <path d="M15 8l4 4-4 4" />
+      <path d="M19 12H9" />
+    </Icon>
+  );
+}
+
+export function Mail(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <path d="m3.5 6.5 8.5 6 8.5-6" />
+    </Icon>
+  );
+}
+
 export function Monitor(props: IconProps) {
   return (
     <Icon {...props}>
@@ -316,6 +347,39 @@ export function CheckCircle(props: IconProps) {
       <circle cx="12" cy="12" r="8.6" />
       <path d="m8.2 12.2 2.6 2.6 5-5.2" />
     </Icon>
+  );
+}
+
+export function CheckCircleFill({ size = 18, className, ...props }: IconProps) {
+  const maskId = useId().replace(/:/g, '');
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      className={className}
+      {...props}
+    >
+      <mask id={maskId} maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">
+        <circle cx="12" cy="12" r="10" fill="#fff" />
+        <path
+          d="m7.3 12.3 3.1 3.1 6.3-6.5"
+          stroke="#000"
+          strokeWidth="2.1"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </mask>
+      <circle
+        cx="12"
+        cy="12"
+        r="10"
+        fill="currentColor"
+        mask={`url(#${maskId})`}
+      />
+    </svg>
   );
 }
 

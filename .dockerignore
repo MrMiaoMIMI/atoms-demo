@@ -5,7 +5,9 @@ frontend/node_modules
 frontend/dist
 backend/.venv
 backend/data
-backend/.env
+backend/.env*
 **/__pycache__
 **/*.pyc
 *.log
+certbot
+scripts

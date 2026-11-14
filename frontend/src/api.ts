@@ -1,22 +1,161 @@
-import type { Health, Project, ProjectState, ProjectSummary } from "./types";
+import type {
+  AuthProviders,
+  AuthUser,
+  Health,
+  Project,
+  ProjectState,
+  ProjectSummary,
+  QuickLoginResult,
+} from "./types";
+
+/** Fired when a protected endpoint answers 401 so the shell can show login. */
+export const AUTH_EVENT = "atoms:unauthorized";
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 async function readError(res: Response): Promise<string> {
   try {
-    const data = (await res.json()) as { detail?: string };
-    return data.detail || res.statusText;
+    const data = (await res.json()) as { detail?: unknown };
+    if (typeof data.detail === "string") return data.detail;
+    if (
+      data.detail &&
+      typeof data.detail === "object" &&
+      "message" in data.detail
+    ) {
+      return String((data.detail as { message: unknown }).message);
+    }
+    return res.statusText;
   } catch {
     return `${res.status} ${res.statusText}`;
   }
 }
 
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(await readError(res));
+async function request(
+  url: string,
+  init?: RequestInit,
+  options?: { silent401?: boolean }
+): Promise<Response> {
+  const res = await fetch(url, init);
+  if (res.status === 401 && !options?.silent401) {
+    window.dispatchEvent(new Event(AUTH_EVENT));
+  }
+  if (!res.ok) throw new ApiError(await readError(res), res.status);
+  return res;
+}
+
+async function getJson<T>(
+  url: string,
+  options?: { silent401?: boolean }
+): Promise<T> {
+  const res = await request(url, undefined, options);
+  return (await res.json()) as T;
+}
+
+async function postJson<T>(
+  url: string,
+  body: unknown,
+  options?: { silent401?: boolean }
+): Promise<T> {
+  const res = await request(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    options
+  );
   return (await res.json()) as T;
 }
 
 export const api = {
   health: () => getJson<Health>("/api/health"),
+
+  // ---- auth ---------------------------------------------------------------
+
+  providers: () => getJson<AuthProviders>("/api/auth/providers"),
+
+  me: () =>
+    getJson<{ user: AuthUser }>("/api/auth/me", { silent401: true }).then(
+      (data) => data.user
+    ),
+
+  checkEmail: (email: string) =>
+    postJson<{ registered: boolean; provider: string | null; verified: boolean }>(
+      "/api/auth/check-email",
+      { email },
+      { silent401: true }
+    ),
+
+  register: (email: string, password: string, redirect = "/dashboard") =>
+    postJson<{
+      email: string;
+      verification_sent: boolean;
+      already_registered: boolean;
+      dev_verify_url?: string | null;
+      warning?: string | null;
+    }>(
+      "/api/auth/register",
+      { email, password, redirect },
+      { silent401: true }
+    ),
+
+  verifyEmail: (token: string) =>
+    postJson<{
+      ok: boolean;
+      email: string;
+      user: AuthUser;
+      redirect: string;
+    }>("/api/auth/verify-email", { token }, { silent401: true }),
+
+  resendVerification: (email: string, redirect = "/dashboard") =>
+    postJson<{ sent: boolean; dev_verify_url?: string | null }>(
+      "/api/auth/resend-verification",
+      { email, redirect },
+      { silent401: true }
+    ),
+
+  login: (email: string, password: string) =>
+    postJson<{ user: AuthUser }>(
+      "/api/auth/login",
+      { email, password },
+      { silent401: true }
+    ).then((data) => data.user),
+
+  quickLogin: (email: string) =>
+    postJson<QuickLoginResult>(
+      "/api/auth/quick",
+      { email },
+      { silent401: true }
+    ),
+
+  logout: () => postJson<{ ok: boolean }>("/api/auth/logout", {}),
+
+  forgotPassword: (email: string) =>
+    postJson<{
+      sent: boolean;
+      delivered?: boolean | null;
+      dev_reset_url?: string | null;
+    }>("/api/auth/password/forgot", { email }, { silent401: true }),
+
+  resetPassword: (token: string, password: string) =>
+    postJson<{ ok: boolean }>(
+      "/api/auth/password/reset",
+      { token, password },
+      { silent401: true }
+    ),
+
+  googleStartUrl: (redirect: string) =>
+    `/api/auth/google/start?redirect=${encodeURIComponent(redirect)}`,
+
+  // ---- projects -----------------------------------------------------------
 
   listProjects: async (): Promise<ProjectSummary[]> => {
     const data = await getJson<{ projects: ProjectSummary[] }>("/api/projects");
@@ -26,35 +165,24 @@ export const api = {
   createProject: async (prompt: string): Promise<Project> => {
     // The backend derives a short title from the full prompt (LLM-assisted,
     // with a heuristic fallback) instead of truncating the first line here.
-    const res = await fetch("/api/projects", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
-    });
-    if (!res.ok) throw new Error(await readError(res));
-    return (await res.json()) as Project;
+    return postJson<Project>("/api/projects", { prompt });
   },
 
   getProject: (pid: string) => getJson<ProjectState>(`/api/projects/${pid}`),
 
   // Generation outlives the SSE connection; stopping it needs an explicit call.
   cancelGeneration: async (pid: string): Promise<void> => {
-    const res = await fetch(`/api/projects/${pid}/cancel`, { method: "POST" });
-    if (!res.ok) throw new Error(await readError(res));
+    await request(`/api/projects/${pid}/cancel`, { method: "POST" });
   },
 
   deleteProject: async (pid: string): Promise<void> => {
-    const res = await fetch(`/api/projects/${pid}`, { method: "DELETE" });
-    if (!res.ok) throw new Error(await readError(res));
+    await request(`/api/projects/${pid}`, { method: "DELETE" });
   },
 
   exportProject: async (
     pid: string
   ): Promise<{ blob: Blob; filename: string }> => {
-    const res = await fetch(
-      `/api/projects/${encodeURIComponent(pid)}/export`
-    );
-    if (!res.ok) throw new Error(await readError(res));
+    const res = await request(`/api/projects/${encodeURIComponent(pid)}/export`);
 
     const disposition = res.headers.get("content-disposition") ?? "";
     const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
@@ -96,8 +224,7 @@ async function readEventStream(
   init: RequestInit,
   onEvent: StreamHandler
 ): Promise<void> {
-  const res = await fetch(url, init);
-  if (!res.ok) throw new Error(await readError(res));
+  const res = await request(url, init);
   if (!res.body) throw new Error("浏览器不支持流式响应");
 
   const reader = res.body.getReader();

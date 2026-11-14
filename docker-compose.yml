@@ -4,7 +4,10 @@ services:
       context: ./backend
     env_file:
       - ./backend/.env
+      # 后加载的文件覆盖先加载的：线上 profile 覆盖共享 .env 中的环境相关值。
+      - ./backend/.env.production
     environment:
+      APP_ENV: production
       DATA_DIR: /app/data
       MAX_RUNNING_APPS: "2"
       GENERATED_APP_MEMORY_MB: "256"
@@ -34,6 +37,14 @@ services:
       dockerfile: nginx/Dockerfile
     ports:
       - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: hajimi.site
+    volumes:
+      # nginx needs write access on first boot to create a temporary
+      # self-signed certificate; certbot later replaces it with the real one.
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot:ro
     depends_on:
       - backend
     mem_limit: 192m

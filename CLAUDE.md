@@ -11,7 +11,7 @@
 - 后端：Python 3.11 + FastAPI + uvicorn（单 worker）
 - 数据库：SQLite（WAL 模式），不引入 Postgres/Redis
 - 实时通信：SSE（Server-Sent Events），不用 WebSocket
-- 部署：Docker Compose + Nginx，单机 2C2G 腾讯云轻量服务器，仅 IP 访问
+- 部署：Docker Compose + Nginx + Let's Encrypt，单机 2C2G 腾讯云轻量服务器，域名 `hajimi.site` HTTPS 访问
 - LLM：远程调用（OpenAI 兼容接口），服务端不加载任何模型
 
 ## 架构约束
@@ -29,6 +29,11 @@
 - 角色能力靠 `AgentSpec.tools` 白名单 + `Toolbox` 强制隔离（Mike 只读，Bob 可校验方案，Alex 可写文件/构建/启动运行时）；工具是进程内 Python 函数，不用 MCP
 - 所有 AI 调用必须可降级：无 API Key 时走 Mock Agent 返回中性占位模板（不再伪装成 Todo/落地页）；运行中 LLM 失败按 `LLM_MAX_RETRIES`（默认 3 次）重试，仍失败则回滚本轮并保留上一个可用版本，不静默替换项目；前端构建或后端启动失败同样回滚并报错
 - 单次 LLM 输出预算由 `LLM_MAX_TOKENS` 控制（默认 16384，上游 400 时自动降回 8192）；`finish_reason=length` 时按 `LLM_CONTINUATION_PASSES`（默认 3）续写；生成后单文件 >12000 字符告警，>20000 字符的前端 TS/TSX 尝试自动拆分
+- 账号体系：邮箱 + 密码（scrypt 加盐哈希）、邮箱验证、忘记密码、快捷登录（演示）、真实 Google OAuth；会话为 HttpOnly + SameSite=Lax 的随机 token cookie，服务端只存 SHA-256；`/api/auth/*` 与 `/api/health` 公开，其余项目 API 和 `/apps/{id}/` HTML 入口必须登录并校验 `projects.user_id`
+- Google 创建的账号 `password_hash` 为 NULL、不设初始密码；登录时与普通账号一样进入密码校验，未设置密码则提示失败，用户可通过「忘记密码」邮件设置密码，之后支持 Google 与邮箱密码双方式登录
+- 邮件：SMTP（QQ 邮箱 465/SSL）发送验证/重置链接；SMTP 未配置时自动进入开发模式，在页面展示链接；`AUTH_DEV_LINKS` 可强制开启，生产关闭
+- 配置分环境：`backend/.env` 只放共享密钥，`backend/.env.local` / `.env.production` 放环境相关值；加载优先级为进程环境变量 > `.env.{APP_ENV}` > `.env`，`APP_ENV` 默认 local、Compose 设 production；`PUBLIC_BASE_URL` 本地留空按请求 origin 推导
+- 生成项目预览的 sandbox iframe（不含 `allow-same-origin`）自身 fetch 不携带 cookie，因此 `/apps/{id}/api/*` 与静态资源不做登录校验；这是单用户演示边界，需在 README 中明确
 
 ## 前端视觉规范（对齐 atoms.dev）
 
@@ -41,7 +46,10 @@
 
 ## 数据模型
 
-- projects(id, name, created_at)
+- users(id, email UNIQUE COLLATE NOCASE, name, password_hash, provider, email_verified, created_at, last_login_at)
+- sessions(token_hash PK, user_id, created_at, expires_at, user_agent, ip)
+- email_tokens(token_hash PK, user_id, kind, email, expires_at, used_at, created_at)
+- projects(id, name, user_id, created_at)
 - conversations(id, project_id, role, content, agent, run_id, run_index, created_at)
 - artifacts(id, project_id, filename, content, version)
 - executions(id, project_id, agent, step, status, log, run_id, created_at)
@@ -60,11 +68,16 @@ atoms-demo/
 │ ├── runtime.py # 生成项目 uvicorn 进程管理（LRU/内存上限）
 │ ├── llm.py # 流式 LLM 调用
 │ ├── naming.py # 项目命名（LLM 概括 + 启发式回退）
-│ ├── db.py # demo SQLite 封装
+│ ├── auth.py # 密码哈希 / 会话 / 邮箱 token / 限流 / OAuth 辅助
+│ ├── mailer.py # SMTP 验证邮件与重置邮件（未配置时开发模式）
+│ ├── db.py # demo SQLite 封装（users/sessions/email_tokens/projects.user_id）
+│ ├── .env.example # 环境变量模板（LLM / Auth / Google / SMTP）
 │ ├── mocks/ # Mock 演示模板（仅无 Key 时使用：中性占位页 + agents.py 角色回复）
 │ ├── runtime/frontend/ # 共享 React + esbuild 工具链（node_modules 不入库）
 │ └── data/ # sqlite 与生成项目挂载（apps/{id}/backend/data/app.db）
-├── nginx/
+├── nginx/ # HTTP→HTTPS、ACME challenge、API/SSE/预览反代、临时自签名证书
+├── scripts/ # init-letsencrypt.sh / renew-cert.sh
+├── certbot/ # 证书与 ACME webroot（gitignored，运行时生成）
 └── docker-compose.yml
 
 ## 代码规范
@@ -72,28 +85,31 @@ atoms-demo/
 - 后端全 async/await，SSE 用 StreamingResponse
 - 前端用 hooks，不准用 class 组件
 - 每个接口必须有错误处理和超时
-- 不引入未声明的依赖
+- 不引入未声明的依赖（账号/邮件只使用标准库 `hashlib`/`secrets`/`hmac`/`smtplib`）
+- 密码、会话 token、邮件 token 不得明文写库；日志不输出密码或 token；项目 API 必须校验 `user_id`
 - Docker 容器必须设 memory 上限
 
 ## 当前阶段
 
-Phase 4：多智能体交互已对齐 atoms.dev。
-对话按智能体分组（头像 + 名字 + 角色 + 已处理 N 步），支持 `@` 指定 Mike / Bob / Alex；
-构建请求 Mike → Bob/Alex 串行交接，咨询请求多角色并行回答；刷新后按 agent/run_id 重建分组。
+Phase 5：注册登录与用户隔离。
+登录页视觉对齐 atoms.dev，支持邮箱 + 密码、邮箱验证、忘记密码/重置、快捷登录（演示）和真实 Google OAuth；
+项目、生成、SSE、导出、删除、预览入口全部按 `user_id` 隔离；旧 DB 迁移已验证。
 每个项目独立 FastAPI 运行时与 SQLite；预览构建、CORS、LRU 运行时、数据保留均已本地验证。
-下一步：部署到腾讯云服务器（安全组 80、数据卷持久化），整理演示脚本与验收截图。
+下一步：在 `https://hajimi.site` 完成 Let's Encrypt 签发、Google OAuth 与 QQ 邮箱 SMTP 配置，跑一遍验收并整理截图。
 
 ## 硬性验收
 
-1. 打开 IP 能直接用，无需注册登录
-2. 输入需求 → 看到 Agent 执行时间线（消息内联，执行中自动展开）→ 按需生成前端/后端 → iframe 真实预览
-3. 可对话续改，前后端文件按需更新
-4. 刷新页面项目不丢失（demo SQLite 持久化）
-5. 全栈项目的业务数据刷新/重启不丢失（项目自己的 SQLite）
+1. 打开域名先登录；支持快捷登录 / 邮箱密码 / 真实 Google OAuth
+2. 邮箱注册需验证；未配置 SMTP 时开发模式展示验证链接；忘记密码可重置
+3. 用户只能看到自己的项目；越权访问项目、生成、导出、删除与预览入口统一 404
+4. 输入需求 → 看到 Agent 执行时间线（消息内联，执行中自动展开）→ 按需生成前端/后端 → iframe 真实预览
+5. 可对话续改，前后端文件按需更新
+6. 刷新页面项目不丢失（demo SQLite 持久化）
+7. 全栈项目的业务数据刷新/重启不丢失（项目自己的 SQLite）
 
 ## 明确不做
 
-- 不做真实鉴权/多用户
+- 不做团队 / 角色权限 / 多租户；快捷登录是演示功能，生产部署应关闭 `AUTH_DEMO_QUICK_LOGIN`
 - 不做 Stripe 真实支付
 - 不做真正的代码沙箱 / 多租户隔离：生成后端在 demo 容器内以独立进程运行，只有内存上限、localhost 绑定与环境变量裁剪，属于单用户演示边界
 - 不为每个生成项目执行 `npm install` 或完整 Vite 构建（预览用共享 esbuild 工具链）

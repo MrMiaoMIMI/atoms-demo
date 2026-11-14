@@ -1,7 +1,7 @@
 import type { FormEvent, MouseEvent as ReactMouseEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
-import type { Health, ProjectSummary } from '../types';
+import type { AuthUser, Health, ProjectSummary } from '../types';
 import { AgentRail } from './Avatar';
 import HomeSidebar, { CollapsedSidebar } from './HomeSidebar';
 import MentionComposer from './MentionComposer';
@@ -163,10 +163,12 @@ interface HomeProps {
   health: Health | null;
   sidebarProjects: ProjectSummary[];
   sidebarCollapsed: boolean;
+  user: AuthUser;
   onSidebarCollapsed: (collapsed: boolean) => void;
   onStart: (projectId: string, prompt: string) => void;
   onOpen: (projectId: string) => void;
   onBrowseAllProjects: () => void;
+  onLogout: () => void;
 }
 
 type Tab = 'projects' | 'templates';
@@ -185,10 +187,12 @@ export default function Home({
   health,
   sidebarProjects,
   sidebarCollapsed,
+  user,
   onSidebarCollapsed,
   onStart,
   onOpen,
   onBrowseAllProjects,
+  onLogout,
 }: HomeProps) {
   const [prompt, setPrompt] = useState('');
   const [creating, setCreating] = useState(false);
@@ -303,6 +307,7 @@ export default function Home({
         <CollapsedSidebar
           health={health}
           section="home"
+          user={user}
           onHome={goHomeContent}
           onProjects={onBrowseAllProjects}
           onExpand={() => onSidebarCollapsed(false)}
@@ -311,10 +316,12 @@ export default function Home({
         <HomeSidebar
           projects={sidebarProjects}
           section="home"
+          user={user}
           onHome={goHomeContent}
           onProjects={onBrowseAllProjects}
           onOpenProject={onOpen}
           onCollapse={() => onSidebarCollapsed(true)}
+          onLogout={onLogout}
         />
       )}
 
@@ -369,7 +376,7 @@ export default function Home({
             <span className="inline-flex h-8 items-center gap-2 rounded-full bg-line-4 px-4 text-[14px] text-ink-55">
               本地演示
               <span className="text-ink-30">·</span>
-              无需登录
+              已登录
             </span>
 
             <AgentRail size={46} className="mt-7" />
