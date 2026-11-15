@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     filename    TEXT NOT NULL,
     content     TEXT NOT NULL,
     version     INTEGER NOT NULL,
+    deleted     INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id, filename, version);
@@ -99,9 +100,30 @@ CREATE TABLE IF NOT EXISTS executions (
     status      TEXT NOT NULL,
     log         TEXT,
     run_id      TEXT,
+    tool        TEXT,
+    target      TEXT,
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_executions_project ON executions(project_id, id);
+
+CREATE TABLE IF NOT EXISTS file_changes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id   TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    run_id       TEXT,
+    agent        TEXT,
+    execution_id INTEGER,
+    filename     TEXT NOT NULL,
+    change_type  TEXT NOT NULL,
+    diff         TEXT NOT NULL DEFAULT '',
+    additions    INTEGER NOT NULL DEFAULT 0,
+    deletions    INTEGER NOT NULL DEFAULT 0,
+    rolled_back  INTEGER NOT NULL DEFAULT 0,
+    truncated    INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_changes_project ON file_changes(project_id, id);
+CREATE INDEX IF NOT EXISTS idx_file_changes_exec ON file_changes(project_id, execution_id);
 """
 
 
@@ -124,7 +146,8 @@ async def _migrate(conn) -> None:
     """Add agent/run_id columns to databases created before the agent UI."""
     migrations = {
         "conversations": {"agent": "TEXT", "run_id": "TEXT", "run_index": "INTEGER"},
-        "executions": {"run_id": "TEXT"},
+        "executions": {"run_id": "TEXT", "tool": "TEXT", "target": "TEXT"},
+        "artifacts": {"deleted": "INTEGER NOT NULL DEFAULT 0"},
         "projects": {
             "user_id": "TEXT",
             "built_version": "INTEGER",
@@ -445,10 +468,33 @@ async def list_projects(user_id: str | None = None) -> list[dict]:
                    p.description, p.category, p.view_count,
                    p.cover_version, p.cover_at, p.build_cover_version, p.build_cover_at,
                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS message_count,
-                   (SELECT COUNT(DISTINCT filename) FROM artifacts a WHERE a.project_id = p.id) AS artifact_count,
+                   (
+                       SELECT COUNT(*) FROM artifacts a
+                       JOIN (
+                           SELECT filename, MAX(version) AS v FROM artifacts
+                           WHERE project_id = p.id GROUP BY filename
+                       ) m ON a.filename = m.filename AND a.version = m.v
+                       WHERE a.project_id = p.id AND a.deleted = 0
+                   ) AS artifact_count,
                    (SELECT MAX(a.version) FROM artifacts a WHERE a.project_id = p.id) AS latest_version,
-                   EXISTS(SELECT 1 FROM artifacts a WHERE a.project_id = p.id AND a.filename LIKE 'frontend/%') AS has_frontend,
-                   EXISTS(SELECT 1 FROM artifacts a WHERE a.project_id = p.id AND a.filename LIKE 'backend/%') AS has_backend
+                   EXISTS(
+                       SELECT 1 FROM artifacts a
+                       JOIN (
+                           SELECT filename, MAX(version) AS v FROM artifacts
+                           WHERE project_id = p.id GROUP BY filename
+                       ) m ON a.filename = m.filename AND a.version = m.v
+                       WHERE a.project_id = p.id AND a.deleted = 0
+                         AND a.filename LIKE 'frontend/%'
+                   ) AS has_frontend,
+                   EXISTS(
+                       SELECT 1 FROM artifacts a
+                       JOIN (
+                           SELECT filename, MAX(version) AS v FROM artifacts
+                           WHERE project_id = p.id GROUP BY filename
+                       ) m ON a.filename = m.filename AND a.version = m.v
+                       WHERE a.project_id = p.id AND a.deleted = 0
+                         AND a.filename LIKE 'backend/%'
+                   ) AS has_backend
             FROM projects p
             {where}
             ORDER BY p.created_at DESC
@@ -668,9 +714,17 @@ async def first_user_message(pid: str) -> str:
 async def latest_artifact_names(pid: str) -> list[str]:
     async with _connect() as conn:
         async with conn.execute(
-            "SELECT DISTINCT filename FROM artifacts "
-            "WHERE project_id = ? ORDER BY filename LIMIT 80",
-            (pid,),
+            """
+            SELECT a.filename FROM artifacts a
+            JOIN (
+                SELECT filename, MAX(version) AS v
+                FROM artifacts WHERE project_id = ?
+                GROUP BY filename
+            ) m ON a.filename = m.filename AND a.version = m.v
+            WHERE a.project_id = ? AND a.deleted = 0
+            ORDER BY a.filename LIMIT 80
+            """,
+            (pid, pid),
         ) as cur:
             return [str(row[0]) for row in await cur.fetchall()]
 
@@ -694,14 +748,24 @@ async def get_state(pid: str) -> dict | None:
                 FROM artifacts WHERE project_id = ?
                 GROUP BY filename
             ) m ON a.filename = m.filename AND a.version = m.v
-            WHERE a.project_id = ?
+            WHERE a.project_id = ? AND a.deleted = 0
             ORDER BY a.filename
             """,
             (pid, pid),
         ) as cur:
             artifacts = [dict(r) for r in await cur.fetchall()]
         async with conn.execute(
-            "SELECT id, agent, step, status, log, run_id, created_at FROM executions WHERE project_id = ? ORDER BY id",
+            """
+            SELECT e.id, e.agent, e.step, e.status, e.log, e.run_id,
+                   e.tool, e.target, e.created_at,
+                   (
+                       SELECT COUNT(*) FROM file_changes c
+                       WHERE c.execution_id = e.id
+                   ) AS change_count
+            FROM executions e
+            WHERE e.project_id = ?
+            ORDER BY e.id
+            """,
             (pid,),
         ) as cur:
             executions = [dict(r) for r in await cur.fetchall()]
@@ -720,7 +784,7 @@ async def latest_artifacts(pid: str) -> dict[str, str]:
             SELECT a.filename, a.content FROM artifacts a
             JOIN (SELECT filename, MAX(version) AS v FROM artifacts WHERE project_id = ? GROUP BY filename) m
               ON a.filename = m.filename AND a.version = m.v
-            WHERE a.project_id = ?
+            WHERE a.project_id = ? AND a.deleted = 0
             """,
             (pid, pid),
         ) as cur:
@@ -762,18 +826,37 @@ async def recent_conversations(pid: str, limit: int = 8) -> list[dict]:
             return [dict(r) for r in reversed(await cur.fetchall())]
 
 
-async def add_artifact(pid: str, filename: str, content: str, version: int) -> None:
-    """Replace-then-insert: a repair pass may rewrite a file within one round."""
+async def add_artifact(
+    pid: str,
+    filename: str,
+    content: str,
+    version: int,
+    deleted: bool = False,
+) -> None:
+    """Replace-then-insert: a repair pass may rewrite a file within one round.
+
+    Deletions are stored as tombstones (``deleted=1``) so the latest-version
+    queries can hide the file while older versions remain available for diffs
+    and rollback.
+    """
     async with _connect() as conn:
         await conn.execute(
             "DELETE FROM artifacts WHERE project_id = ? AND filename = ? AND version = ?",
             (pid, filename, version),
         )
         await conn.execute(
-            "INSERT INTO artifacts (project_id, filename, content, version, created_at) VALUES (?, ?, ?, ?, ?)",
-            (pid, filename, content, version, now()),
+            """
+            INSERT INTO artifacts
+                (project_id, filename, content, version, deleted, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (pid, filename, content, version, 1 if deleted else 0, now()),
         )
         await conn.commit()
+
+
+async def add_artifact_deleted(pid: str, filename: str, version: int) -> None:
+    await add_artifact(pid, filename, "", version, deleted=True)
 
 
 async def add_execution(
@@ -783,11 +866,17 @@ async def add_execution(
     status: str,
     log: str,
     run_id: str | None = None,
+    tool: str | None = None,
+    target: str | None = None,
 ) -> int:
     async with _connect() as conn:
         cur = await conn.execute(
-            "INSERT INTO executions (project_id, agent, step, status, log, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (pid, agent, step, status, log, run_id, now()),
+            """
+            INSERT INTO executions
+                (project_id, agent, step, status, log, run_id, tool, target, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (pid, agent, step, status, log, run_id, tool, target, now()),
         )
         await conn.commit()
         return int(cur.lastrowid)
@@ -798,6 +887,112 @@ async def update_execution(exec_id: int, status: str, log: str | None) -> None:
         await conn.execute(
             "UPDATE executions SET status = ?, log = COALESCE(?, log) WHERE id = ?",
             (status, log, exec_id),
+        )
+        await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# File changes (per-tool diff history + rollback bookkeeping)
+# ---------------------------------------------------------------------------
+
+
+async def add_file_change(
+    pid: str,
+    *,
+    version: int,
+    filename: str,
+    change_type: str,
+    diff: str,
+    additions: int = 0,
+    deletions: int = 0,
+    run_id: str | None = None,
+    agent: str | None = None,
+    execution_id: int | None = None,
+    rolled_back: bool = False,
+    truncated: bool = False,
+) -> int:
+    async with _connect() as conn:
+        cur = await conn.execute(
+            """
+            INSERT INTO file_changes
+                (project_id, version, run_id, agent, execution_id, filename,
+                 change_type, diff, additions, deletions, rolled_back, truncated,
+                 created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                pid,
+                version,
+                run_id,
+                agent,
+                execution_id,
+                filename,
+                change_type,
+                diff,
+                additions,
+                deletions,
+                1 if rolled_back else 0,
+                1 if truncated else 0,
+                now(),
+            ),
+        )
+        await conn.commit()
+        return int(cur.lastrowid)
+
+
+async def get_file_change(pid: str, change_id: int) -> dict | None:
+    async with _connect() as conn:
+        async with conn.execute(
+            "SELECT * FROM file_changes WHERE project_id = ? AND id = ?",
+            (pid, change_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def list_file_changes(
+    pid: str,
+    *,
+    execution_id: int | None = None,
+    run_id: str | None = None,
+    version: int | None = None,
+    include_rolled_back: bool = True,
+) -> list[dict]:
+    sql = "SELECT * FROM file_changes WHERE project_id = ?"
+    params: list[object] = [pid]
+    if execution_id is not None:
+        sql += " AND execution_id = ?"
+        params.append(execution_id)
+    if run_id is not None:
+        sql += " AND run_id = ?"
+        params.append(run_id)
+    if version is not None:
+        sql += " AND version = ?"
+        params.append(version)
+    if not include_rolled_back:
+        sql += " AND rolled_back = 0"
+    sql += " ORDER BY id"
+    async with _connect() as conn:
+        async with conn.execute(sql, params) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_file_changes_rolled_back(pid: str, version: int) -> None:
+    """Keep failed-round diffs visible in the timeline, but mark them as rolled back."""
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE file_changes SET rolled_back = 1 "
+            "WHERE project_id = ? AND version = ?",
+            (pid, version),
+        )
+        await conn.commit()
+
+
+async def delete_file_changes_version(pid: str, version: int) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "DELETE FROM file_changes WHERE project_id = ? AND version = ?",
+            (pid, version),
         )
         await conn.commit()
 
@@ -849,6 +1044,7 @@ async def delete_project(pid: str) -> None:
             "conversations",
             "artifacts",
             "executions",
+            "file_changes",
             "project_saves",
             "projects",
         ):

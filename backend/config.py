@@ -59,6 +59,24 @@ TITLE_TIMEOUT = float(os.getenv("TITLE_TIMEOUT", "12"))
 LLM_MODE = "deepseek" if LLM_API_KEY else "mock"
 AUTO_REPAIR = os.getenv("AUTO_REPAIR", "1") != "0"
 
+# ---------------------------------------------------------------------------
+# Agent tool loop
+# ---------------------------------------------------------------------------
+# The unified build/iteration path uses native function calling. The legacy
+# per-file generator remains available for providers without tool support.
+AGENT_TOOL_LOOP = os.getenv("AGENT_TOOL_LOOP", "1") != "0"
+AGENT_MAX_STEPS_FIRST_BUILD = max(20, int(os.getenv("AGENT_MAX_STEPS_FIRST_BUILD", "96")))
+AGENT_MAX_STEPS_ITERATION = max(12, int(os.getenv("AGENT_MAX_STEPS_ITERATION", "64")))
+AGENT_MAX_SECONDS_FIRST_BUILD = float(os.getenv("AGENT_MAX_SECONDS_FIRST_BUILD", "1200"))
+AGENT_MAX_SECONDS_ITERATION = float(os.getenv("AGENT_MAX_SECONDS_ITERATION", "600"))
+AGENT_MAX_TOOL_CALLS = max(20, int(os.getenv("AGENT_MAX_TOOL_CALLS", "320")))
+AGENT_MAX_TOOL_CALLS_PER_STEP = max(1, int(os.getenv("AGENT_MAX_TOOL_CALLS_PER_STEP", "8")))
+AGENT_MAX_NO_PROGRESS_STEPS = max(2, int(os.getenv("AGENT_MAX_NO_PROGRESS_STEPS", "5")))
+AGENT_REPAIR_MAX_ROUNDS = max(0, int(os.getenv("AGENT_REPAIR_MAX_ROUNDS", "2")))
+# Inline the whole source tree when it is small; otherwise use tools for reads.
+AGENT_CONTEXT_INLINE_CHARS = max(0, int(os.getenv("AGENT_CONTEXT_INLINE_CHARS", "40000")))
+AGENT_CONTEXT_FILE_CHARS = max(0, int(os.getenv("AGENT_CONTEXT_FILE_CHARS", "12000")))
+
 # Generated app runtime (each project backend is a dedicated uvicorn process).
 MAX_RUNNING_APPS = max(1, int(os.getenv("MAX_RUNNING_APPS", "2")))
 GENERATED_APP_MEMORY_MB = max(0, int(os.getenv("GENERATED_APP_MEMORY_MB", "256")))

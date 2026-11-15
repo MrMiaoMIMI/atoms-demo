@@ -29,6 +29,47 @@ export interface Execution {
   log: string;
   run_id?: string | null;
   created_at?: string;
+  tool?: string | null;
+  target?: string | null;
+  change_id?: number | null;
+  change_count?: number | null;
+}
+
+export type ChangeType = "created" | "modified" | "deleted";
+
+export interface FileChange {
+  id: number;
+  project_id?: string;
+  version: number;
+  run_id?: string | null;
+  agent?: string | null;
+  execution_id?: number | null;
+  filename: string;
+  change_type: ChangeType;
+  diff: string;
+  additions: number;
+  deletions: number;
+  rolled_back?: number;
+  truncated?: number;
+  created_at?: string;
+}
+
+export interface ChangeFile {
+  filename: string;
+  change_type: ChangeType;
+  additions: number;
+  deletions: number;
+  diff: string;
+  truncated: boolean;
+}
+
+export interface ChangesResponse {
+  published_version: number | null;
+  current_version: number;
+  has_published: boolean;
+  baseline_ok: boolean;
+  files: ChangeFile[];
+  summary: { created: number; modified: number; deleted: number };
 }
 
 export interface AuthUser {

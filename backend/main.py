@@ -34,6 +34,7 @@ import auth
 import categories
 import config
 import db
+import diffing
 import mailer
 import naming
 import publisher
@@ -713,6 +714,84 @@ async def get_project(pid: str, user: dict = Depends(auth.current_user)) -> dict
     return _decorate_state(state)
 
 
+@app.get("/api/projects/{pid}/changes")
+async def get_project_changes(
+    pid: str,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Published-baseline vs current artifacts, for the code panel's diff view."""
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    current = await db.latest_artifacts(pid)
+    current_version = max(0, await db.next_version(pid) - 1)
+    published_version = project.get("published_version")
+    has_published = published_version is not None
+    baseline = publisher.read_source(pid)
+    baseline_ok = baseline is not None
+
+    if not has_published:
+        # A draft has no released baseline; every current file is an addition.
+        changes = diffing.diff_trees({}, current)
+    elif baseline_ok:
+        published = {
+            str(name): str(content)
+            for name, content in (baseline.get("files") or {}).items()
+        }
+        changes = diffing.diff_trees(published, current)
+    else:
+        # Published before the baseline feature existed (or the snapshot was
+        # damaged): report the missing baseline instead of inventing a diff.
+        changes = []
+
+    files = [
+        {
+            "filename": change.path,
+            "change_type": change.change_type,
+            "additions": change.diff.additions,
+            "deletions": change.diff.deletions,
+            "diff": change.diff.diff,
+            "truncated": change.diff.truncated,
+        }
+        for change in changes
+    ]
+    return {
+        "published_version": published_version,
+        "current_version": current_version,
+        "has_published": has_published,
+        "baseline_ok": baseline_ok,
+        "files": files,
+        "summary": diffing.summarize(changes),
+    }
+
+
+@app.get("/api/projects/{pid}/changes/{change_id}")
+async def get_project_change(
+    pid: str,
+    change_id: int,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    if not await db.get_project_for_user(pid, user["id"]):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    row = await db.get_file_change(pid, change_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="变更记录不存在")
+    return row
+
+
+@app.get("/api/projects/{pid}/executions/{execution_id}/changes")
+async def get_execution_changes(
+    pid: str,
+    execution_id: int,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    if not await db.get_project_for_user(pid, user["id"]):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    rows = await db.list_file_changes(pid, execution_id=execution_id)
+    return {"changes": rows}
+
+
 @app.post("/api/projects/{pid}/publish")
 async def publish_project(
     pid: str,
@@ -758,8 +837,14 @@ async def publish_project(
         # The published process must not keep the old tree open while it is
         # swapped; it restarts lazily on the next visitor request.
         await runtime.runtime.stop(pid, published=True)
+        source = await db.latest_artifacts(pid)
         manifest = await asyncio.to_thread(
-            publisher.snapshot, pid, int(built), mode, project["name"]
+            publisher.snapshot,
+            pid,
+            int(built),
+            mode,
+            project["name"],
+            source,
         )
         await db.mark_published(pid, int(built))
         if body is not None:
@@ -1218,6 +1303,8 @@ async def generate(
                                 payload["status"],
                                 payload.get("log") or "",
                                 payload.get("run_id"),
+                                payload.get("tool"),
+                                payload.get("target"),
                             ),
                         }
                 elif event == "message":

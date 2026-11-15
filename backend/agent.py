@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 import uuid
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
@@ -26,13 +27,14 @@ import runtime
 import scaffold
 from llm import MockLLM, get_llm
 from mocks import templates
-from tools import Toolbox, ToolContext
+from tool_loop import LoopResult, ToolLoopError, run_tool_loop
+from tools import Toolbox, ToolContext, check_health as check_runtime_health, record_change
+from workspace import Workspace
 
 Emit = Callable[[str, dict], Awaitable[Any]]
 
 PLANNER_SYSTEM = """你是 "Planner" Agent，负责把用户的自然语言需求拆解为一个可运行的 Web 项目。
 只输出 JSON，不要 markdown 代码围栏，不要任何解释。
-
 JSON 结构：
 {
   "summary": "一句话说明要做什么",
@@ -70,6 +72,14 @@ JSON 结构：
 7. 用户是在续改已有项目时，列出所有需要新增或修改的文件；不要重复列出不需要改的文件。
 8. 如果已有项目是 fullstack，除非用户明确要求去掉后端，否则继续保持 fullstack。
 """
+
+BOB_TOOL_SYSTEM = (
+    "你是 Bob，架构师。你可以使用只读工具查看现有项目，但绝不能修改文件。\n"
+    "在给出方案前，先用 list_files / read_file / grep 确认现有文件、数据模型和 API；"
+    "不要凭文件名猜测。\n"
+    "最终答复必须只输出一个 JSON 对象，不要 markdown 围栏、不要解释、"
+    "不要在 JSON 前后写文字。\n\n" + PLANNER_SYSTEM
+)
 
 FRONTEND_SYSTEM = """你是 "Coder" Agent，负责写出一个 React + TypeScript 文件的完整内容。
 只输出文件内容本身：不要 markdown 代码围栏，不要任何解释、标题或前后缀。
@@ -852,7 +862,7 @@ class RoleEmitter:
             data["agent"] = self.agent
             data["run_id"] = self.run_id
             data["run_index"] = self.index
-        elif event in {"artifact", "file_start", "token", "token_reset"}:
+        elif event in {"artifact", "file_change", "file_start", "token", "token_reset"}:
             data.setdefault("run_id", self.run_id)
             data.setdefault("agent", self.agent)
         return await self.base_emit(event, data)
@@ -1049,8 +1059,67 @@ async def _call_planner(
         + f"当前形态：{existing_mode or '（空项目）'}\n\n"
         + "输出 JSON。"
     )
+    llm = get_llm()
+
+    # Bob gets a short read-only loop only when there is an existing project to
+    # inspect. New projects have nothing to read, and Mock mode uses the
+    # deterministic single-shot planner.
+    if config.AGENT_TOOL_LOOP and existing and not isinstance(llm, MockLLM):
+        ctx = ToolContext(
+            pid=emit.pid,
+            run_id=emit.run_id,
+            agent="bob",
+            emit=emit,
+            version=emit.version,
+        )
+        toolbox = Toolbox(ctx, agent_roster.AGENTS["bob"].tools)
+        try:
+            result = await run_tool_loop(
+                llm=llm,
+                toolbox=toolbox,
+                system=BOB_TOOL_SYSTEM,
+                user=(
+                    planner_user
+                    + "\n\n你可以先用只读工具查看项目文件，确认结构与 API；"
+                    "最终只输出 JSON。"
+                ),
+                meta={
+                    "prompt": message,
+                    "existing": existing,
+                    "existing_mode": existing_mode,
+                    "role": "bob",
+                },
+                emit=emit,
+                max_steps=6,
+                timeout_seconds=180.0,
+                max_tool_calls=24,
+                max_tool_calls_per_step=4,
+                no_progress_limit=6,
+            )
+            if _planner_text_valid(result.text):
+                return _plan_from_text(
+                    result.text, message, existing, existing_mode, project_name
+                )
+            await emit(
+                "execution",
+                {
+                    "step": "读取项目上下文",
+                    "status": "warning",
+                    "log": "Bob 的工具循环没有输出合法 JSON，回退到一次性规划",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - planning must fall back, not fail
+            await emit(
+                "execution",
+                {
+                    "step": "读取项目上下文",
+                    "status": "warning",
+                    "log": f"{type(exc).__name__}: {str(exc)[:160]}",
+                },
+            )
+
     plan_text = await _llm_text(
-        get_llm(),
+        llm,
         role="planner",
         system=PLANNER_SYSTEM,
         user=planner_user,
@@ -1284,6 +1353,9 @@ async def _rollback_round(
         if had_published:
             await toolbox.call("publish_files", files=previous)
             title = _existing_title(previous) or project_name
+            # Drop any preview written by the failed round before restoring the
+            # previous one; a failed rebuild must not leave the failed preview.
+            shutil.rmtree(config.APPS_DIR / pid / ".preview", ignore_errors=True)
             try:
                 if any(path.startswith("frontend/") for path in previous):
                     await frontend_builder.build(pid, title)
@@ -1313,10 +1385,20 @@ async def _rollback_round(
                             "log": f"{type(exc).__name__}: {str(exc)[:140]}",
                         },
                     )
+            else:
+                # publish_files already stopped the runtime; a project with no
+                # previous backend must not leave a runtime from the failed round.
+                await runtime.runtime.stop(pid)
     except Exception as exc:  # noqa: BLE001 - rollback must not mask the cause
         restore_error = exc
     try:
         await db.delete_artifacts_version(pid, version)
+    except Exception as exc:  # noqa: BLE001
+        restore_error = restore_error or exc
+    try:
+        # Keep the attempted diffs visible in the timeline, but mark them so the
+        # UI can say "本轮已回滚" and aggregate queries ignore them.
+        await db.mark_file_changes_rolled_back(pid, version)
     except Exception as exc:  # noqa: BLE001
         restore_error = restore_error or exc
     if restore_error is not None:
@@ -1341,6 +1423,9 @@ async def _rollback_round(
                 ),
             },
         )
+    # Tell the UI to drop in-flight file_change state and refetch the aggregate
+    # diff; the per-step rows remain queryable with rolled_back=1.
+    await emit("changes_reset", {"version": version})
 
 
 def _build_error_path(error: str, published: dict[str, str]) -> str | None:
@@ -1542,7 +1627,667 @@ async def _guard_large_files(
             contents.update(files)
 
 
+# ---------------------------------------------------------------------------
+# Unified tool-loop build (first build + iteration)
+# ---------------------------------------------------------------------------
+
+ALEX_TOOL_SYSTEM = """你是 Alex，团队的工程师。你通过工具读写项目文件，并负责构建和运行验证。
+工具使用规则：
+1. 修改已有文件前先 read_file；优先 edit_file（精确匹配）。write_file 只用于新建文件，或显式 overwrite=true 的整文件重写。
+2. 只操作项目内的源码路径；不要碰 .published、.preview、backend/data、node_modules、.runtime.log。
+3. 新项目工作区只有确定性脚手架：前端必须创建 frontend/src/App.tsx（export default function App()）和 frontend/src/styles.css；全栈/后端必须创建 backend/main.py。
+4. 如果项目形态升级（例如新增后端），请创建缺失侧的最小必需文件。
+5. 前端只 import react / react-dom 和本轮规划中的本地文件；禁止第三方库；不要 import CSS（styles.css 由 main.tsx 引入）。
+6. 全栈项目前端所有请求使用相对路径 "api/..."，不要以 / 开头；禁止 localStorage/sessionStorage。
+7. 后端只允许 fastapi、pydantic、aiosqlite 和标准库；必须 from db import connection, init_db；lifespan 中 await init_db()；app = FastAPI(root_path=os.getenv("APP_ROOT_PATH",""), lifespan=lifespan)；CORS 全开；至少实现 GET /api/health。
+8. 单个文件尽量控制在 8,000 字符以内；结构完整闭合，不要写到一半停止。
+9. 改完代码后调用 build_preview；后端项目还要 start_runtime 并 check_health。构建/启动失败时先 read_file 看真实错误，再用 edit_file 精准修复，不要整文件瞎改。
+10. 保持现有 UI、文案、交互与数据；不要重写与本次需求无关的文件。
+11. 完成时用中文简短总结：修改了哪些文件、是否构建/启动成功。不要声称成功但没有跑 build。
+"""
+
+
+def _schema_changed(plan: dict, existing: dict[str, str]) -> bool:
+    if plan["mode"] not in ("backend", "fullstack"):
+        return False
+    return existing.get("backend/schema.sql") != scaffold.schema_sql(plan["entities"])
+
+
+def _tool_budget(
+    plan: dict,
+    *,
+    first_build: bool,
+    schema_changed: bool,
+) -> tuple[int, float, int]:
+    planned = max(1, len(plan.get("files") or []))
+    if first_build:
+        steps = min(
+            config.AGENT_MAX_STEPS_FIRST_BUILD,
+            max(40, 12 + 6 * planned),
+        )
+        seconds = config.AGENT_MAX_SECONDS_FIRST_BUILD
+    else:
+        steps = min(
+            config.AGENT_MAX_STEPS_ITERATION,
+            max(24, 12 + 4 * planned),
+        )
+        if schema_changed:
+            steps = min(config.AGENT_MAX_STEPS_ITERATION, steps + 6)
+        seconds = config.AGENT_MAX_SECONDS_ITERATION
+    max_calls = min(config.AGENT_MAX_TOOL_CALLS, 6 * steps)
+    return steps, seconds, max_calls
+
+
+def _workspace_context(workspace: Workspace, plan: dict) -> str:
+    files = workspace.files
+    tree = "\n".join(
+        f"- {path} ({len(content.encode('utf-8')):,} 字节)"
+        for path, content in sorted(files.items())
+    )
+    blocks = [f"当前文件树（{len(files)} 个）：\n{tree or '（空）'}"]
+
+    targets = [item["path"] for item in plan.get("files") or []]
+    preferred: list[str] = []
+    for path in [
+        "frontend/src/App.tsx",
+        "frontend/src/styles.css",
+        "backend/main.py",
+        *targets,
+    ]:
+        if path in files and path not in preferred:
+            preferred.append(path)
+    total_size = sum(len(content) for content in files.values())
+    if total_size <= config.AGENT_CONTEXT_INLINE_CHARS:
+        include = sorted(files)
+    else:
+        include = preferred
+    chunks: list[str] = []
+    used = 0
+    for path in include:
+        content = files[path]
+        cap = config.AGENT_CONTEXT_FILE_CHARS
+        if cap and len(content) > cap:
+            content = content[:cap] + "\n/* ... 内容已截断，请 read_file 查看完整文件 ... */"
+        if (
+            chunks
+            and used + len(content) > config.AGENT_CONTEXT_INLINE_CHARS
+        ):
+            break
+        chunks.append(f"--- {path} ---\n{content}")
+        used += len(content)
+    if chunks:
+        blocks.append(
+            f"已有文件内容（共 {len(include)} 个候选，已注入 {len(chunks)} 个；"
+            "需要更多请 read_file）：\n" + "\n\n".join(chunks)
+        )
+    return "\n\n".join(blocks)
+
+
+def _alex_tool_user(
+    plan: dict,
+    message: str,
+    workspace: Workspace,
+    *,
+    first_build: bool,
+    bob_text: str = "",
+) -> str:
+    blocks = [
+        f"用户需求：\n{message}",
+        f"项目概述：{plan['summary']}",
+        f"项目形态：{plan['mode']}（title: {plan['title']}）",
+        "Planner 建议文件："
+        + ("、".join(item["path"] for item in plan["files"]) or "（未指定）"),
+        _contract(plan),
+    ]
+    if first_build:
+        blocks.append(
+            "这是一个新项目：工作区只有确定性脚手架。"
+            "请先用 write_file 创建最小必需文件，再实现完整需求。"
+        )
+    else:
+        blocks.append(
+            "这是对已有项目的迭代：先 read_file 看相关文件，"
+            "优先 edit_file 精准修改；不要全量重写无关文件。"
+        )
+    if bob_text:
+        blocks.append(f"Bob 的建筑方案：\n{bob_text}")
+    blocks.append(_workspace_context(workspace, plan))
+    return "\n\n".join(blocks)
+
+
+async def _seed_scaffold(
+    ctx: ToolContext,
+    workspace: Workspace,
+    plan: dict,
+    emit: RoleEmitter,
+) -> int:
+    scaffold_files = _scaffold_files(plan, workspace.base)
+    writes: dict[str, str] = {}
+    for path, content in scaffold_files.items():
+        if path == "backend/schema.sql":
+            if workspace.base.get(path) != content:
+                writes[path] = content
+        elif path not in workspace.base:
+            writes[path] = content
+    if not writes:
+        return 0
+
+    step = await emit(
+        "execution",
+        {
+            "step": "生成项目脚手架",
+            "status": "running",
+            "log": f"{len(writes)} 个确定性基础文件",
+        },
+    )
+    ctx.execution_id = step if isinstance(step, int) else None
+    for path, content in writes.items():
+        change = workspace.write(
+            path,
+            content,
+            overwrite=path in workspace.base,
+        )
+        if change is None:
+            continue
+        await db.add_artifact(ctx.pid, path, content, ctx.version)
+        await record_change(ctx, change)
+        await emit(
+            "artifact",
+            {
+                "filename": path,
+                "content": content,
+                "version": ctx.version,
+                "run_id": ctx.run_id,
+            },
+        )
+    await emit(
+        "execution",
+        {
+            "id": step,
+            "step": "生成项目脚手架",
+            "status": "success",
+            "log": f"{len(writes)} 个基础文件",
+            "change_count": len(writes),
+        },
+    )
+    return len(writes)
+
+
+async def _repair_with_tools(
+    *,
+    llm,
+    toolbox: Toolbox,
+    loop_result: LoopResult,
+    instruction: str,
+    plan: dict,
+    message: str,
+    emit: RoleEmitter,
+    max_steps: int = 12,
+    timeout_seconds: float = 300.0,
+) -> LoopResult:
+    meta = {
+        "prompt": message,
+        "mode": plan["mode"],
+        "title": plan["title"],
+        "existing": toolbox.ctx.workspace.files if toolbox.ctx.workspace else {},
+        "iteration": True,
+    }
+    return await run_tool_loop(
+        llm=llm,
+        toolbox=toolbox,
+        initial_messages=list(loop_result.messages)
+        + [{"role": "user", "content": instruction}],
+        meta=meta,
+        emit=emit,
+        max_steps=max_steps,
+        timeout_seconds=timeout_seconds,
+        max_tool_calls=min(config.AGENT_MAX_TOOL_CALLS, 8 * max_steps),
+        max_tool_calls_per_step=config.AGENT_MAX_TOOL_CALLS_PER_STEP,
+        no_progress_limit=config.AGENT_MAX_NO_PROGRESS_STEPS,
+    )
+
+
+async def _review_with_tools(
+    *,
+    llm,
+    toolbox: Toolbox,
+    loop_result: LoopResult,
+    plan: dict,
+    message: str,
+    emit: RoleEmitter,
+) -> tuple[LoopResult, list[str]]:
+    workspace = toolbox.ctx.workspace
+    assert workspace is not None
+    issues = _review(workspace.files, plan["mode"])
+    if not issues:
+        await emit(
+            "execution",
+            {
+                "step": "结构与联调检查",
+                "status": "success",
+                "log": f"{len(workspace.files)} 个文件通过检查",
+            },
+        )
+        return loop_result, issues
+    if not config.AUTO_REPAIR:
+        await emit(
+            "execution",
+            {
+                "step": "结构与联调检查",
+                "status": "warning",
+                "log": "；".join(issues)[:180],
+            },
+        )
+        return loop_result, issues
+
+    check = await emit(
+        "execution",
+        {
+            "step": "结构与联调检查",
+            "status": "running",
+            "log": "；".join(issues)[:180],
+        },
+    )
+    for round_index in range(config.AGENT_REPAIR_MAX_ROUNDS):
+        if not issues:
+            break
+        instruction = (
+            f"Reviewer 发现以下问题（第 {round_index + 1} 轮自动回修）：\n- "
+            + "\n- ".join(issues)
+            + "\n请用工具精准修复，不要重写无关文件；修复后如可构建请调用 build_preview。"
+        )
+        loop_result = await _repair_with_tools(
+            llm=llm,
+            toolbox=toolbox,
+            loop_result=loop_result,
+            instruction=instruction,
+            plan=plan,
+            message=message,
+            emit=emit,
+        )
+        issues = _review(workspace.files, plan["mode"])
+    await emit(
+        "execution",
+        {
+            "id": check,
+            "step": "结构与联调检查",
+            "status": "success" if not issues else "warning",
+            "log": (
+                "自动回修后仍有问题：" + "；".join(issues)[:160]
+                if issues
+                else "检查通过（已自动回修）"
+            ),
+        },
+    )
+    return loop_result, issues
+
+
+async def _apply_and_build(
+    pid: str,
+    workspace: Workspace,
+    plan: dict,
+    emit: RoleEmitter,
+    ctx: ToolContext,
+    *,
+    stop_backend: bool,
+) -> tuple[bool, str]:
+    if stop_backend:
+        await runtime.runtime.stop(pid)
+    try:
+        stats = await asyncio.to_thread(
+            workspace.apply_to,
+            config.APPS_DIR / pid,
+            reconcile_source=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - path/runtime errors become repair input
+        return False, f"写入项目文件失败：{type(exc).__name__}: {exc}"
+    await emit(
+        "execution",
+        {
+            "step": "写入项目文件",
+            "status": "success",
+            "log": f"写入 {stats['written']} 个，删除 {stats['removed']} 个",
+        },
+    )
+
+    if plan["mode"] in ("frontend", "fullstack"):
+        build = await emit(
+            "execution",
+            {
+                "step": "构建前端预览",
+                "status": "running",
+                "log": "esbuild 打包 React + TypeScript…",
+            },
+        )
+        try:
+            built = await frontend_builder.build(pid, plan["title"])
+        except Exception as exc:  # noqa: BLE001 - build errors are repair input
+            text = str(exc) if isinstance(exc, frontend_builder.BuildError) else (
+                f"{type(exc).__name__}: {exc}"
+            )
+            await emit(
+                "execution",
+                {
+                    "id": build,
+                    "step": "构建前端预览",
+                    "status": "error",
+                    "log": text.replace("\n", " ")[:180],
+                },
+            )
+            return False, text
+        if built is False:
+            text = "前端入口 frontend/src/main.tsx 不存在，无法构建预览"
+            await emit(
+                "execution",
+                {
+                    "id": build,
+                    "step": "构建前端预览",
+                    "status": "error",
+                    "log": text,
+                },
+            )
+            return False, text
+        await emit(
+            "execution",
+            {
+                "id": build,
+                "step": "构建前端预览",
+                "status": "success",
+                "log": "预览产物已生成",
+            },
+        )
+
+    if plan["mode"] in ("backend", "fullstack"):
+        start = await emit(
+            "execution",
+            {
+                "step": "启动后端运行时",
+                "status": "running",
+                "log": "独立 uvicorn 进程 · SQLite 跟随项目",
+            },
+        )
+        try:
+            port = await runtime.runtime.ensure(pid)
+            await check_runtime_health(ctx, port)
+        except Exception as exc:  # noqa: BLE001 - runtime errors are repair input
+            text = f"{type(exc).__name__}: {exc}"
+            await emit(
+                "execution",
+                {
+                    "id": start,
+                    "step": "启动后端运行时",
+                    "status": "error",
+                    "log": text[:180],
+                },
+            )
+            return False, text
+        await emit(
+            "execution",
+            {
+                "id": start,
+                "step": "启动后端运行时",
+                "status": "success",
+                "log": f"运行时已就绪：/apps/{pid}/api/*",
+            },
+        )
+    return True, ""
+
+
+async def _build_project_tools(
+    pid: str,
+    message: str,
+    plan: dict,
+    emit: RoleEmitter,
+    *,
+    existing: dict[str, str],
+    version: int,
+    llm,
+    progress: dict,
+    bob_text: str = "",
+) -> str:
+    """Unified first-build/iteration path: scaffold -> tool loop -> verify -> commit."""
+    initial_latest = dict(existing)
+    existing = _prune(existing, plan["mode"])
+    first_build = not existing
+    schema_changed = _schema_changed(plan, existing)
+
+    workspace = Workspace(existing)
+    ctx = ToolContext(
+        pid=pid,
+        run_id=emit.run_id,
+        agent="alex",
+        emit=emit,
+        version=version,
+        plan=plan,
+        workspace=workspace,
+    )
+    toolbox = Toolbox(ctx, agent_roster.AGENTS["alex"].tools)
+
+    if bob_text:
+        await emit(
+            "execution",
+            {
+                "step": "对齐 Bob 的方案",
+                "status": "success",
+                "log": bob_text.replace("\n", " ")[:140],
+            },
+        )
+
+    await _seed_scaffold(ctx, workspace, plan, emit)
+    # Build/start tools materialise the staged tree during the loop. From here
+    # on any failure must restore the previous tree, not only delete artifacts.
+    progress["published"] = True
+
+    steps, seconds, max_calls = _tool_budget(
+        plan,
+        first_build=first_build,
+        schema_changed=schema_changed,
+    )
+    user = _alex_tool_user(
+        plan,
+        message,
+        workspace,
+        first_build=first_build,
+        bob_text=bob_text,
+    )
+    meta = {
+        "prompt": message,
+        "mode": plan["mode"],
+        "title": plan["title"],
+        "existing": workspace.files,
+        "iteration": not first_build,
+    }
+
+    loop_result = await run_tool_loop(
+        llm=llm,
+        toolbox=toolbox,
+        system=ALEX_TOOL_SYSTEM,
+        user=user,
+        meta=meta,
+        emit=emit,
+        max_steps=steps,
+        timeout_seconds=seconds,
+        max_tool_calls=max_calls,
+        max_tool_calls_per_step=config.AGENT_MAX_TOOL_CALLS_PER_STEP,
+        no_progress_limit=config.AGENT_MAX_NO_PROGRESS_STEPS,
+    )
+    if loop_result.stopped_reason != "done":
+        await emit(
+            "execution",
+            {
+                "step": "工具循环结束",
+                "status": "warning",
+                "log": (
+                    f"停止原因：{loop_result.stopped_reason} · "
+                    f"{loop_result.steps} 步 / {loop_result.tool_calls} 次工具调用"
+                ),
+            },
+        )
+
+    loop_result, issues = await _review_with_tools(
+        llm=llm,
+        toolbox=toolbox,
+        loop_result=loop_result,
+        plan=plan,
+        message=message,
+        emit=emit,
+    )
+
+    # A real no-op is a workspace identical to the pre-round tree. Comparing to
+    # ``workspace.base`` would miss an explicit mode prune (base is pruned too).
+    if workspace.files == initial_latest:
+        await emit(
+            "execution",
+            {
+                "step": "检查变更",
+                "status": "warning",
+                "log": "本轮没有检测到文件变更，未写入新版本",
+            },
+        )
+        # A build tool may have materialised an intermediate edit that was later
+        # reverted; make disk match the final workspace without bumping a version.
+        try:
+            await asyncio.to_thread(
+                workspace.apply_to,
+                config.APPS_DIR / pid,
+                reconcile_source=True,
+            )
+        except Exception:  # noqa: BLE001 - best effort on a no-op round
+            pass
+        return loop_result.text or "本轮没有检测到需要修改的文件。"
+
+    repair_notes: list[str] = []
+    for attempt in range(config.AGENT_REPAIR_MAX_ROUNDS + 1):
+        changed, deleted = workspace.commit_plan()
+        backend_changed = any(path.startswith("backend/") for path in changed) or any(
+            path.startswith("backend/") for path in deleted
+        )
+        ok, error = await _apply_and_build(
+            pid,
+            workspace,
+            plan,
+            emit,
+            ctx,
+            stop_backend=backend_changed,
+        )
+        if ok:
+            break
+        if attempt >= config.AGENT_REPAIR_MAX_ROUNDS:
+            raise GenerationError(f"构建/启动失败：{error[:300]}")
+        repair_notes.append(f"构建/启动回修第 {attempt + 1} 轮：{error[:80]}")
+        instruction = (
+            "上一轮构建/启动失败，真实错误如下：\n"
+            f"{error[:3000]}\n\n"
+            "请先用 read_file 查看相关文件，再用 edit_file 精准修复；"
+            "前端修复后调用 build_preview，后端修复后调用 start_runtime 并 check_health。"
+            "不要整文件重写无关内容。"
+        )
+        loop_result = await _repair_with_tools(
+            llm=llm,
+            toolbox=toolbox,
+            loop_result=loop_result,
+            instruction=instruction,
+            plan=plan,
+            message=message,
+            emit=emit,
+            max_steps=min(16, steps),
+        )
+
+    # Reconcile files that disappeared (mode changes, deletes that bypassed the
+    # tool loop) with tombstones so latest_artifacts matches the workspace.
+    for path in sorted(set(initial_latest) - set(workspace.files)):
+        await db.add_artifact_deleted(pid, path, version)
+
+    await db.mark_built(pid, version)
+
+    changed, deleted = workspace.commit_plan()
+    changed_list = sorted(changed)
+    files_text = "、".join(changed_list[:8])
+    if len(changed_list) > 8:
+        files_text += "…"
+    if deleted:
+        files_text += ("；删除 " if files_text else "删除 ") + "、".join(
+            sorted(deleted)[:4]
+        )
+    notes = list(repair_notes)
+    if loop_result.stopped_reason != "done":
+        notes.append(f"工具循环因 {loop_result.stopped_reason} 结束")
+    if issues:
+        notes.append("仍有检查项未通过：" + "；".join(issues[:3]))
+
+    preview_url = f"/apps/{pid}/?v={version}"
+    await emit(
+        "execution",
+        {
+            "step": "生成构建产物",
+            "status": "success",
+            "log": f"v{version} 可访问：{preview_url}",
+        },
+    )
+    await emit(
+        "preview",
+        {"url": preview_url, "version": version, "mode": plan["mode"]},
+    )
+
+    assistant = (
+        f"已完成 v{version}：{plan['summary']}\n"
+        f"形态：{MODE_LABEL[plan['mode']]}（{plan['mode']}）\n"
+        f"本轮修改：{files_text or '无文件变更'}\n"
+        + ("\n".join(f"- {note}" for note in notes) + "\n" if notes else "")
+        + (
+            f"\nAlex 总结：{loop_result.text.strip()[:600]}\n"
+            if loop_result.text.strip()
+            else ""
+        )
+        + (
+            "\n数据保存在 backend/data/app.db，刷新或重启后仍在。\n"
+            if plan["mode"] in ("backend", "fullstack")
+            else "\n"
+        )
+        + "右侧可以直接预览；如果想调整，继续告诉我就行。"
+    )
+    return assistant
+
+
 async def _build_project(
+    pid: str,
+    message: str,
+    plan: dict,
+    emit: RoleEmitter,
+    *,
+    existing: dict[str, str],
+    version: int,
+    llm,
+    progress: dict,
+    bob_text: str = "",
+) -> str:
+    """Dispatch to the unified tool loop, or the legacy generator when disabled."""
+    if not config.AGENT_TOOL_LOOP:
+        return await _build_project_legacy(
+            pid,
+            message,
+            plan,
+            emit,
+            existing=existing,
+            version=version,
+            llm=llm,
+            progress=progress,
+            bob_text=bob_text,
+        )
+    return await _build_project_tools(
+        pid,
+        message,
+        plan,
+        emit,
+        existing=existing,
+        version=version,
+        llm=llm,
+        progress=progress,
+        bob_text=bob_text,
+    )
+
+
+async def _build_project_legacy(
     pid: str,
     message: str,
     plan: dict,

@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   CheckCircle,
   ChevronDown,
+  FileText,
   Spinner,
   X,
 } from "./Icons";
@@ -18,9 +19,14 @@ function StatusIcon({ status, size = 14 }: { status: Execution["status"]; size?:
 interface Props {
   executions: Execution[];
   live?: boolean;
+  onOpenDiff?: (execution: Execution) => void;
 }
 
-export default function ExecutionSteps({ executions, live = false }: Props) {
+export default function ExecutionSteps({
+  executions,
+  live = false,
+  onOpenDiff,
+}: Props) {
   const active = executions.some((execution) => execution.status === "running");
   const failed = executions.some((execution) => execution.status === "error");
   const warned = executions.some((execution) => execution.status === "warning");
@@ -75,29 +81,65 @@ export default function ExecutionSteps({ executions, live = false }: Props) {
                 ) : null}
               </div>
               <div className="min-w-0 flex-1 pb-2">
-                <div className="rounded-[8px] border border-line-4 bg-white/70 px-3 py-2">
-                  <div className="flex items-start gap-2">
-                    <span className="min-w-0 flex-1 break-words text-[13px] leading-[20px] text-ink-80">
-                      {execution.step}
-                    </span>
-                    <span className="mt-0.5 flex-none">
-                      <StatusIcon status={execution.status} />
-                    </span>
-                  </div>
-                  {execution.log ? (
-                    <p
-                      className={`mt-0.5 break-words text-[12px] leading-[18px] ${
-                        execution.status === "error"
-                          ? "text-danger"
-                          : execution.status === "warning"
-                            ? "text-warning"
-                            : "text-ink-55"
+                {(() => {
+                  const changeCount =
+                    execution.change_count ??
+                    (execution.change_id ? 1 : 0);
+                  const hasDiff = changeCount > 0 && Boolean(onOpenDiff);
+                  return (
+                    <div
+                      onClick={
+                        hasDiff ? () => onOpenDiff?.(execution) : undefined
+                      }
+                      onKeyDown={
+                        hasDiff
+                          ? (event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                onOpenDiff?.(execution);
+                              }
+                            }
+                          : undefined
+                      }
+                      role={hasDiff ? "button" : undefined}
+                      tabIndex={hasDiff ? 0 : undefined}
+                      title={hasDiff ? "查看本次改动的 diff" : undefined}
+                      className={`rounded-[8px] border border-line-4 bg-white/70 px-3 py-2 ${
+                        hasDiff
+                          ? "cursor-pointer transition hover:border-brand/40 hover:bg-white focus:outline-none focus-visible:border-brand/60"
+                          : ""
                       }`}
                     >
-                      {execution.log}
-                    </p>
-                  ) : null}
-                </div>
+                      <div className="flex items-start gap-2">
+                        <span className="min-w-0 flex-1 break-words text-[13px] leading-[20px] text-ink-80">
+                          {execution.step}
+                        </span>
+                        {hasDiff ? (
+                          <span className="mt-0.5 inline-flex flex-none items-center gap-1 rounded-full bg-brand-50 px-1.5 py-0.5 text-[10px] font-medium text-brand-text">
+                            <FileText size={10} />
+                            diff{changeCount > 1 ? ` ${changeCount}` : ""}
+                          </span>
+                        ) : null}
+                        <span className="mt-0.5 flex-none">
+                          <StatusIcon status={execution.status} />
+                        </span>
+                      </div>
+                      {execution.log ? (
+                        <p
+                          className={`mt-0.5 break-words text-[12px] leading-[18px] ${
+                            execution.status === "error"
+                              ? "text-danger"
+                              : execution.status === "warning"
+                                ? "text-warning"
+                                : "text-ink-55"
+                          }`}
+                        >
+                          {execution.log}
+                        </p>
+                      ) : null}
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           ))}

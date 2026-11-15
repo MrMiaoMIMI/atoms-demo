@@ -84,7 +84,15 @@ AGENTS: dict[str, AgentSpec] = {
         role="架构师",
         system="",  # Bob's build prompt is the structured Planner prompt in agent.py.
         skills=("architecture", "schema", "api-design"),
-        tools=frozenset({"read_project_state", "validate_plan"}),
+        tools=frozenset(
+            {
+                "read_project_state",
+                "list_files",
+                "read_file",
+                "grep",
+                "validate_plan",
+            }
+        ),
     ),
     "alex": AgentSpec(
         key="alex",
@@ -95,12 +103,17 @@ AGENTS: dict[str, AgentSpec] = {
         tools=frozenset(
             {
                 "read_project_state",
+                "list_files",
                 "read_file",
+                "grep",
                 "write_file",
+                "edit_file",
+                "delete_file",
                 "publish_files",
                 "build_preview",
                 "start_runtime",
                 "check_health",
+                "read_runtime_log",
             }
         ),
     ),

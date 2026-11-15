@@ -4,8 +4,10 @@ RealLLM  -> DeepSeek (OpenAI-compatible) streaming endpoint.
 MockLLM  -> demo placeholder used only when no API key is configured; it is
             never a runtime fallback for a failing real model.
 """
+import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -14,6 +16,25 @@ from mocks import agents as agent_mocks
 from mocks import templates
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ToolCall:
+    """One function call requested by the model."""
+
+    id: str
+    name: str
+    arguments: str  # raw JSON string, validated by the tool loop
+
+
+@dataclass
+class AssistantTurn:
+    """One model turn, with optional native tool calls."""
+
+    text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    finish_reason: str | None = None
+    truncated: bool = False
 
 
 class MockLLM:
@@ -45,6 +66,146 @@ class MockLLM:
         step = 48
         for i in range(0, len(text), step):
             yield text[i : i + step]
+
+    async def turn(
+        self,
+        *,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        meta: dict | None = None,
+        on_text=None,
+    ) -> AssistantTurn:
+        """Deterministic tool sequence so the loop and diff UI work without a key."""
+        meta = meta or {}
+        mode = str(meta.get("mode") or "frontend")
+        title = str(meta.get("title") or "Mock 演示项目")
+        prompt = str(meta.get("prompt") or "")
+        existing = meta.get("existing") or {}
+        iteration = bool(meta.get("iteration"))
+        step = sum(1 for message in messages if message.get("role") == "assistant")
+
+        def call(name: str, arguments: dict) -> AssistantTurn:
+            return AssistantTurn(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id=f"mock-{step}-{name}",
+                        name=name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        if not iteration:
+            script: list[tuple[str, dict]] = []
+            if mode in ("frontend", "fullstack"):
+                script.append(
+                    (
+                        "write_file",
+                        {
+                            "path": "frontend/src/App.tsx",
+                            "content": templates.mock_file(
+                                prompt,
+                                "frontend/src/App.tsx",
+                                existing,
+                                mode=mode,
+                                title=title,
+                            ),
+                        },
+                    )
+                )
+                script.append(
+                    (
+                        "write_file",
+                        {
+                            "path": "frontend/src/styles.css",
+                            "content": templates.mock_file(
+                                prompt,
+                                "frontend/src/styles.css",
+                                existing,
+                                mode=mode,
+                                title=title,
+                            ),
+                        },
+                    )
+                )
+            if mode in ("backend", "fullstack"):
+                script.append(
+                    (
+                        "write_file",
+                        {
+                            "path": "backend/main.py",
+                            "content": templates.mock_file(
+                                prompt,
+                                "backend/main.py",
+                                existing,
+                                mode=mode,
+                                title=title,
+                            ),
+                        },
+                    )
+                )
+            if mode in ("frontend", "fullstack"):
+                script.append(("build_preview", {}))
+            if mode in ("backend", "fullstack"):
+                script.append(("start_runtime", {}))
+            if step < len(script):
+                name, arguments = script[step]
+                return call(name, arguments)
+            return AssistantTurn(
+                text="Mock 模式：已完成占位项目的工具循环。配置 LLM_API_KEY 后会按需求生成真实应用。",
+                finish_reason="stop",
+            )
+
+        # Iteration: read one file, append a clearly-labelled mock line, then
+        # build. This exercises the same tool path as a real edit.
+        target = (
+            "frontend/src/App.tsx"
+            if "frontend/src/App.tsx" in existing
+            else "backend/main.py"
+            if "backend/main.py" in existing
+            else "frontend/src/App.tsx"
+        )
+        if step == 0:
+            return call("read_file", {"path": target})
+        if step == 1:
+            content = ""
+            last_tool = next(
+                (m for m in reversed(messages) if m.get("role") == "tool"), None
+            )
+            if last_tool:
+                try:
+                    payload = json.loads(last_tool.get("content") or "{}")
+                    content = str(payload.get("data", {}).get("content") or "")
+                except (TypeError, ValueError):
+                    content = ""
+            marker = "/* mock iteration: 未配置 LLM_API_KEY */"
+            if content:
+                return call(
+                    "edit_file",
+                    {
+                        "path": target,
+                        "old_string": content,
+                        "new_string": f"{content}\n{marker}\n",
+                    },
+                )
+            return call(
+                "write_file",
+                {
+                    "path": target,
+                    "content": f"{marker}\n",
+                    "overwrite": True,
+                },
+            )
+        if step == 2:
+            if mode in ("frontend", "fullstack"):
+                return call("build_preview", {})
+            return call("start_runtime", {})
+        return AssistantTurn(
+            text="Mock 模式：已完成一次占位修改。配置 LLM_API_KEY 后会按需求真实修改代码。",
+            finish_reason="stop",
+        )
 
 
 class DeepSeekLLM:
@@ -145,6 +306,156 @@ class DeepSeekLLM:
         raise RuntimeError(
             "LLM output still truncated after "
             f"{config.LLM_CONTINUATION_PASSES} continuation passes"
+        )
+
+    async def _deltas(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[dict]:
+        """Stream text/tool-call deltas from an OpenAI-compatible endpoint."""
+        url = f"{config.LLM_BASE_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {config.LLM_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        while True:
+            payload: dict = {
+                "model": config.LLM_MODEL,
+                "messages": messages,
+                "stream": True,
+                "temperature": config.LLM_TEMPERATURE,
+                "max_tokens": self._max_tokens,
+            }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+            async with self._client.stream(
+                "POST", url, json=payload, headers=headers
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    detail = body.decode("utf-8", "ignore")
+                    if resp.status_code == 400 and self._max_tokens > 8192:
+                        logger.warning(
+                            "provider returned 400 with max_tokens=%s; "
+                            "retrying with 8192: %s",
+                            self._max_tokens,
+                            detail[:200],
+                        )
+                        self._max_tokens = 8192
+                        continue
+                    raise RuntimeError(
+                        f"LLM HTTP {resp.status_code}: {detail[:300]}"
+                    )
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                        choice = obj["choices"][0]
+                    except (ValueError, KeyError, IndexError):
+                        continue
+                    delta = choice.get("delta") or {}
+                    content = delta.get("content")
+                    if content:
+                        yield {"type": "text", "text": content}
+                    for item in delta.get("tool_calls") or []:
+                        function = item.get("function") or {}
+                        yield {
+                            "type": "tool_call",
+                            "index": int(item.get("index") or 0),
+                            "id": item.get("id"),
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments"),
+                        }
+                    if choice.get("finish_reason"):
+                        yield {"type": "finish", "reason": choice["finish_reason"]}
+            break
+
+    async def _collect_turn(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        on_text,
+    ) -> AssistantTurn:
+        text_parts: list[str] = []
+        slots: dict[int, dict[str, str]] = {}
+        finish_reason: str | None = None
+        async for event in self._deltas(messages, tools):
+            kind = event["type"]
+            if kind == "text":
+                text_parts.append(event["text"])
+                if on_text is not None:
+                    await on_text(event["text"])
+            elif kind == "tool_call":
+                slot = slots.setdefault(
+                    event["index"],
+                    {"id": "", "name": "", "arguments": ""},
+                )
+                if event["id"]:
+                    slot["id"] = event["id"]
+                if event["name"]:
+                    slot["name"] = event["name"]
+                if event["arguments"]:
+                    slot["arguments"] += event["arguments"]
+            elif kind == "finish":
+                finish_reason = event["reason"]
+
+        calls: list[ToolCall] = []
+        for index in sorted(slots):
+            slot = slots[index]
+            if not slot["name"]:
+                continue
+            calls.append(
+                ToolCall(
+                    id=slot["id"] or f"call_{index}",
+                    name=slot["name"],
+                    arguments=slot["arguments"] or "{}",
+                )
+            )
+        return AssistantTurn(
+            text="".join(text_parts),
+            tool_calls=calls,
+            finish_reason=finish_reason,
+            truncated=finish_reason == "length" and bool(calls),
+        )
+
+    async def turn(
+        self,
+        *,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        meta: dict | None = None,
+        on_text=None,
+    ) -> AssistantTurn:
+        """One native-function-calling turn, with text continuation."""
+        current = list(messages)
+        text_parts: list[str] = []
+        for _ in range(config.LLM_CONTINUATION_PASSES):
+            result = await self._collect_turn(current, tools, on_text)
+            text_parts.append(result.text)
+            if result.tool_calls or result.finish_reason != "length":
+                result.text = "".join(text_parts)
+                return result
+            current = current + [
+                {"role": "assistant", "content": result.text},
+                {
+                    "role": "user",
+                    "content": (
+                        "上一条输出因长度限制被截断。请从中断处继续输出剩余内容，"
+                        "不要重复已输出的任何内容，不要添加解释或代码围栏。"
+                    ),
+                },
+            ]
+        return AssistantTurn(
+            text="".join(text_parts),
+            finish_reason="length",
+            truncated=True,
         )
 
 

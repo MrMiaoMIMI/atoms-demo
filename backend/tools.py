@@ -16,9 +16,11 @@ import httpx
 
 import config
 import db
+import diffing
 import frontend_builder
 import runtime
 import scaffold
+from workspace import Workspace, WorkspaceError
 
 Emit = Callable[[str, dict], Awaitable[Any]]
 
@@ -31,6 +33,12 @@ class ToolContext:
     emit: Emit
     version: int = 1
     files: dict[str, str] = field(default_factory=dict)
+    # Populated by the tool loop. ``execution_id`` links a mutation to the
+    # timeline step the user can click; ``plan`` lets build tools reuse the
+    # planner contract.
+    execution_id: int | None = None
+    plan: dict | None = None
+    workspace: Workspace | None = None
 
 
 def _project_mode(paths: set[str]) -> str:
@@ -156,6 +164,463 @@ TOOL_REGISTRY = {
 }
 
 
+# ---------------------------------------------------------------------------
+# LLM-facing tools (native function calling)
+#
+# These are separate from TOOL_REGISTRY so the still-existing deterministic
+# pipeline keeps its old call semantics until the tool loop replaces it. The
+# final loop invokes these through ``Toolbox.invoke``.
+# ---------------------------------------------------------------------------
+
+
+async def _workspace(ctx: ToolContext) -> Workspace:
+    if ctx.workspace is None:
+        files = ctx.files if ctx.files else await db.latest_artifacts(ctx.pid)
+        ctx.workspace = Workspace(dict(files))
+    return ctx.workspace
+
+
+async def _record_change(ctx: ToolContext, change) -> int | None:
+    """Persist and broadcast one tool mutation."""
+    if change is None:
+        return None
+    change_id = await db.add_file_change(
+        ctx.pid,
+        version=ctx.version,
+        filename=change.path,
+        change_type=change.change_type,
+        diff=change.diff.diff,
+        additions=change.additions,
+        deletions=change.deletions,
+        run_id=ctx.run_id,
+        agent=ctx.agent,
+        execution_id=ctx.execution_id,
+        truncated=change.diff.truncated,
+    )
+    await ctx.emit(
+        "file_change",
+        {
+            "id": change_id,
+            "filename": change.path,
+            "change_type": change.change_type,
+            "diff": change.diff.diff,
+            "additions": change.additions,
+            "deletions": change.deletions,
+            "truncated": change.diff.truncated,
+            "execution_id": ctx.execution_id,
+            "run_id": ctx.run_id,
+            "agent": ctx.agent,
+            "version": ctx.version,
+        },
+    )
+    return change_id
+
+
+async def record_change(ctx: ToolContext, change) -> int | None:
+    """Public wrapper used by deterministic steps such as scaffolding."""
+    return await _record_change(ctx, change)
+
+
+def _change_data(change, change_id: int | None) -> dict:
+    if change is None:
+        return {"changed": False, "change_id": None}
+    return {
+        "changed": True,
+        "change_id": change_id,
+        "filename": change.path,
+        "change_type": change.change_type,
+        "additions": change.additions,
+        "deletions": change.deletions,
+    }
+
+
+async def llm_list_files(ctx: ToolContext, pattern: str | None = None) -> dict:
+    ws = await _workspace(ctx)
+    infos = ws.list_files(pattern)
+    return {
+        "ok": True,
+        "data": {
+            "files": [
+                {"path": item.path, "bytes": item.bytes, "lines": item.lines}
+                for item in infos
+            ],
+            "total": len(infos),
+        },
+    }
+
+
+async def llm_read_file(
+    ctx: ToolContext,
+    path: str,
+    offset: int = 1,
+    limit: int = 400,
+) -> dict:
+    ws = await _workspace(ctx)
+    result = ws.read(path, offset=offset, limit=limit)
+    lines = result.content.splitlines()
+    numbered = "\n".join(
+        f"{result.start_line + index:>5}  {line}"
+        for index, line in enumerate(lines)
+    )
+    return {
+        "ok": True,
+        "data": {
+            "path": result.path,
+            "content": result.content,
+            "numbered": numbered,
+            "start_line": result.start_line,
+            "end_line": result.end_line,
+            "total_lines": result.total_lines,
+            "truncated": result.truncated,
+        },
+    }
+
+
+async def llm_grep(
+    ctx: ToolContext,
+    pattern: str,
+    glob: str | None = None,
+    max_results: int = 30,
+) -> dict:
+    ws = await _workspace(ctx)
+    result = ws.grep(pattern, glob=glob, max_results=max_results)
+    return {
+        "ok": True,
+        "data": {
+            "matches": [
+                {"path": item.path, "line": item.line, "text": item.text}
+                for item in result.matches
+            ],
+            "total": result.total,
+            "truncated": result.truncated,
+        },
+    }
+
+
+async def llm_write_file(
+    ctx: ToolContext,
+    path: str,
+    content: str,
+    overwrite: bool = False,
+) -> dict:
+    ws = await _workspace(ctx)
+    change = ws.write(path, content, overwrite=bool(overwrite))
+    if change is None:
+        return {"ok": True, "data": {"path": path, **_change_data(None, None)}}
+    await db.add_artifact(ctx.pid, change.path, change.new or "", ctx.version)
+    change_id = await _record_change(ctx, change)
+    await ctx.emit(
+        "artifact",
+        {
+            "filename": change.path,
+            "content": change.new or "",
+            "version": ctx.version,
+            "run_id": ctx.run_id,
+        },
+    )
+    return {"ok": True, "data": _change_data(change, change_id)}
+
+
+async def llm_edit_file(
+    ctx: ToolContext,
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+) -> dict:
+    ws = await _workspace(ctx)
+    change = ws.edit(
+        path,
+        old_string,
+        new_string,
+        replace_all=bool(replace_all),
+    )
+    if change is None:
+        return {"ok": True, "data": {"path": path, **_change_data(None, None)}}
+    await db.add_artifact(ctx.pid, change.path, change.new or "", ctx.version)
+    change_id = await _record_change(ctx, change)
+    await ctx.emit(
+        "artifact",
+        {
+            "filename": change.path,
+            "content": change.new or "",
+            "version": ctx.version,
+            "run_id": ctx.run_id,
+        },
+    )
+    return {"ok": True, "data": _change_data(change, change_id)}
+
+
+async def llm_delete_file(ctx: ToolContext, path: str) -> dict:
+    ws = await _workspace(ctx)
+    change = ws.delete(path)
+    await db.add_artifact_deleted(ctx.pid, change.path, ctx.version)
+    change_id = await _record_change(ctx, change)
+    return {"ok": True, "data": _change_data(change, change_id)}
+
+
+async def llm_build_preview(ctx: ToolContext) -> dict:
+    if not ctx.plan:
+        raise RuntimeError("缺少项目计划，无法构建预览")
+    ws = await _workspace(ctx)
+    # Build tools see the staged tree; only the build step materialises it.
+    await asyncio.to_thread(
+        ws.apply_to, config.APPS_DIR / ctx.pid, reconcile_source=True
+    )
+    await build_preview(ctx, ctx.plan)
+    return {"ok": True, "data": {"mode": ctx.plan.get("mode")}}
+
+
+async def llm_start_runtime(ctx: ToolContext) -> dict:
+    ws = await _workspace(ctx)
+    await asyncio.to_thread(
+        ws.apply_to, config.APPS_DIR / ctx.pid, reconcile_source=True
+    )
+    # The process must pick up the staged backend source, not the previous one.
+    await runtime.runtime.stop(ctx.pid)
+    port = await start_runtime(ctx)
+    return {"ok": True, "data": {"port": port}}
+
+
+async def llm_check_health(ctx: ToolContext, port: int) -> dict:
+    await check_health(ctx, port)
+    return {"ok": True, "data": {"port": port}}
+
+
+async def llm_read_runtime_log(ctx: ToolContext, lines: int = 80) -> dict:
+    path = config.APPS_DIR / ctx.pid / ".runtime.log"
+    if not path.is_file():
+        return {"ok": True, "data": {"lines": [], "text": "", "truncated": False}}
+    text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+    all_lines = text.splitlines()
+    limit = max(1, min(int(lines), 400))
+    tail = all_lines[-limit:]
+    return {
+        "ok": True,
+        "data": {
+            "lines": tail,
+            "text": "\n".join(tail),
+            "truncated": len(all_lines) > len(tail),
+        },
+    }
+
+
+async def llm_validate_plan(ctx: ToolContext, plan: dict) -> dict:
+    return {"ok": True, "data": {"valid": await validate_plan(ctx, plan)}}
+
+
+async def llm_read_project_state(ctx: ToolContext) -> dict:
+    return {"ok": True, "data": await read_project_state(ctx)}
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict
+    read_only: bool = False
+
+    def openai(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+
+_EMPTY_PARAMS = {"type": "object", "properties": {}, "additionalProperties": False}
+
+LLM_TOOL_SPECS: dict[str, ToolSpec] = {
+    "list_files": ToolSpec(
+        name="list_files",
+        description="列出项目内可编辑的源文件（路径、字节数、行数）。可用 pattern 过滤，如 frontend/src/**/*.tsx。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "可选的 glob，例如 frontend/src/**/*.tsx",
+                }
+            },
+            "additionalProperties": False,
+        },
+        read_only=True,
+    ),
+    "read_file": ToolSpec(
+        name="read_file",
+        description="读取项目文件的一段内容。返回 raw content 和带行号的 numbered 版本；修改前先读文件。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "项目相对路径"},
+                "offset": {
+                    "type": "integer",
+                    "description": "起始行，1-based，默认 1",
+                    "minimum": 1,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多读取行数，默认 400，上限 800",
+                    "minimum": 1,
+                    "maximum": 800,
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        read_only=True,
+    ),
+    "grep": ToolSpec(
+        name="grep",
+        description="用正则搜索项目源码，返回文件、行号和该行内容。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Python 正则"},
+                "glob": {
+                    "type": "string",
+                    "description": "可选文件过滤，例如 frontend/src/**/*.tsx",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "最多返回条数，默认 30，上限 50",
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+        read_only=True,
+    ),
+    "write_file": ToolSpec(
+        name="write_file",
+        description=(
+            "创建新文件，或显式 overwrite=true 整文件重写。修改已有文件优先用 edit_file。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "项目相对路径"},
+                "content": {"type": "string", "description": "完整文件内容"},
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "已存在文件必须显式设为 true",
+                },
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    ),
+    "edit_file": ToolSpec(
+        name="edit_file",
+        description=(
+            "对已有文件做精确字符串替换。old_string 必须在文件中唯一命中，"
+            "否则请求失败；多处替换请设置 replace_all=true。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "项目相对路径"},
+                "old_string": {
+                    "type": "string",
+                    "description": "要替换的原文，必须精确匹配",
+                },
+                "new_string": {"type": "string", "description": "替换后的内容"},
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "是否替换所有命中，默认 false",
+                },
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": False,
+        },
+    ),
+    "delete_file": ToolSpec(
+        name="delete_file",
+        description="删除项目文件；删除后应重新构建并处理引用错误。",
+        parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "项目相对路径"}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    ),
+    "build_preview": ToolSpec(
+        name="build_preview",
+        description="用 esbuild 构建前端预览（或生成纯后端 API 页面），返回真实构建错误。",
+        parameters=_EMPTY_PARAMS,
+    ),
+    "start_runtime": ToolSpec(
+        name="start_runtime",
+        description="启动/重启项目自己的 FastAPI 运行时，返回端口。",
+        parameters=_EMPTY_PARAMS,
+    ),
+    "check_health": ToolSpec(
+        name="check_health",
+        description="检查项目后端的 /api/health。",
+        parameters={
+            "type": "object",
+            "properties": {"port": {"type": "integer"}},
+            "required": ["port"],
+            "additionalProperties": False,
+        },
+    ),
+    "read_runtime_log": ToolSpec(
+        name="read_runtime_log",
+        description="读取项目后端运行时日志尾部，用于修复启动错误。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "lines": {
+                    "type": "integer",
+                    "description": "读取尾部行数，默认 80",
+                    "minimum": 1,
+                    "maximum": 400,
+                }
+            },
+            "additionalProperties": False,
+        },
+        read_only=True,
+    ),
+    "read_project_state": ToolSpec(
+        name="read_project_state",
+        description="读取项目形态、文件列表和当前版本。",
+        parameters=_EMPTY_PARAMS,
+        read_only=True,
+    ),
+    "validate_plan": ToolSpec(
+        name="validate_plan",
+        description="校验 Planner 输出是否包含必需文件与合法形态。",
+        parameters={
+            "type": "object",
+            "properties": {"plan": {"type": "object"}},
+            "required": ["plan"],
+            "additionalProperties": False,
+        },
+        read_only=True,
+    ),
+}
+
+LLM_TOOL_REGISTRY = {
+    "list_files": llm_list_files,
+    "read_file": llm_read_file,
+    "grep": llm_grep,
+    "write_file": llm_write_file,
+    "edit_file": llm_edit_file,
+    "delete_file": llm_delete_file,
+    "build_preview": llm_build_preview,
+    "start_runtime": llm_start_runtime,
+    "check_health": llm_check_health,
+    "read_runtime_log": llm_read_runtime_log,
+    "read_project_state": llm_read_project_state,
+    "validate_plan": llm_validate_plan,
+}
+
+
 class Toolbox:
     def __init__(self, ctx: ToolContext, allowed: frozenset[str]):
         self.ctx = ctx
@@ -168,3 +633,45 @@ class Toolbox:
         if tool is None:
             raise KeyError(f"未知工具：{name}")
         return await tool(self.ctx, **kwargs)
+
+    def specs(self) -> list[dict]:
+        """OpenAI-compatible function schemas for this role's tools."""
+        return [
+            spec.openai()
+            for name, spec in LLM_TOOL_SPECS.items()
+            if name in self.allowed
+        ]
+
+    async def invoke(self, name: str, arguments: dict | None = None) -> dict:
+        """Execute one LLM tool call and always return a JSON-serialisable result."""
+        if name not in self.allowed:
+            return _tool_error(
+                "permission_denied",
+                f"工具 {name} 不属于角色 {self.ctx.agent}",
+            )
+        spec = LLM_TOOL_SPECS.get(name)
+        tool = LLM_TOOL_REGISTRY.get(name)
+        if spec is None or tool is None:
+            return _tool_error("unknown_tool", f"未知工具：{name}")
+        kwargs = arguments or {}
+        try:
+            result = await tool(self.ctx, **kwargs)
+        except WorkspaceError as exc:
+            return exc.to_result()
+        except frontend_builder.BuildError as exc:
+            return _tool_error("build_failed", str(exc))
+        except runtime.AppRuntimeError as exc:
+            return _tool_error("runtime_failed", str(exc))
+        except asyncio.TimeoutError:
+            return _tool_error("timeout", f"工具 {name} 执行超时")
+        except TypeError as exc:
+            return _tool_error("invalid_args", f"{name} 参数不正确：{exc}")
+        except Exception as exc:  # noqa: BLE001 - tool errors must reach the model
+            return _tool_error("internal", f"{type(exc).__name__}: {exc}")
+        if isinstance(result, dict) and "ok" in result:
+            return result
+        return {"ok": True, "data": result}
+
+
+def _tool_error(code: str, message: str) -> dict:
+    return {"ok": False, "error": {"code": code, "message": message}}

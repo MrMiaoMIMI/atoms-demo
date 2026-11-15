@@ -3,6 +3,7 @@ import { agentFor } from "../lib/agents";
 import { copyText } from "../lib/clipboard";
 import type { ChatGroup } from "../lib/groups";
 import { summaryFromText, versionFromText } from "../lib/groups";
+import type { Execution } from "../types";
 import { Markdown } from "../lib/markdown";
 import { AgentAvatar } from "./Avatar";
 import ExecutionSteps from "./ExecutionSteps";
@@ -46,6 +47,7 @@ interface Props {
   onSend: (text: string) => void;
   onStop: () => void;
   onOpenCode: () => void;
+  onOpenDiff?: (execution: Execution) => void;
 }
 
 export default function ChatPanel({
@@ -55,6 +57,7 @@ export default function ChatPanel({
   onSend,
   onStop,
   onOpenCode,
+  onOpenDiff,
 }: Props) {
   const [input, setInput] = useState("");
   const [copied, setCopied] = useState<string | null>(null);
@@ -219,7 +222,11 @@ export default function ChatPanel({
                           </span>
                         </div>
 
-                        <ExecutionSteps executions={group.executions} live={group.live} />
+                        <ExecutionSteps
+                          executions={group.executions}
+                          live={group.live}
+                          onOpenDiff={onOpenDiff}
+                        />
 
                         {group.messages.map((message, messageIndex) => (
                           <Markdown

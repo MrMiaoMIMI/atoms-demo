@@ -138,8 +138,10 @@ apps/{project_id}/
 | 角色 | 职责 | 可用工具（由 Toolbox 白名单强制） |
 | --- | --- | --- |
 | **Mike** 团队领导 | 理解需求、拆解任务、判断复杂度、选择下一位 | `read_project_state` |
-| **Bob** 架构师 | 形态判断、数据模型、API 合约、文件规划 | `read_project_state`、`validate_plan` |
-| **Alex** 工程师 | 脚手架、代码生成、自检回修、预览构建、后端运行时 | `read_project_state`、`read_file`、`write_file`、`publish_files`、`build_preview`、`start_runtime`、`check_health` |
+| **Bob** 架构师 | 形态判断、数据模型、API 合约、文件规划 | `read_project_state`、`list_files`、`read_file`、`grep`、`validate_plan` |
+| **Alex** 工程师 | 统一工具循环：读写文件、精确编辑、删除、自检回修、预览构建、后端运行时 | `read_project_state`、`list_files`、`read_file`、`grep`、`write_file`、`edit_file`、`delete_file`、`build_preview`、`start_runtime`、`check_health`、`read_runtime_log` |
+
+> 迭代与首建共用一条 tool loop：Alex 通过原生 function calling 调用文件工具，`edit_file` 精确匹配、`write_file` 对已有文件要求显式覆盖；每次写操作记录 `file_changes` 并通过 `file_change` SSE 下发。旧的一次性整文件生成链路只作为 `AGENT_TOOL_LOOP=0` 的兜底。
 
 - **按 @ 分段**：一条消息可以给不同角色分配不同问题，后端按 `@` 位置切段，每个 Agent 只拿到自己名下的文本；同一 Agent 的多个问题合并成一轮。
   - 未被 @ 的独立问题默认交给 Mike（团队领导）；`请/麻烦/帮我` 这类连接词会附着到第一个被 @ 的角色。
@@ -164,10 +166,18 @@ apps/{project_id}/
 - 所有 LLM 调用失败按 `LLM_MAX_RETRIES`（默认首次失败后再重试 3 次）与指数退避重试；仍失败则**回滚本轮**、保留上一个可用版本并向前端报错，不再静默替换成 Mock 模板。
 - 单次请求的输出预算由 `LLM_MAX_TOKENS` 控制（默认 16384；若上游返回 400 会自动降回 8192）。文件被 `finish_reason=length` 截断时，自动携带已生成内容请求**续写**，最多 `LLM_CONTINUATION_PASSES`（默认 3）次；仍不完整则进入上述重试/回滚流程，绝不发布半截页面。
 - 生成完成后做大小检查：超过 12,000 字符在时间线告警；超过 20,000 字符的前端 TS/TSX 会尝试自动拆分为 `components/` / `hooks/`。拆分失败只告警，不阻塞本轮。
-- Alex 在实现阶段自检文件完整性、样式缺口、移动端媒体查询、前端是否调用后端 API、API 路径是否以 `/` 开头、Python 语法等；命中后自动回修。
-- 前端预览用 esbuild 做真实构建；构建失败时先带着当前文件内容与错误信息回修，仍失败则回滚到上一个可用版本并展示错误横幅。
-- 后端启动失败时读取 `.runtime.log` 回修 `main.py`，仍失败同样回滚并报错。
+- 前端预览用 esbuild 做真实构建；构建失败时把真实错误作为 tool result 回灌，Alex 用 `read_file` / `edit_file` 精准修复；仍失败则回滚到上一个可用版本并展示错误横幅。
+- 后端启动失败时通过 `read_runtime_log` / `start_runtime` 工具回修 `main.py`，仍失败同样回滚并报错。
 - 真实生成约 60–180s（含多文件生成与自动回修），Mock 演示模式 < 5s。
+
+### 迭代与 diff
+
+- 首建与迭代共用 Workspace 暂存树：确定性脚手架 → Alex tool loop → Reviewer → 只写变更文件的 `apply_changes` → build/health → `mark_built`。
+- `edit_file` 默认要求 `old_string` 唯一命中；失败返回命中数并提示重新读取。`write_file` 只用于新文件或显式 `overwrite=true`。
+- 每次写/编辑/删除生成 `file_changes` 记录（文件名、change_type、unified diff、+/- 数、run_id、execution_id）；时间线步骤显示 diff 徽标，点击在右侧查看。
+- 代码模式可切换「文件 / 未发布改动」；未发布改动对比发布时写入的 `.published/source.json` 与当前 artifacts，返回变更文件清单与逐文件 diff。
+- 删除文件使用 artifacts tombstone（`deleted=1`）；回滚保留 diff 记录并标记 `rolled_back=1`，不伪造成功。
+- 工具循环按计划文件数动态分配步数与墙钟预算；80% 提示收敛，超限时构建通过则带 warning 提交，否则回滚。
 
 ## 本地开发
 
@@ -195,6 +205,14 @@ npm run dev
 ```
 
 打开 http://127.0.0.1:5173 。前端 dev server 会把 `/api`、`/apps` 代理到 8000，并允许沙箱 iframe 的 `Origin: null` 预检请求。
+
+```bash
+# 5. 后端单元测试（workspace / diff / tool loop / 构建 / 发布基线 / 回滚）
+cd backend
+.venv/bin/python -m unittest discover -s tests
+```
+
+> 重置演示数据：停止后端后删除 `backend/data/atoms.db*` 与 `backend/data/apps/*`；下次启动会自动建新库，所有账号和项目都会清空。
 
 配置分两层，加载优先级：**进程环境变量 > `backend/.env.{APP_ENV}` > `backend/.env`**。
 
@@ -224,6 +242,14 @@ npm run dev
 | `GENERATED_APP_MEMORY_MB` | `256` | 单个生成后端的内存上限（Linux） |
 | `RUNTIME_START_TIMEOUT` | `20` | 生成后端启动等待秒数 |
 | `FRONTEND_BUILD_TIMEOUT` | `120` | 预览构建超时秒数 |
+| `AGENT_TOOL_LOOP` | `1` | 统一首建/迭代 tool loop；设为 `0` 回退旧整文件生成 |
+| `AGENT_MAX_STEPS_FIRST_BUILD` | `96` | 首建步数硬上限（实际按计划文件数动态计算） |
+| `AGENT_MAX_STEPS_ITERATION` | `64` | 迭代步数硬上限 |
+| `AGENT_MAX_SECONDS_FIRST_BUILD` / `AGENT_MAX_SECONDS_ITERATION` | `1200` / `600` | 单轮墙钟上限（秒） |
+| `AGENT_MAX_TOOL_CALLS` / `AGENT_MAX_TOOL_CALLS_PER_STEP` | `320` / `8` | 单轮 / 单步工具调用上限 |
+| `AGENT_MAX_NO_PROGRESS_STEPS` | `5` | 连续无进展停止阈值 |
+| `AGENT_REPAIR_MAX_ROUNDS` | `2` | Reviewer / 构建 / 启动失败的工具回修轮数 |
+| `AGENT_CONTEXT_INLINE_CHARS` / `AGENT_CONTEXT_FILE_CHARS` | `40000` / `12000` | 项目全文注入阈值 / 单文件注入上限 |
 | `PREVIEW_NODE_MODULES` | `backend/runtime/frontend/node_modules` | 共享 esbuild / React 工具链位置 |
 | `PUBLIC_BASE_URL` | 空（用请求 origin） | 验证/重置邮件链接与 OAuth 回调的对外 origin；本地放 `.env.local`（5173 或留空），线上放 `.env.production`（`https://hajimi.site`） |
 | `AUTH_COOKIE_SECURE` | `0` | HTTPS 部署设为 `1`（放 `.env.production`） |
@@ -301,6 +327,9 @@ CERTBOT_EMAIL=you@example.com ./scripts/init-letsencrypt.sh
 | GET | `/api/projects` | 项目列表（含 `mode`、`status`、`has_changes`） |
 | POST | `/api/projects` | 创建项目 `{prompt?, name?}`；省略 `name` 时后台用 LLM 把首条需求概括为短名称 |
 | GET | `/api/projects/{id}` | 完整状态（对话、最新文件、执行记录、`mode`、`preview_url`、`status`、`published_url`） |
+| GET | `/api/projects/{id}/changes` | 未发布改动：发布源码基线 vs 当前 artifacts，返回变更文件清单与 unified diff |
+| GET | `/api/projects/{id}/changes/{change_id}` | 单条工具改动的 diff 记录 |
+| GET | `/api/projects/{id}/executions/{execution_id}/changes` | 某个时间线步骤产生的全部 diff |
 | DELETE | `/api/projects/{id}` | 删除项目、生成物、发布快照并停止工作区 / 发布运行时 |
 | POST | `/api/projects/{id}/generate` | `{message}`，返回 SSE 流 |
 | POST | `/api/projects/{id}/publish` | 把最近一次成功构建快照为公开站点；构建中返回 409 |
@@ -335,10 +364,12 @@ SSE 事件：
 | --- | --- |
 | `project` | `{id, name}` 项目名（后台 LLM 概括首条需求后回填） |
 | `agent_start` | `{run_id, agent, name, role, index}` 某个智能体开始一轮 |
-| `execution` | `{id, run_id, agent, step, status, log}`，`status: running/success/warning/error` |
+| `execution` | `{id, run_id, agent, step, status, log, tool?, target?, change_id?, change_count?}`，`status: running/success/warning/error` |
 | `token` | `{filename, delta, run_id}` 流式代码片段 |
 | `file_start` | `{filename, purpose, run_id}` 开始写某个文件 |
 | `artifact` | `{filename, content, version, run_id}` 文件完成 |
+| `file_change` | `{id, filename, change_type, diff, additions, deletions, truncated, execution_id, run_id, agent, version}` 单次工具改动 |
+| `changes_reset` | `{version}` 本轮回滚，前端丢弃实时 diff 并重新拉取 |
 | `preview` | `{url, version, mode}` 已发布 |
 | `message` | `{role, agent, run_id, run_index, content}` 该智能体的最终答复 |
 | `agent_end` | `{run_id, agent, status}` 一轮结束 |
@@ -350,13 +381,14 @@ SSE 事件：
 0. 打开首页 → 输入任意邮箱 → 点「快捷登录（演示）」。新邮箱会自动创建账号并提示默认密码 `AtomsDemo2026`；已有邮箱直接登录。也可以走「邮箱 + 密码 + 邮箱验证」或 Google OAuth。
 1. 首页输入「做一个团队任务看板，支持新增/完成/筛选，数据保存到 SQLite」→ 对话按智能体分组：Mike（拆解 + 判定复杂度）→ Bob（形态 / 数据模型 / API）→ Alex（脚手架、代码、回修、构建预览、启动运行时）→ 右侧 iframe 出现可交互应用。
 2. 在应用里新增几条任务 → 刷新页面 / 刷新 iframe → 数据仍在（来自 `apps/{id}/backend/data/app.db`）。
-3. 继续输入「加一个按负责人筛选」→ Mike 判断改动范围，生成 v2，已有任务不丢。
-4. 输入 `@Alex 把主按钮文案改成「立即联系」` → 只出现 Alex 的 group，直接修改前端并刷新预览。
-5. 输入 `@Mike @Bob @Alex 简单介绍下这个项目` → 三个 group 并行返回产品、架构、实现三个视角，不修改任何文件。
-6. 输入 `@Alex 今天天气怎么样？` 换行 `@Mike 曹操是谁？` → 后端按 @ 切段，Alex 只收到天气问题、Mike 只收到曹操问题，各自回答自己的那一段。
-7. 输入「今天天气怎么样？」→ 识别为咨询，Mike 回答并明确说明没有接入实时外部数据，不会触发构建。
-8. 清空 `LLM_API_KEY` 重启 → 进入 Mock 演示模式：链路照常执行，但生成明确标注的中性占位页，不会伪装成需求中的应用。
-9. 首次构建成功后顶栏出现「概览」tab → 点「发布」→「发布应用」→ 复制公开链接，在无登录窗口打开 `/s/{id}/` → 回工作台继续对话生成 v2：线上仍是 v1，概览出现「线上有未发布的变更」→「发布新变更」更新线上 → 概览「暂停访问」后公开链接 404 →「恢复在线」立即恢复，不需要构建。
+3. 继续输入「加一个按负责人筛选」→ Mike 判断改动范围，生成 v2，已有任务不丢。时间线中带 `diff` 的步骤可点击，在右侧查看本次工具改动的文件与 unified diff。
+4. 切到右侧「代码 → 未发布改动」：按发布源码基线列出变更文件；点击文件查看逐文件 diff。发布后再看，diff 清空。
+5. 输入 `@Alex 把主按钮文案改成「立即联系」` → 只出现 Alex 的 group，直接修改前端并刷新预览。
+6. 输入 `@Mike @Bob @Alex 简单介绍下这个项目` → 三个 group 并行返回产品、架构、实现三个视角，不修改任何文件。
+7. 输入 `@Alex 今天天气怎么样？` 换行 `@Mike 曹操是谁？` → 后端按 @ 切段，Alex 只收到天气问题、Mike 只收到曹操问题，各自回答自己的那一段。
+8. 输入「今天天气怎么样？」→ 识别为咨询，Mike 回答并明确说明没有接入实时外部数据，不会触发构建。
+9. 清空 `LLM_API_KEY` 重启 → 进入 Mock 演示模式：链路照常执行，但生成明确标注的中性占位页，不会伪装成需求中的应用。
+10. 首次构建成功后顶栏出现「概览」tab → 点「发布」→「发布应用」→ 复制公开链接，在无登录窗口打开 `/s/{id}/` → 回工作台继续对话生成 v2：线上仍是 v1，概览出现「线上有未发布的变更」→「发布新变更」更新线上 → 概览「暂停访问」后公开链接 404 →「恢复在线」立即恢复，不需要构建。
 
 ## 验收对照
 

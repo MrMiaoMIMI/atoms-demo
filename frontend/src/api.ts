@@ -1,9 +1,11 @@
 import type {
   AuthProviders,
   AuthUser,
+  ChangesResponse,
   DiscoverApp,
   DiscoverDetail,
   DiscoverSort,
+  FileChange,
   Health,
   Project,
   ProjectState,
@@ -172,6 +174,17 @@ export const api = {
   },
 
   getProject: (pid: string) => getJson<ProjectState>(`/api/projects/${pid}`),
+
+  projectChanges: (pid: string) =>
+    getJson<ChangesResponse>(`/api/projects/${pid}/changes`),
+
+  projectChange: (pid: string, changeId: number) =>
+    getJson<FileChange>(`/api/projects/${pid}/changes/${changeId}`),
+
+  executionChanges: (pid: string, executionId: number) =>
+    getJson<{ changes: FileChange[] }>(
+      `/api/projects/${pid}/executions/${executionId}/changes`
+    ),
 
   // Generation outlives the SSE connection; stopping it needs an explicit call.
   cancelGeneration: async (pid: string): Promise<void> => {

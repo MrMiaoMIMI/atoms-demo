@@ -13,8 +13,10 @@ import type {
   AgentKey,
   Artifact,
   AuthUser,
+  ChangesResponse,
   Conversation,
   Execution,
+  FileChange,
   Health,
   Project,
   ProjectMode,
@@ -23,7 +25,7 @@ import type {
 } from '../types';
 import { PresenceBar } from './Avatar';
 import ChatPanel from './ChatPanel';
-import FilePanel from './FilePanel';
+import CodePanel, { type StepDiff } from './CodePanel';
 import HomeSidebar from './HomeSidebar';
 import {
   AtomsMark,
@@ -103,6 +105,14 @@ export default function Workspace({
   const [groups, setGroups] = useState<ChatGroup[]>([]);
   const [artifacts, setArtifacts] = useState<Record<string, Artifact>>({});
   const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [codeView, setCodeView] = useState<'files' | 'changes'>('files');
+  const [changes, setChanges] = useState<ChangesResponse | null>(null);
+  const [changesLoading, setChangesLoading] = useState(false);
+  const [changesError, setChangesError] = useState<string | null>(null);
+  const [stepDiff, setStepDiff] = useState<StepDiff | null>(null);
+  const [stepDiffLoading, setStepDiffLoading] = useState(false);
+  const [stepDiffError, setStepDiffError] = useState<string | null>(null);
+  const [runChanges, setRunChanges] = useState<Record<number, FileChange>>({});
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [streamingFile, setStreamingFile] = useState<string | null>(null);
   const [streamingBuffer, setStreamingBuffer] = useState('');
@@ -143,6 +153,8 @@ export default function Workspace({
   const resumeStartedRef = useRef(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
   const buildCoverAttempt = useRef<string | null>(null);
+  const changesTimerRef = useRef<number | null>(null);
+  const codeViewRef = useRef<'files' | 'changes'>('files');
 
   const maybeCaptureBuildCover = useCallback(
     (version: number) => {
@@ -228,6 +240,41 @@ export default function Workspace({
     setGroups(buildGroups(state.conversations, state.executions));
   }, []);
 
+  const refreshChanges = useCallback(async () => {
+    setChangesLoading(true);
+    setChangesError(null);
+    try {
+      setChanges(await api.projectChanges(projectId));
+    } catch (err) {
+      setChangesError((err as Error).message || '未发布变更加载失败');
+    } finally {
+      setChangesLoading(false);
+    }
+  }, [projectId]);
+
+  const scheduleChangesRefresh = useCallback(() => {
+    if (changesTimerRef.current) window.clearTimeout(changesTimerRef.current);
+    changesTimerRef.current = window.setTimeout(() => {
+      changesTimerRef.current = null;
+      void refreshChanges();
+    }, 500);
+  }, [refreshChanges]);
+
+  useEffect(() => {
+    codeViewRef.current = codeView;
+  }, [codeView]);
+
+  useEffect(() => {
+    if (codeView === 'changes' && !stepDiff) void refreshChanges();
+  }, [codeView, stepDiff, refreshChanges]);
+
+  useEffect(
+    () => () => {
+      if (changesTimerRef.current) window.clearTimeout(changesTimerRef.current);
+    },
+    [],
+  );
+
   useEffect(() => {
     let cancelled = false;
     setLoaded(false);
@@ -236,6 +283,13 @@ export default function Workspace({
     setActiveFile(null);
     setPublishOpen(false);
     setPublishError(null);
+    setCodeView('files');
+    setChanges(null);
+    setChangesError(null);
+    setChangesLoading(false);
+    setStepDiff(null);
+    setStepDiffError(null);
+    setRunChanges({});
     api
       .getProject(projectId)
       .then((state) => {
@@ -474,6 +528,32 @@ export default function Workspace({
         setStreamingBuffer('');
         return;
       }
+      if (event === 'file_change') {
+        const change = data as unknown as FileChange;
+        if (typeof change.id !== 'number' || !change.filename) return;
+        setRunChanges((prev) => ({ ...prev, [change.id]: change }));
+        if (change.change_type === 'deleted') {
+          setArtifacts((prev) => {
+            if (!(change.filename in prev)) return prev;
+            const next = { ...prev };
+            delete next[change.filename];
+            return next;
+          });
+          setActiveFile((prev) =>
+            prev === change.filename ? null : prev,
+          );
+        }
+        if (codeViewRef.current === 'changes') scheduleChangesRefresh();
+        return;
+      }
+      if (event === 'changes_reset') {
+        setChanges(null);
+        setRunChanges({});
+        setStepDiff(null);
+        setStepDiffError(null);
+        if (codeViewRef.current === 'changes') scheduleChangesRefresh();
+        return;
+      }
       if (event === 'preview') {
         if (typeof data.url === 'string') setPreviewUrl(data.url);
         if (
@@ -528,8 +608,41 @@ export default function Workspace({
         );
       }
     },
-    [applyState, normalizeAgent, maybeCaptureBuildCover],
+    [applyState, normalizeAgent, maybeCaptureBuildCover, scheduleChangesRefresh],
   );
+
+  const openStepDiff = useCallback(
+    async (execution: Execution) => {
+      const changeCount =
+        execution.change_count ?? (execution.change_id ? 1 : 0);
+      if (!changeCount) return;
+      setPane('code');
+      setStepDiffError(null);
+      const live = Object.values(runChanges).filter(
+        (change) => change.execution_id === execution.id,
+      );
+      if (live.length) {
+        setStepDiff({ title: execution.step, changes: live });
+        return;
+      }
+      setStepDiff({ title: execution.step, changes: [] });
+      setStepDiffLoading(true);
+      try {
+        const data = await api.executionChanges(projectId, execution.id);
+        setStepDiff({ title: execution.step, changes: data.changes });
+      } catch (err) {
+        setStepDiffError((err as Error).message || '步骤 diff 加载失败');
+      } finally {
+        setStepDiffLoading(false);
+      }
+    },
+    [projectId, runChanges],
+  );
+
+  const closeStepDiff = useCallback(() => {
+    setStepDiff(null);
+    setStepDiffError(null);
+  }, []);
 
   const run = useCallback(
     async (text: string) => {
@@ -618,10 +731,11 @@ export default function Workspace({
           } catch {
             // Ignore; the next user action will refresh the workspace.
           }
+          void refreshChanges();
         }
       }
     },
-    [projectId, handleEvent, applyState],
+    [projectId, handleEvent, applyState, refreshChanges],
   );
 
   const resume = useCallback(async () => {
@@ -684,9 +798,10 @@ export default function Workspace({
         } catch {
           // Ignore; the next user action will refresh the workspace.
         }
+        void refreshChanges();
       }
     }
-  }, [projectId, handleEvent, applyState]);
+  }, [projectId, handleEvent, applyState, refreshChanges]);
 
   useEffect(() => {
     if (!watching || resumeStartedRef.current) return;
@@ -982,7 +1097,11 @@ export default function Workspace({
           <div className="flex items-center rounded-full bg-line-4 p-0 shadow-[inset_0_0_0_1px_rgba(12,12,12,0.03)]">
             <button
               type="button"
-              onClick={() => setPane('preview')}
+              onClick={() => {
+                setStepDiff(null);
+                setStepDiffError(null);
+                setPane('preview');
+              }}
               title="预览"
               className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
                 pane === 'preview'
@@ -996,7 +1115,11 @@ export default function Workspace({
             {hasOverview ? (
               <button
                 type="button"
-                onClick={() => setPane('overview')}
+                onClick={() => {
+                  setStepDiff(null);
+                  setStepDiffError(null);
+                  setPane('overview');
+                }}
                 title="概览"
                 aria-label="概览"
                 className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
@@ -1011,7 +1134,11 @@ export default function Workspace({
             ) : null}
             <button
               type="button"
-              onClick={() => setPane('code')}
+              onClick={() => {
+                setStepDiff(null);
+                setStepDiffError(null);
+                setPane('code');
+              }}
               title="代码"
               className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
                 pane === 'code'
@@ -1085,7 +1212,12 @@ export default function Workspace({
             error={error}
             onSend={(text) => void run(text)}
             onStop={stop}
-            onOpenCode={() => setPane('code')}
+            onOpenCode={() => {
+              setStepDiff(null);
+              setStepDiffError(null);
+              setPane('code');
+            }}
+            onOpenDiff={(execution) => void openStepDiff(execution)}
           />
         </div>
 
@@ -1117,13 +1249,28 @@ export default function Workspace({
             onOpenSite={openSite}
           />
         ) : pane === 'code' ? (
-          <FilePanel
+          <CodePanel
             projectId={projectId}
             artifacts={artifacts}
             activeFile={activeFile}
             onSelect={setActiveFile}
             streamingFile={streamingFile}
             streamingBuffer={streamingBuffer}
+            view={codeView}
+            onViewChange={(view) => {
+              setStepDiff(null);
+              setStepDiffError(null);
+              setCodeView(view);
+            }}
+            changes={changes}
+            changesLoading={changesLoading}
+            changesError={changesError}
+            onRefreshChanges={() => void refreshChanges()}
+            stepDiff={stepDiff}
+            stepDiffLoading={stepDiffLoading}
+            stepDiffError={stepDiffError}
+            onCloseStepDiff={closeStepDiff}
+            hasChanges={hasChanges}
           />
         ) : (
           <PreviewPane
