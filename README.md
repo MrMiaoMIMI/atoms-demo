@@ -272,7 +272,7 @@ cd backend
 前置条件：
 
 1. DNS：`hajimi.site` 的 A 记录指向服务器公网 IP。
-2. 腾讯云安全组放行 TCP `80` 和 `443`（80 用于 ACME 验证与跳转 HTTPS；HTTP/3 可选放行 UDP `443`）。
+2. 腾讯云安全组放行 TCP `80` 和 `443`（80 用于 ACME 验证与跳转 HTTPS）。Caddy 默认只开 HTTP/1.1 + HTTP/2：HTTP/3 会在 `Alt-Svc` 里通告 UDP `443`，一旦 UDP 被安全组/运营商丢弃，API 请求会一直等到 QUIC idle timeout（浏览器报 `ERR_QUIC_PROTOCOL_ERROR.QUIC_NETWORK_IDLE_TIMEOUT`）而不是回退 TCP。确认公网可达 UDP `443` 后再在 `caddy/Caddyfile` 里把 `servers { protocols h1 h2 }` 改成 `h1 h2 h3`。
 3. 服务器上准备 `backend/.env`（共享密钥）和 `backend/.env.production`（线上 origin、Cookie、开发模式开关）。
 4. 可选：在项目根目录创建 `.env` 设置 `DOMAIN` / `ACME_EMAIL`（Compose 自动读取）；不设置时回退到 `hajimi.site` / `admin@hajimi.site`。
 

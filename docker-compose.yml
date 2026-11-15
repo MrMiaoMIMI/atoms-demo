@@ -38,8 +38,9 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # HTTP/3 (optional). Without inbound UDP 443 browsers fall back to HTTP/2.
-      - "443:443/udp"
+      # HTTP/3 is disabled in caddy/Caddyfile (protocols h1 h2): advertising
+      # h3 while UDP 443 is unreachable makes API fetches hang until the QUIC
+      # idle timeout instead of falling back to TCP.
     environment:
       # Domain and ACME contact email. Override in a root .env file; Compose
       # loads it automatically. Caddy issues and renews the certificate.

@@ -8,6 +8,16 @@
 {
 	email {$ACME_EMAIL}
 
+	# Serve HTTP/1.1 + HTTP/2 only. With HTTP/3 enabled Caddy advertises it via
+	# Alt-Svc, and any client whose network drops UDP 443 (cloud security group,
+	# corporate Wi-Fi, ISP QoS) stalls until the QUIC idle timeout instead of
+	# falling back to TCP — the browser then reports
+	# ERR_QUIC_PROTOCOL_ERROR.QUIC_NETWORK_IDLE_TIMEOUT on API fetches. Re-enable
+	# h3 only after UDP 443 is confirmed reachable from the public internet.
+	servers {
+		protocols h1 h2
+	}
+
 	# Uncomment to test issuance without hitting the Let's Encrypt production
 	# rate limits (certificates will be untrusted by browsers):
 	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
@@ -20,6 +30,8 @@
 		X-Content-Type-Options nosniff
 		Referrer-Policy strict-origin-when-cross-origin
 		-Server
+		# Drop any Alt-Svc entry a browser cached while h3 was advertised.
+		Alt-Svc "clear"
 	}
 
 	# HTML navigations are never cached, otherwise a rebuilt image can keep
