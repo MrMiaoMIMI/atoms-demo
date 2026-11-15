@@ -218,7 +218,13 @@ export default function LoginPage({ onNavigate, onAuthenticated }: Props) {
               <GoogleButton
                 onClick={googleLogin}
                 disabled={!providers?.google}
+                disabledReason={providers?.google_reason}
               />
+              {providers && !providers.google && providers.google_reason ? (
+                <p className="text-center text-[11px] leading-5 text-ink-55">
+                  {providers.google_reason}
+                </p>
+              ) : null}
 
               <AuthDivider />
 

@@ -249,7 +249,8 @@ async def _session_response(user: dict, request: Request, payload: dict) -> JSON
 async def auth_providers() -> dict:
     """Public capabilities so the login page can render honest buttons."""
     return {
-        "google": auth.google_configured(),
+        "google": auth.google_available(),
+        "google_reason": auth.google_disabled_reason(),
         "quick": config.AUTH_DEMO_QUICK_LOGIN,
         "quick_password": (
             config.AUTH_DEMO_PASSWORD if config.AUTH_DEMO_QUICK_LOGIN else None
@@ -480,10 +481,11 @@ async def auth_reset_password(body: ResetBody):
 
 @app.get("/api/auth/google/start")
 async def google_start(request: Request, redirect: str = "/dashboard"):
-    if not auth.google_configured():
+    if not auth.google_available():
         raise HTTPException(
             status_code=503,
-            detail="Google 登录尚未配置，请先设置 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET",
+            detail=auth.google_disabled_reason()
+            or "Google 登录不可用，请使用邮箱登录",
         )
     state = auth.new_token(24)
     response = RedirectResponse(
@@ -635,7 +637,8 @@ async def health() -> dict:
         "running_apps": runtime.runtime.running(),
         "auth": {
             "mail": mailer.mode(),
-            "google": auth.google_configured(),
+            "google": auth.google_available(),
+            "google_reason": auth.google_disabled_reason(),
             "quick": config.AUTH_DEMO_QUICK_LOGIN,
         },
     }

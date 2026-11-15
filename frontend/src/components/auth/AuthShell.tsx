@@ -46,24 +46,26 @@ export function GoogleButton({
   onClick,
   disabled = false,
   label = '使用 Google 继续',
+  disabledReason,
 }: {
   onClick?: () => void;
   disabled?: boolean;
   label?: string;
+  disabledReason?: string | null;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
-      title={disabled ? 'Google 登录尚未配置' : undefined}
+      title={disabled ? disabledReason || 'Google 登录尚未配置' : undefined}
       className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-line-8 bg-white text-[13px] font-medium text-ink-95 transition hover:bg-[#FAFAF9] disabled:cursor-not-allowed disabled:text-ink-30 disabled:hover:bg-white"
     >
       <GoogleG />
       <span>{label}</span>
       {disabled ? (
         <span className="rounded-full border border-line-6 px-1.5 py-0.5 text-[10px] leading-none text-ink-30">
-          未配置
+          不可用
         </span>
       ) : null}
     </button>

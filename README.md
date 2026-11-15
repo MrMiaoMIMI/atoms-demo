@@ -260,6 +260,8 @@ cd backend
 | `AUTH_DEMO_PASSWORD` | `AtomsDemo2026` | 快捷登录新账号的默认密码 |
 | `AUTH_DEV_LINKS` | 自动 | SMTP 未配置时自动在页面展示验证/重置链接；设为 `1` 强制开启（即使 SMTP 已配置，邮件仍会真实发送），`0` 关闭（生产） |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | 空 | Google OAuth 凭据（共享 `.env`） |
+| `AUTH_GOOGLE_ENABLED` | `1` | 是否开放 Google 登录；国内服务器设为 `0` 时登录页禁用按钮并展示原因（放 `.env.production`） |
+| `AUTH_GOOGLE_DISABLED_REASON` | 腾讯云国内服务器提示 | `AUTH_GOOGLE_ENABLED=0` 时登录页展示的原因文案 |
 | `GOOGLE_REDIRECT_URI` | `{PUBLIC_BASE_URL}/api/auth/google/callback` | 留空即可按环境推导；Google Console 中本地与线上两个回调地址都要登记 |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_TLS` | 空 / `465` / `ssl` | SMTP 服务器；QQ 邮箱用 `smtp.qq.com:465` + SSL |
 | `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | 空 | SMTP 账号、授权码、发件人 |

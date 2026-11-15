@@ -286,6 +286,25 @@ def google_configured() -> bool:
     return bool(config.GOOGLE_CLIENT_ID and config.GOOGLE_CLIENT_SECRET)
 
 
+def google_enabled() -> bool:
+    """Environment gate for the Google login entry (credentials aside)."""
+    return config.AUTH_GOOGLE_ENABLED
+
+
+def google_available() -> bool:
+    """Google login can actually be offered: enabled and configured."""
+    return google_enabled() and google_configured()
+
+
+def google_disabled_reason() -> str | None:
+    """User-facing explanation when Google login cannot be offered."""
+    if not google_enabled():
+        return config.AUTH_GOOGLE_DISABLED_REASON
+    if not google_configured():
+        return "Google 登录尚未配置，请使用邮箱登录。"
+    return None
+
+
 def google_redirect_uri(request: Request) -> str:
     if config.GOOGLE_REDIRECT_URI:
         return config.GOOGLE_REDIRECT_URI

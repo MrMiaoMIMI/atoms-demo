@@ -93,6 +93,7 @@ export interface AuthUser {
 
 export interface AuthProviders {
   google: boolean;
+  google_reason?: string | null;
   quick: boolean;
   quick_password?: string | null;
   mail: "smtp" | "dev";
@@ -206,6 +207,7 @@ export interface Health {
   auth?: {
     mail: "smtp" | "dev";
     google: boolean;
+    google_reason?: string | null;
     quick: boolean;
   };
 }

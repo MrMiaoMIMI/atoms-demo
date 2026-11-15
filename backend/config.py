@@ -136,6 +136,16 @@ SCRYPT_P = int(os.getenv("SCRYPT_P", "1"))
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+# Some deployments (e.g. mainland-China servers) cannot reach Google at all.
+# Setting AUTH_GOOGLE_ENABLED=0 hides the login entry from the client and makes
+# /api/auth/google/start refuse the request; the login page shows the reason.
+AUTH_GOOGLE_ENABLED = os.getenv("AUTH_GOOGLE_ENABLED", "1") != "0"
+_GOOGLE_DISABLED_DEFAULT_REASON = (
+    "由于使用腾讯云国内服务器，无法访问google执行登录操作"
+)
+AUTH_GOOGLE_DISABLED_REASON = (
+    os.getenv("AUTH_GOOGLE_DISABLED_REASON") or _GOOGLE_DISABLED_DEFAULT_REASON
+).strip()
 
 # SMTP (QQ Mail: smtp.qq.com, 465/ssl, authorization code as password).
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
