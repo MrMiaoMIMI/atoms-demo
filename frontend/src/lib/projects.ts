@@ -22,13 +22,39 @@ export const STATUS_LABEL: Record<ProjectStatus, string> = {
 
 export const STATUS_TONE: Record<
   ProjectStatus,
-  { badge: string; dot: string }
+  { badge: string; dot: string; text: string }
 > = {
-  draft: { badge: 'bg-line-4 text-ink-55', dot: 'bg-ink-30' },
-  unpublished: { badge: 'bg-warning/10 text-warning', dot: 'bg-warning' },
-  online: { badge: 'bg-positive/10 text-positive', dot: 'bg-positive' },
-  paused: { badge: 'bg-line-6 text-ink-55', dot: 'bg-ink-30' },
+  draft: {
+    badge: 'bg-line-4 text-ink-55',
+    dot: 'bg-ink-30',
+    text: 'text-ink-55',
+  },
+  unpublished: {
+    badge: 'bg-line-4 text-ink-55',
+    dot: 'bg-ink-30',
+    text: 'text-ink-55',
+  },
+  online: {
+    badge: 'bg-positive/10 text-positive',
+    dot: 'bg-positive',
+    text: 'text-positive',
+  },
+  paused: {
+    badge: 'bg-warning/10 text-warning',
+    dot: 'bg-warning',
+    text: 'text-warning',
+  },
 };
+
+/** 暂停 / 恢复按钮共用状态色，避免概览与发布弹窗各写一套。 */
+export const PAUSE_ACTION_CLASS =
+  'border-warning/30 bg-white text-warning hover:border-warning/60 hover:bg-warning/10';
+
+export const RESUME_ACTION_CLASS =
+  'border-positive bg-positive text-white hover:bg-positive/90';
+
+export const RESUME_OUTLINE_CLASS =
+  'border-positive/30 bg-white text-positive hover:border-positive/60 hover:bg-positive/10';
 
 /** Fall back to the persisted versions if an older response omits status. */
 export function projectStatus(project: StatusFields): ProjectStatus {

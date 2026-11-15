@@ -1,6 +1,8 @@
 import type { Project, ProjectMode, ProjectStatus } from '../types';
 import {
   MODE_LABEL,
+  PAUSE_ACTION_CLASS,
+  RESUME_ACTION_CLASS,
   STATUS_LABEL,
   STATUS_TONE,
   absoluteUrl,
@@ -227,8 +229,8 @@ export default function OverviewPane({
                     disabled={busy}
                     className={`mt-3 inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12px] font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
                       status === 'online'
-                        ? 'border-line-6 bg-white text-ink-80 hover:border-line-12 hover:text-ink-95'
-                        : 'border-brand bg-brand text-white hover:bg-brand-600'
+                        ? PAUSE_ACTION_CLASS
+                        : RESUME_ACTION_CLASS
                     }`}
                   >
                     {busy ? <Spinner size={13} /> : null}

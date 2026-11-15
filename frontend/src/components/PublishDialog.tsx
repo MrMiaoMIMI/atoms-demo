@@ -4,7 +4,12 @@ import {
   DISCOVER_CATEGORIES,
   isDiscoverCategory,
 } from '../lib/discover';
-import { absoluteUrl } from '../lib/projects';
+import {
+  PAUSE_ACTION_CLASS,
+  RESUME_ACTION_CLASS,
+  RESUME_OUTLINE_CLASS,
+  absoluteUrl,
+} from '../lib/projects';
 import { Check, Copy, ExternalLink, Sparkle, Spinner, X } from './Icons';
 
 interface Props {
@@ -307,7 +312,7 @@ export default function PublishDialog({
                 type="button"
                 onClick={onPause}
                 disabled={busy}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full border border-line-6 bg-white px-4 text-[12px] font-medium text-ink-80 transition hover:border-line-12 hover:text-ink-95 disabled:cursor-not-allowed disabled:opacity-40"
+                className={`inline-flex h-9 items-center gap-1.5 rounded-full border px-4 text-[12px] font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${PAUSE_ACTION_CLASS}`}
               >
                 {busy ? <Spinner size={13} /> : null}
                 暂停访问
@@ -357,7 +362,7 @@ export default function PublishDialog({
                 type="button"
                 onClick={onResume}
                 disabled={busy}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-brand px-4 text-[12px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
+                className={`inline-flex h-9 items-center gap-1.5 rounded-full border px-4 text-[12px] font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${RESUME_ACTION_CLASS}`}
               >
                 {busy ? <Spinner size={13} /> : null}
                 恢复在线
@@ -378,7 +383,7 @@ export default function PublishDialog({
                 type="button"
                 onClick={onResume}
                 disabled={busy}
-                className="inline-flex h-9 items-center rounded-full border border-line-6 bg-white px-4 text-[12px] font-medium text-ink-80 transition hover:border-line-12 hover:text-ink-95 disabled:cursor-not-allowed disabled:opacity-40"
+                className={`inline-flex h-9 items-center rounded-full border px-4 text-[12px] font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${RESUME_OUTLINE_CLASS}`}
               >
                 恢复在线
               </button>

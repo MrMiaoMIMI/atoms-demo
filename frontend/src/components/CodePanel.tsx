@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   Artifact,
   ChangeFile,
@@ -6,15 +6,19 @@ import type {
   ChangesResponse,
   FileChange,
 } from "../types";
-import { fileBadge } from "../lib/files";
+import { buildFileTree, fileBadge, flattenFiles, type FileNode } from "../lib/files";
 import DiffView from "./DiffView";
 import FilePanel from "./FilePanel";
 import {
   AlertTriangle,
   ChevronLeft,
+  ChevronRight,
   Code,
   FileText,
+  Folder,
+  PanelLeft,
   Refresh,
+  Search,
   Spinner,
 } from "./Icons";
 
@@ -83,10 +87,160 @@ function toChangeFile(change: FileChange): ChangeFile {
   };
 }
 
+interface ChangeTreeNode {
+  type: "dir" | "file";
+  name: string;
+  path: string;
+  additions: number;
+  deletions: number;
+  file?: ChangeFile;
+  children?: ChangeTreeNode[];
+}
+
+/** Reuse the file tab's tree shape so both lists nest and order files alike. */
+function buildChangeTree(files: ChangeFile[]): ChangeTreeNode[] {
+  const byPath = new Map(files.map((file) => [file.filename, file]));
+  const convert = (nodes: FileNode[]): ChangeTreeNode[] =>
+    nodes.map((node) => {
+      if (node.type === "file") {
+        const file = byPath.get(node.path);
+        return {
+          type: "file" as const,
+          name: node.name,
+          path: node.path,
+          additions: file?.additions ?? 0,
+          deletions: file?.deletions ?? 0,
+          file,
+        };
+      }
+      const children = convert(node.children ?? []);
+      return {
+        type: "dir" as const,
+        name: node.name,
+        path: node.path,
+        additions: children.reduce((sum, child) => sum + child.additions, 0),
+        deletions: children.reduce((sum, child) => sum + child.deletions, 0),
+        children,
+      };
+    });
+  return convert(buildFileTree(files.map((file) => file.filename)));
+}
+
+function ChangeFileRow({
+  file,
+  label,
+  active,
+  paddingLeft,
+  onSelect,
+}: {
+  file: ChangeFile;
+  label: string;
+  active: boolean;
+  paddingLeft: number;
+  onSelect: (path: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={file.filename}
+      onClick={() => onSelect(file.filename)}
+      className={`flex h-[26px] w-full items-center gap-1.5 rounded-md pr-2 text-left text-[12px] transition ${
+        active
+          ? "bg-line-6 text-ink-95"
+          : "text-ink-80 hover:bg-line-4 hover:text-ink-95"
+      }`}
+      style={{ paddingLeft }}
+    >
+      <FileBadge name={file.filename} />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <span
+        className={`flex-none rounded px-1.5 py-0.5 text-[10px] font-medium ${CHANGE_CLASS[file.change_type]}`}
+      >
+        {CHANGE_LABEL[file.change_type]}
+      </span>
+      <span className="flex flex-none items-center gap-1 font-mono text-[10px]">
+        <span className="text-[#15803d]">+{file.additions}</span>
+        <span className="text-[#b91c1c]">−{file.deletions}</span>
+      </span>
+    </button>
+  );
+}
+
+function ChangeTreeRows({
+  nodes,
+  depth,
+  activePath,
+  collapsed,
+  onToggle,
+  onSelect,
+}: {
+  nodes: ChangeTreeNode[];
+  depth: number;
+  activePath: string | null;
+  collapsed: Set<string>;
+  onToggle: (path: string) => void;
+  onSelect: (path: string) => void;
+}) {
+  return (
+    <>
+      {nodes.map((node) => {
+        const pad = 8 + depth * 12;
+        if (node.type === "dir") {
+          const isCollapsed = collapsed.has(node.path);
+          return (
+            <div key={node.path}>
+              <button
+                type="button"
+                onClick={() => onToggle(node.path)}
+                title={node.path}
+                className="flex h-[26px] w-full items-center gap-1.5 rounded-md pr-2 text-left text-[12px] text-ink-80 transition hover:bg-line-4 hover:text-ink-95"
+                style={{ paddingLeft: pad }}
+              >
+                <ChevronRight
+                  size={12}
+                  className={`flex-none text-ink-30 transition-transform ${
+                    isCollapsed ? "" : "rotate-90"
+                  }`}
+                />
+                <Folder size={14} className="flex-none text-ink-30" />
+                <span className="min-w-0 flex-1 truncate">{node.name}</span>
+                <span className="flex flex-none items-center gap-1 font-mono text-[10px]">
+                  <span className="text-[#15803d]">+{node.additions}</span>
+                  <span className="text-[#b91c1c]">−{node.deletions}</span>
+                </span>
+              </button>
+              {isCollapsed ? null : (
+                <ChangeTreeRows
+                  nodes={node.children ?? []}
+                  depth={depth + 1}
+                  activePath={activePath}
+                  collapsed={collapsed}
+                  onToggle={onToggle}
+                  onSelect={onSelect}
+                />
+              )}
+            </div>
+          );
+        }
+        const file = node.file;
+        if (!file) return null;
+        return (
+          <ChangeFileRow
+            key={node.path}
+            file={file}
+            label={node.name}
+            active={node.path === activePath}
+            paddingLeft={pad + 13}
+            onSelect={onSelect}
+          />
+        );
+      })}
+    </>
+  );
+}
+
 function DiffBrowser({
   files,
-  title,
-  subtitle,
   loading,
   error,
   notice,
@@ -94,8 +248,6 @@ function DiffBrowser({
   onRetry,
 }: {
   files: ChangeFile[];
-  title: string;
-  subtitle?: string;
   loading?: boolean;
   error?: string | null;
   notice?: string | null;
@@ -103,6 +255,23 @@ function DiffBrowser({
   onRetry?: () => void;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [treeOpen, setTreeOpen] = useState(true);
+  const [query, setQuery] = useState("");
+  const tree = useMemo(() => buildChangeTree(files), [files]);
+  const ordered = useMemo(() => flattenFiles(tree), [tree]);
+  const byName = useMemo(
+    () => new Map(files.map((file) => [file.filename, file])),
+    [files],
+  );
+  const results = useMemo(() => {
+    const value = query.trim().toLowerCase();
+    if (!value) return [];
+    return ordered
+      .filter((name) => name.toLowerCase().includes(value))
+      .map((name) => byName.get(name))
+      .filter((file): file is ChangeFile => Boolean(file));
+  }, [ordered, byName, query]);
 
   useEffect(() => {
     setSelected((current) =>
@@ -114,57 +283,102 @@ function DiffBrowser({
 
   const active = files.find((file) => file.filename === selected) ?? files[0];
 
+  function toggleFolder(path: string) {
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+
   return (
     <section className="flex min-h-0 min-w-0 flex-1 bg-white pb-2 pr-2">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-[16px] border border-line-4 bg-white md:flex-row">
-        <div className="flex w-full flex-none flex-col border-b border-line-6 bg-white md:w-[270px] md:border-b-0 md:border-r">
-          <div className="flex h-11 flex-none items-center justify-between gap-2 border-b border-line-4 px-3">
-            <span className="truncate text-[12px] font-medium text-ink-95">
-              {title}
-            </span>
-            {subtitle ? (
-              <span className="flex-none text-[11px] text-ink-30">{subtitle}</span>
-            ) : null}
-          </div>
-          <div className="max-h-[220px] min-h-0 flex-1 overflow-y-auto p-1.5 md:max-h-none">
-            {files.length === 0 && loading ? (
-              <p className="px-2 py-2 text-[12px] text-ink-30">正在加载变更…</p>
-            ) : (
-              files.map((file) => {
-                const isActive = file.filename === active?.filename;
-                return (
-                  <button
-                    key={file.filename}
-                    type="button"
-                    title={file.filename}
-                    onClick={() => setSelected(file.filename)}
-                    className={`mb-0.5 flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[12px] transition ${
-                      isActive
-                        ? "bg-line-6 text-ink-95"
-                        : "text-ink-80 hover:bg-line-4 hover:text-ink-95"
-                    }`}
-                  >
-                    <FileBadge name={file.filename} />
-                    <span className="min-w-0 flex-1 truncate">
-                      {file.filename.split("/").pop()}
-                    </span>
-                    <span
-                      className={`flex-none rounded px-1.5 py-0.5 text-[10px] font-medium ${CHANGE_CLASS[file.change_type]}`}
-                    >
-                      {CHANGE_LABEL[file.change_type]}
-                    </span>
-                    <span className="flex flex-none items-center gap-1 font-mono text-[10px]">
-                      <span className="text-[#15803d]">+{file.additions}</span>
-                      <span className="text-[#b91c1c]">−{file.deletions}</span>
-                    </span>
-                  </button>
-                );
-              })
-            )}
-          </div>
+        <div
+          className={`flex flex-none flex-col bg-white ${
+            treeOpen
+              ? "w-full border-b border-line-6 md:w-[270px] md:border-b-0 md:border-r"
+              : "w-10 items-center border-b border-line-6 py-2 md:border-b-0 md:border-r"
+          }`}
+        >
+          {treeOpen ? (
+            <>
+              <div className="flex h-11 flex-none items-center gap-2 border-b border-line-4 px-2.5">
+                <button
+                  type="button"
+                  onClick={() => setTreeOpen(false)}
+                  title="收起变更树"
+                  className="grid h-7 w-7 flex-none place-items-center rounded-md text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
+                >
+                  <PanelLeft size={16} />
+                </button>
+                <div className="relative min-w-0 flex-1">
+                  <Search
+                    size={14}
+                    className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-30"
+                  />
+                  <input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="搜索"
+                    className="h-8 w-full rounded-lg border border-line-6 bg-base px-2.5 pl-7 text-[12px] text-ink-95 outline-none transition placeholder:text-ink-30 focus:border-brand/40"
+                  />
+                </div>
+              </div>
+              <div className="max-h-[220px] min-h-0 flex-1 overflow-y-auto p-1.5 md:max-h-none">
+                {files.length === 0 && loading ? (
+                  <p className="px-2 py-2 text-[12px] text-ink-30">
+                    正在加载变更…
+                  </p>
+                ) : query.trim() ? (
+                  results.length ? (
+                    results.map((file) => (
+                      <ChangeFileRow
+                        key={file.filename}
+                        file={file}
+                        label={file.filename}
+                        active={file.filename === active?.filename}
+                        paddingLeft={8}
+                        onSelect={setSelected}
+                      />
+                    ))
+                  ) : (
+                    <p className="px-2 py-2 text-[12px] text-ink-30">
+                      没有匹配的文件
+                    </p>
+                  )
+                ) : (
+                  <ChangeTreeRows
+                    nodes={tree}
+                    depth={0}
+                    activePath={active?.filename ?? null}
+                    collapsed={collapsed}
+                    onToggle={toggleFolder}
+                    onSelect={setSelected}
+                  />
+                )}
+              </div>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setTreeOpen(true)}
+              title="展开变更树"
+              className="grid h-8 w-8 place-items-center rounded-md text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
+            >
+              <PanelLeft size={16} />
+            </button>
+          )}
         </div>
 
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {notice ? (
+            <p className="flex flex-none items-start gap-1.5 border-b border-line-4 bg-[rgba(245,158,11,0.08)] px-3 py-1.5 text-[11px] leading-[16px] text-warning">
+              <AlertTriangle size={12} className="mt-[2px] flex-none" />
+              <span className="min-w-0">{notice}</span>
+            </p>
+          ) : null}
           {active ? (
             <>
               <div className="flex h-11 flex-none items-center justify-between gap-3 border-b border-line-4 px-3">
@@ -185,10 +399,6 @@ function DiffBrowser({
               {error ? (
                 <p className="border-b border-line-4 bg-[rgba(239,68,68,0.06)] px-3 py-1.5 text-[11px] text-danger">
                   {error}
-                </p>
-              ) : notice ? (
-                <p className="border-b border-line-4 bg-[rgba(245,158,11,0.08)] px-3 py-1.5 text-[11px] text-warning">
-                  {notice}
                 </p>
               ) : null}
               <DiffView diff={active.diff} truncated={active.truncated} />
@@ -215,13 +425,6 @@ function DiffBrowser({
                       <Refresh size={12} /> 重试
                     </button>
                   ) : null}
-                </>
-              ) : notice ? (
-                <>
-                  <AlertTriangle size={22} className="text-warning" />
-                  <p className="max-w-[320px] text-[12px] leading-[18px] text-ink-55">
-                    {notice}
-                  </p>
                 </>
               ) : (
                 <>
@@ -262,12 +465,12 @@ export default function CodePanel({
   const aggregateNote = !changes
     ? null
     : !changes.has_published
-      ? "项目尚未发布，以下为当前全部文件；发布后会以发布快照为基线计算 diff。"
+      ? "项目尚未发布，暂时没有线上基线，全部文件按新增展示；发布后会按发布快照计算 diff。"
       : !changes.baseline_ok
-        ? "发布基线尚未建立。下一次发布成功后会启用未发布改动 diff。"
+        ? "发布基线尚未建立，暂时无法计算未发布改动；下一次发布成功后会启用。"
         : null;
   const stepNote = stepDiff?.changes.some((change) => change.rolled_back)
-    ? "本轮改动已回滚；下面是回滚前的 diff 记录。"
+    ? "本轮改动已回滚，以下为回滚前的 diff 记录。"
     : null;
 
   return (
@@ -311,34 +514,20 @@ export default function CodePanel({
             >
               <Code size={13} />
               未发布改动              {changeCount != null && changeCount > 0 ? (
-                <span className="rounded-full bg-brand-50 px-1.5 text-[10px] font-medium text-brand-text">
+                <span className="rounded-full bg-[rgba(216,122,22,0.12)] px-1.5 text-[10px] font-medium text-warning">
                   {changeCount}
                 </span>
               ) : changeCount == null && hasChanges ? (
-                <span className="h-1.5 w-1.5 rounded-full bg-brand" />
+                <span className="h-1.5 w-1.5 rounded-full bg-warning" />
               ) : null}
             </button>
           </div>
         )}
-
-        {!stepDiff && view === "changes" ? (
-          <button
-            type="button"
-            onClick={onRefreshChanges}
-            disabled={changesLoading}
-            className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] text-ink-55 transition hover:bg-line-4 hover:text-ink-95 disabled:opacity-40"
-          >
-            <Refresh size={13} />
-            刷新
-          </button>
-        ) : null}
       </div>
 
       {stepDiff ? (
         <DiffBrowser
           files={stepDiff.changes.map(toChangeFile)}
-          title="本次工具改动"
-          subtitle={`${stepDiff.changes.length} 个文件`}
           loading={stepDiffLoading}
           error={stepDiffError}
           notice={stepNote}
@@ -356,14 +545,6 @@ export default function CodePanel({
       ) : (
         <DiffBrowser
           files={changes?.files ?? []}
-          title="未发布改动"
-          subtitle={
-            changes
-              ? changes.has_published
-                ? `v${changes.published_version ?? "—"} → v${changes.current_version}`
-                : "尚未发布"
-              : undefined
-          }
           loading={changesLoading}
           error={changesError}
           notice={aggregateNote}

@@ -154,6 +154,7 @@ export default function Workspace({
   const dragCleanupRef = useRef<(() => void) | null>(null);
   const buildCoverAttempt = useRef<string | null>(null);
   const changesTimerRef = useRef<number | null>(null);
+  const changesRequestRef = useRef(0);
   const codeViewRef = useRef<'files' | 'changes'>('files');
 
   const maybeCaptureBuildCover = useCallback(
@@ -241,14 +242,20 @@ export default function Workspace({
   }, []);
 
   const refreshChanges = useCallback(async () => {
+    // Publishing changes the diff baseline, so a slow pre-publish response
+    // must not overwrite a newer one when both are in flight.
+    const request = ++changesRequestRef.current;
     setChangesLoading(true);
     setChangesError(null);
     try {
-      setChanges(await api.projectChanges(projectId));
+      const next = await api.projectChanges(projectId);
+      if (changesRequestRef.current === request) setChanges(next);
     } catch (err) {
-      setChangesError((err as Error).message || '未发布变更加载失败');
+      if (changesRequestRef.current === request) {
+        setChangesError((err as Error).message || '未发布变更加载失败');
+      }
     } finally {
-      setChangesLoading(false);
+      if (changesRequestRef.current === request) setChangesLoading(false);
     }
   }, [projectId]);
 
@@ -312,6 +319,10 @@ export default function Workspace({
           setWatching(true);
         }
         setLoaded(true);
+        // Prefetch the aggregate diff so the changes tab shows its file count
+        // (and any baseline notice) right after a page refresh, instead of
+        // only after the tab is first opened.
+        void refreshChanges();
       })
       .catch((err: Error) => {
         if (cancelled) return;
@@ -321,7 +332,7 @@ export default function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [projectId, applyState, maybeCaptureBuildCover]);
+  }, [projectId, applyState, maybeCaptureBuildCover, refreshChanges]);
 
   // The overview only exists after the first successful build; never leave the
   // right pane pointing at a hidden mode.
@@ -898,6 +909,11 @@ export default function Workspace({
         category: publishCategory,
       });
       await reloadProject();
+      // Publishing moves the diff baseline to the current build, so the
+      // unpublished-changes badge and list must be recomputed right away
+      // instead of staying on the pre-publish snapshot until the tab is
+      // opened again.
+      void refreshChanges();
       setPublishOpen(false);
       // The cover is captured from the just-published workspace build. It is
       // best-effort: a failure leaves the discover card on its CSS cover.
@@ -915,6 +931,7 @@ export default function Workspace({
     publishDescription,
     publishCategory,
     reloadProject,
+    refreshChanges,
   ]);
 
   const doPause = useCallback(async () => {

@@ -134,7 +134,9 @@ export default function ProjectCard({
         ) : (
           <ProjectCover project={project} />
         )}
-        <div className="absolute left-2 top-2 inline-flex items-center gap-1.5 rounded-full bg-white/90 px-2 py-1 text-[10px] font-medium text-ink-80 shadow-sm backdrop-blur">
+        <div
+          className={`absolute left-2 top-2 inline-flex items-center gap-1.5 rounded-full bg-white/90 px-2 py-1 text-[10px] font-medium shadow-sm backdrop-blur ${STATUS_TONE[status].text}`}
+        >
           <span
             className={`h-1.5 w-1.5 rounded-full ${STATUS_TONE[status].dot}`}
           />
