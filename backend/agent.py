@@ -1858,7 +1858,7 @@ async def _build_project(
     deploy_ex = await emit(
         "execution",
         {
-            "step": "发布项目",
+            "step": "生成构建产物",
             "status": "running",
             "log": f"写入 /apps/{pid}/ 并准备运行时",
         },
@@ -1966,7 +1966,7 @@ async def _build_project(
                     "execution",
                     {
                         "id": deploy_ex,
-                        "step": "发布项目",
+                        "step": "生成构建产物",
                         "status": "error",
                         "log": "前端构建失败，本轮改动已回滚",
                     },
@@ -2068,7 +2068,7 @@ async def _build_project(
                 "execution",
                 {
                     "id": deploy_ex,
-                    "step": "发布项目",
+                    "step": "生成构建产物",
                     "status": "error",
                     "log": "后端启动失败，本轮改动已回滚",
                 },
@@ -2087,13 +2087,16 @@ async def _build_project(
     # Keep the artifact table in sync with what is actually on disk (mode
     # downgrades can drop files from the project tree).
     await db.delete_artifacts_except(pid, set(published))
+    # Persisted success marker: the overview only offers publish after this
+    # point (preview built and, for fullstack/backend, runtime healthy).
+    await db.mark_built(pid, version)
 
     preview_url = f"/apps/{pid}/?v={version}"
     await emit(
         "execution",
         {
             "id": deploy_ex,
-            "step": "发布项目",
+            "step": "生成构建产物",
             "status": "success",
             "log": f"v{version} 可访问：{preview_url}",
         },

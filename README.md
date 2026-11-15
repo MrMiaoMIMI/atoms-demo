@@ -25,6 +25,7 @@
 - **Google OAuth**：配置 `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` 后启用真实的 Authorization Code 流程。Google 不允许公网 IP 的 HTTP 回调，因此需要 HTTPS 域名；项目已内置 Let's Encrypt 配置。
 - **会话安全**：HttpOnly + SameSite=Lax 的随机 token cookie，服务端只存 token 的 SHA-256；密码使用标准库 `scrypt` 加盐哈希；登录/注册/发信接口有内存级限流。
 - **用户隔离**：`projects.user_id` 归属校验覆盖项目列表、详情、生成、SSE、导出、删除和 `/apps/{id}/` HTML 入口，越权统一返回 404。
+- **公开站点例外**：发布后的项目走 `/s/{id}/`（含 `/s/{id}/api/*`），不要求登录；未发布或暂停时统一 404。工作台预览 `/apps/{id}/` 仍仅项目所有者可打开。
 - **已知演示边界**：沙箱 iframe 自身的 `fetch()` 默认不携带 cookie，因此 `/apps/{id}/api/*` 和静态资源不额外校验登录；预览 HTML 入口仍要求项目所有者登录。真实生产化需要把生成项目放到独立域名/容器中做隔离。
 
 ## 生成物形态
@@ -58,10 +59,30 @@ apps/{project_id}/
 │   ├── requirements.txt
 │   └── data/app.db              # 项目自己的 SQLite，随项目目录持久化
 ├── README.md
-└── .gitignore
+├── ...                          # .gitignore / .preview / .runtime.log 等
+├── .preview/                    # 工作台预览构建产物（构建成功即刷新）
+└── .published/                  # 发布快照（仅显式发布时替换）
+    ├── site/                    # 构建产物副本，<base> 改写为 /s/{id}/
+    ├── backend/                 # 后端源码副本；data 软链到工作区 backend/data
+    └── manifest.json            # version / mode / title / published_at
 ```
 
-所有前端请求统一使用相对路径 `api/...`。预览时页面有 `<base href="/apps/{id}/">`，因此同一个前端源码在本地 Vite、独立部署和 Atoms 子路径预览下都能工作。
+所有前端请求统一使用相对路径 `api/...`。预览时页面有 `<base href="/apps/{id}/">`，因此同一个前端源码在本地 Vite、独立部署和 Atoms 子路径预览下都能工作。发布快照里的 `<base>` 会改写为 `/s/{id}/`。
+
+### 生命周期与发布
+
+| 状态 | 含义 | 进入方式 |
+| --- | --- | --- |
+| `draft` / 未构建 | 创建后还没有成功构建 | 新建项目 |
+| `unpublished` / 未发布 | 至少一次构建成功，但还没有发布 | 首次构建成功 |
+| `online` / 在线 | 公开链接可访问 | 点击发布 |
+| `paused` / 暂停 | 公开链接统一 404 | 在线时暂停 |
+
+- 构建成功才写 `built_version`；失败 / 回滚不更新，所以不会出现“发布了半成品”。
+- `has_changes = built_version > published_version`：发布后继续 chat 构建，线上仍跑旧快照，概览提示“线上有未发布的变更”。
+- 发布 = 把 `.preview` 与后端源码复制成 `.published/` 快照，并为发布快照启动独立 uvicorn（`pid#published`，`APP_ROOT_PATH=/s/{id}`）；工作台构建只改写工作区，不会碰到线上进程与快照。
+- 暂停 / 恢复只改 `projects.paused` 并停止发布运行时，不重新构建；恢复后首个访问懒启动。
+- 线上与工作台共用 `backend/data/app.db`，访客写入的数据在工作台预览也能看到。
 
 ## 架构
 
@@ -80,8 +101,14 @@ apps/{project_id}/
  ├─ SQLite (WAL): users / sessions / email_tokens / projects(user_id) /
  │                 conversations(agent, run_id, run_index) / artifacts / executions(run_id)
  │
- ├─ iframe /apps/{id}/ ───────────────► Nginx ──► FastAPI 预览静态文件
- │                                        └─► /apps/{id}/api/* ──► 项目 uvicorn 进程
+ ├─ iframe /apps/{id}/ ───────────────► Nginx ──► FastAPI 预览静态文件（需登录）
+ │                                        └─► /apps/{id}/api/* ──► 工作区 uvicorn
+ │
+ ├─ /s/{id}/（公开）──────────────────► 发布快照静态文件（暂停/未发布 404）
+ │                                        └─► /s/{id}/api/* ──► 发布快照独立 uvicorn
+ │
+ ├─ 生命周期: draft → unpublished → online ⇄ paused
+ │              built_version / published_version / paused 持久化在 projects
  │
  └─ 项目 SQLite: apps/{id}/backend/data/app.db（与 demo 数据库完全隔离）
 ```
@@ -246,22 +273,27 @@ CERTBOT_EMAIL=you@example.com ./scripts/init-letsencrypt.sh
 | GET | `/api/auth/google/callback` | Google OAuth 回调 |
 | GET | `/api/auth/providers` | 当前启用的登录方式 |
 
-> 除 `/api/health` 和 `/api/auth/*` 外，所有 `/api/projects*` 以及 `/apps/{id}/` HTML 入口都需要登录，并校验项目归属。
+> 除 `/api/health`、`/api/auth/*` 和已发布站点 `/s/{id}/` 外，所有 `/api/projects*` 以及 `/apps/{id}/` HTML 入口都需要登录，并校验项目归属。
 
 ### 项目
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/health` | 健康检查，返回 LLM 模式、运行中的项目与认证能力 |
-| GET | `/api/projects` | 项目列表（含 `mode`） |
+| GET | `/api/projects` | 项目列表（含 `mode`、`status`、`has_changes`） |
 | POST | `/api/projects` | 创建项目 `{prompt?, name?}`；省略 `name` 时后台用 LLM 把首条需求概括为短名称 |
-| GET | `/api/projects/{id}` | 完整状态（对话、最新文件、执行记录、`mode`、`preview_url`） |
-| DELETE | `/api/projects/{id}` | 删除项目、生成物并停止其运行时 |
+| GET | `/api/projects/{id}` | 完整状态（对话、最新文件、执行记录、`mode`、`preview_url`、`status`、`published_url`） |
+| DELETE | `/api/projects/{id}` | 删除项目、生成物、发布快照并停止工作区 / 发布运行时 |
 | POST | `/api/projects/{id}/generate` | `{message}`，返回 SSE 流 |
+| POST | `/api/projects/{id}/publish` | 把最近一次成功构建快照为公开站点；构建中返回 409 |
+| POST | `/api/projects/{id}/pause` | 暂停公开站点（不重建） |
+| POST | `/api/projects/{id}/resume` | 恢复公开站点（懒启动发布运行时） |
 | GET | `/api/projects/{id}/export` | 下载最新源代码 ZIP 仓库包（`Content-Disposition: attachment`） |
-| GET | `/apps/{id}/` | 已发布项目预览 |
-| GET/POST/... | `/apps/{id}/api/*` | 代理到该项目自己的 FastAPI 后端 |
-| GET | `/apps/{id}/docs` | 生成项目的 Swagger 文档 |
+| GET | `/apps/{id}/` | 工作台预览入口（需登录 + 项目归属） |
+| GET/POST/... | `/apps/{id}/api/*` | 代理到工作区项目的 FastAPI 后端 |
+| GET | `/apps/{id}/docs` | 工作区项目的 Swagger 文档 |
+| GET | `/s/{id}/` | 已发布公开站点（无需登录；未发布/暂停 404） |
+| GET/POST/... | `/s/{id}/api/*` | 代理到发布快照的独立 FastAPI 后端 |
 
 SSE 事件：
 
@@ -290,6 +322,7 @@ SSE 事件：
 6. 输入 `@Alex 今天天气怎么样？` 换行 `@Mike 曹操是谁？` → 后端按 @ 切段，Alex 只收到天气问题、Mike 只收到曹操问题，各自回答自己的那一段。
 7. 输入「今天天气怎么样？」→ 识别为咨询，Mike 回答并明确说明没有接入实时外部数据，不会触发构建。
 8. 清空 `LLM_API_KEY` 重启 → 进入 Mock 演示模式：链路照常执行，但生成明确标注的中性占位页，不会伪装成需求中的应用。
+9. 首次构建成功后顶栏出现「概览」tab → 点「发布」→「发布应用」→ 复制公开链接，在无登录窗口打开 `/s/{id}/` → 回工作台继续对话生成 v2：线上仍是 v1，概览出现「线上有未发布的变更」→「发布新变更」更新线上 → 概览「暂停访问」后公开链接 404 →「恢复在线」立即恢复，不需要构建。
 
 ## 验收对照
 
@@ -308,6 +341,9 @@ SSE 事件：
 - [x] 对话续改（版本递增、按 need 更新前后端、其余文件合并保留、SQLite 数据保留）
 - [x] 无 Key 提供 Mock 演示占位页；LLM 失败按配置重试，最终失败回滚并保留上一个可用版本（含前端构建 / 后端启动失败）
 - [x] Docker Compose + Nginx + 内存上限与运行时 LRU
+- [x] 生命周期状态：未构建 / 未发布 / 在线 / 暂停；首次构建成功后工作台出现「概览」
+- [x] 发布快照与公开链接 `/s/{id}/`；发布后继续构建不影响线上，概览提示变更并可重新发布
+- [x] 暂停 / 恢复只切状态不重建；项目列表显示状态徽标；顶栏发布按钮按状态展示不同弹窗
 
 ## 设计边界与安全说明
 
@@ -315,3 +351,6 @@ SSE 事件：
 - 生成的前端运行在 `sandbox` iframe 中（不含 `allow-same-origin`），通过 CORS 访问自己的后端。因此 iframe 自身的 `fetch()` 不携带 demo 登录 cookie：`/apps/{id}/api/*` 和静态资源不做额外登录校验，预览 HTML 入口仍要求项目所有者登录。
 - 生成的后端是**在本机（Docker 容器内）执行的不可信代码**：它有内存上限、只监听 127.0.0.1、环境变量被裁剪，但没有真正的进程/文件系统沙箱。这个 demo 定位为单用户演示；生产化需要把每个项目放进独立容器或 microVM。
 - 不执行 `npm install` 级别的服务端构建；预览用共享 esbuild 打包生成的前端源码。
+- 发布只保留一份最新快照，不做真正的版本历史 / 回滚 / 多版本并存；不做自定义域名、SEO、Google Ads、分析、推广素材。变更判断用 `built_version > published_version`，不做内容哈希。
+- 线上快照与工作台共用项目的 `backend/data/app.db`（演示取舍）：访客写入的数据工作台可见，但工作台后续构建若修改表结构，可能与线上旧代码不兼容。需要强隔离时应拆成独立数据库。
+- `/s/{id}/` 是公开入口，生成的后端同样是在本机执行的不可信代码；发布不会额外增加沙箱能力。

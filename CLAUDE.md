@@ -16,8 +16,12 @@
 
 ## 架构约束
 
-- 两栏布局：左侧对话（执行步骤内联折叠，角色执行中自动展开）/ 右侧 App Viewer（预览、代码两个模式；文件树位于代码模式的右侧面板内），两栏分界线可拖拽
+- 两栏布局：左侧对话（执行步骤内联折叠，角色执行中自动展开）/ 右侧 App Viewer（预览、概览、代码三个模式；概览仅在首次构建成功后显示，文件树位于代码模式的右侧面板内），两栏分界线可拖拽
 - 生成代码写入 `backend/data/apps/{project_id}/`，nginx 将 `/apps/` 反代到 FastAPI；FastAPI 托管 `.preview/` 静态产物，并把 `/apps/{id}/api/*` 代理到项目自己的 uvicorn 进程
+- 项目生命周期：`draft`（未构建）→ `unpublished`（首次构建成功）→ `online`（发布）⇄ `paused`（暂停）；`projects.built_version/built_at/published_version/published_at/paused` 持久化，派生 `status` 与 `has_changes = built_version > published_version`。只有完整构建成功才写 `built_version`，失败/回滚不写
+- 发布是构建快照：`apps/{id}/.published/{site,backend,manifest.json}`；`site` 的 `<base>` 改写为 `/s/{id}/`，`backend/data` 软链到工作区 `backend/data/app.db`；发布快照由独立 uvicorn 进程（`pid#published`，`APP_ROOT_PATH=/s/{id}`）运行。发布后的 chat 构建只改写工作区，不得触碰 `.published/` 或发布进程
+- `/s/{id}/` 与 `/s/{id}/api/*` 是公开入口（未发布/暂停统一 404），`/apps/{id}/` 仍仅项目所有者可打开；nginx 与 Vite dev proxy 都要加 `/s/`（Vite 必须写成 `/s/`，写成 `/s` 会把 `/src/*` 也代理走）
+- 暂停/恢复只改 `projects.paused` 并停止发布运行时，不重新构建；恢复后首个请求懒启动。线上与工作台共用项目 SQLite
 - 生成物是按需的完整 Web 项目：`frontend`（Vite + React 18 + TS）、`fullstack`（前端 + FastAPI + SQLite）、`backend`（FastAPI + SQLite）；不针对每个项目执行 `npm install`，预览用共享 esbuild 打包
 - 每个生成项目拥有独立 SQLite：`apps/{id}/backend/data/app.db`，与 demo 的 `backend/data/atoms.db` 完全隔离；重写代码时保留该数据目录
 - 生成后端按项目启动独立 uvicorn 子进程（仅 127.0.0.1、随机端口、LRU 上限、内存上限）；环境变量裁剪，不泄露 demo 的 LLM Key
@@ -49,7 +53,7 @@
 - users(id, email UNIQUE COLLATE NOCASE, name, password_hash, provider, email_verified, created_at, last_login_at)
 - sessions(token_hash PK, user_id, created_at, expires_at, user_agent, ip)
 - email_tokens(token_hash PK, user_id, kind, email, expires_at, used_at, created_at)
-- projects(id, name, user_id, created_at)
+- projects(id, name, user_id, created_at, built_version, built_at, published_version, published_at, paused)
 - conversations(id, project_id, role, content, agent, run_id, run_index, created_at)
 - artifacts(id, project_id, filename, content, version)
 - executions(id, project_id, agent, step, status, log, run_id, created_at)
@@ -65,7 +69,8 @@ atoms-demo/
 │ ├── tools.py # Toolbox + 角色白名单工具（读状态/写文件/构建/运行时）
 │ ├── scaffold.py # 确定性脚手架（Vite/FastAPI/SQLite/预览壳）
 │ ├── frontend_builder.py # 共享 esbuild 预览构建
-│ ├── runtime.py # 生成项目 uvicorn 进程管理（LRU/内存上限）
+│ ├── publisher.py # 发布快照（.published/、base 改写、数据软链）
+│ ├── runtime.py # 生成项目 uvicorn 进程管理（工作区/发布双实例，LRU/内存上限）
 │ ├── llm.py # 流式 LLM 调用
 │ ├── naming.py # 项目命名（LLM 概括 + 启发式回退）
 │ ├── auth.py # 密码哈希 / 会话 / 邮箱 token / 限流 / OAuth 辅助
@@ -95,6 +100,9 @@ Phase 5：注册登录与用户隔离。
 登录页视觉对齐 atoms.dev，支持邮箱 + 密码、邮箱验证、忘记密码/重置、快捷登录（演示）和真实 Google OAuth；
 项目、生成、SSE、导出、删除、预览入口全部按 `user_id` 隔离；旧 DB 迁移已验证。
 每个项目独立 FastAPI 运行时与 SQLite；预览构建、CORS、LRU 运行时、数据保留均已本地验证。
+
+Phase 6：项目状态管理与发布概览。
+`draft / unpublished / online / paused` 状态派生；发布快照 `.published/` 与独立发布运行时；公开站点 `/s/{id}/`；暂停/恢复；工作台「概览」tab（仅首次构建成功后显示）、按状态弹窗的顶栏发布入口、项目列表状态徽标。本期不做真正的版本历史/回滚。
 下一步：在 `https://hajimi.site` 完成 Let's Encrypt 签发、Google OAuth 与 QQ 邮箱 SMTP 配置，跑一遍验收并整理截图。
 
 ## 硬性验收
@@ -106,6 +114,9 @@ Phase 5：注册登录与用户隔离。
 5. 可对话续改，前后端文件按需更新
 6. 刷新页面项目不丢失（demo SQLite 持久化）
 7. 全栈项目的业务数据刷新/重启不丢失（项目自己的 SQLite）
+8. 首次构建成功后工作台出现「概览」；未构建时不显示
+9. 发布后公开链接未登录可访问；继续 chat 构建不影响线上并提示「有未发布变更」；重新发布后线上更新
+10. 暂停/恢复只切状态不重建；项目列表显示状态徽标；顶栏发布按钮按状态展示不同弹窗
 
 ## 明确不做
 
@@ -116,3 +127,5 @@ Phase 5：注册登录与用户隔离。
 - 不接 Kafka/Redis/ES
 - 不引入 LangChain / LangGraph / MCP：3 角色 + 有界交接用显式状态机 + Toolbox 足够，框架会增加依赖、内存与 SSE 事件映射成本
 - 不做 Emma / David / Iris / Sarah / Adrian 等其他角色（本轮只实现 Mike / Bob / Alex 三个构建角色）
+- 不做真正的版本历史 / 回滚 / 多版本并存：发布只保留一份最新快照，变更判断用版本号而非内容哈希
+- 不做自定义域名 / SEO / Google Ads / 分析 / 推广素材；线上快照与工作台共用同一个项目 SQLite（需要强隔离时再拆独立库）

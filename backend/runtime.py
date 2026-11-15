@@ -65,30 +65,38 @@ class AppRuntime:
 
     # ------------------------------------------------------------------ paths
     @staticmethod
-    def backend_dir(pid: str) -> Path:
-        return config.APPS_DIR / pid / "backend"
+    def _key(pid: str, published: bool = False) -> str:
+        # The published snapshot runs from a different tree, so it needs its
+        # own process, port and LRU slot.
+        return f"{pid}#published" if published else pid
+
+    @staticmethod
+    def backend_dir(pid: str, published: bool = False) -> Path:
+        root = config.APPS_DIR / pid
+        return root / ".published" / "backend" if published else root / "backend"
 
     @classmethod
-    def has_backend(cls, pid: str) -> bool:
-        return (cls.backend_dir(pid) / "main.py").exists()
+    def has_backend(cls, pid: str, published: bool = False) -> bool:
+        return (cls.backend_dir(pid, published) / "main.py").exists()
 
     # ------------------------------------------------------------------ lifecycle
-    async def ensure(self, pid: str) -> int:
+    async def ensure(self, pid: str, published: bool = False) -> int:
         """Start (or reuse) the project backend and return its localhost port."""
-        lock = self._locks.setdefault(pid, asyncio.Lock())
+        key = self._key(pid, published)
+        lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
-            instance = self._instances.get(pid)
+            instance = self._instances.get(key)
             if instance and instance.proc.returncode is None:
                 if await _port_open(instance.port):
                     instance.last_used = time.monotonic()
                     return instance.port
-                await self._stop_locked(pid)
+                await self._stop_locked(key)
 
-            if not self.has_backend(pid):
+            if not self.has_backend(pid, published):
                 raise AppRuntimeError("该项目没有后端服务")
 
             await self._evict_if_needed()
-            return await self._spawn(pid)
+            return await self._spawn(pid, key, published)
 
     async def _evict_if_needed(self) -> None:
         async with self._guard:
@@ -96,9 +104,11 @@ class AppRuntime:
                 victim = min(self._instances.values(), key=lambda item: item.last_used)
                 await self._stop_locked(victim.pid)
 
-    async def _spawn(self, pid: str) -> int:
-        backend = self.backend_dir(pid)
-        log_path = config.APPS_DIR / pid / ".runtime.log"
+    async def _spawn(self, pid: str, key: str, published: bool) -> int:
+        backend = self.backend_dir(pid, published)
+        log_path = config.APPS_DIR / pid / (
+            ".runtime.published.log" if published else ".runtime.log"
+        )
         log_path.parent.mkdir(parents=True, exist_ok=True)
         port = _free_port()
         # Minimal environment: never expose the demo's LLM key or other
@@ -108,7 +118,7 @@ class AppRuntime:
             "HOME": str(backend),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-            "APP_ROOT_PATH": f"/apps/{pid}",
+            "APP_ROOT_PATH": f"/s/{pid}" if published else f"/apps/{pid}",
             "PYTHONUNBUFFERED": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
@@ -157,8 +167,8 @@ class AppRuntime:
                     f"后端启动失败（exit {proc.returncode}）：{tail[-1200:] or '无日志'}"
                 )
             if await _port_open(port):
-                self._instances[pid] = Instance(
-                    pid=pid,
+                self._instances[key] = Instance(
+                    pid=key,
                     port=port,
                     proc=proc,
                     log_path=log_path,
@@ -173,12 +183,14 @@ class AppRuntime:
             f"后端启动超时（{int(config.RUNTIME_START_TIMEOUT)}s）：{tail[-1200:] or '无日志'}"
         )
 
-    async def logs(self, pid: str) -> str:
-        return _read_tail(config.APPS_DIR / pid / ".runtime.log")
+    async def logs(self, pid: str, published: bool = False) -> str:
+        name = ".runtime.published.log" if published else ".runtime.log"
+        return _read_tail(config.APPS_DIR / pid / name)
 
-    async def stop(self, pid: str) -> None:
-        async with self._locks.setdefault(pid, asyncio.Lock()):
-            await self._stop_locked(pid)
+    async def stop(self, pid: str, published: bool = False) -> None:
+        key = self._key(pid, published)
+        async with self._locks.setdefault(key, asyncio.Lock()):
+            await self._stop_locked(key)
 
     async def _stop_locked(self, pid: str) -> None:
         instance = self._instances.pop(pid, None)

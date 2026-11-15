@@ -14,6 +14,9 @@ export default defineConfig({
     proxy: {
       "/api": { target: "http://127.0.0.1:8000" },
       "/apps": { target: "http://127.0.0.1:8000" },
+      // Keep the trailing slash: "/s" would also match "/src/main.tsx" and
+      // proxy the dev app's own modules to FastAPI.
+      "/s/": { target: "http://127.0.0.1:8000" },
     },
   },
 });

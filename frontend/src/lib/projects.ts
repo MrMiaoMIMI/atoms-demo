@@ -1,10 +1,55 @@
-import type { ProjectMode, ProjectSummary } from '../types';
+import type { ProjectMode, ProjectStatus, ProjectSummary } from '../types';
 
 export const MODE_LABEL: Record<string, string> = {
   frontend: '前端',
   fullstack: '全栈',
   backend: 'API',
 };
+
+interface StatusFields {
+  status?: ProjectStatus;
+  built_version?: number | null;
+  published_version?: number | null;
+  paused?: boolean;
+}
+
+export const STATUS_LABEL: Record<ProjectStatus, string> = {
+  draft: '未构建',
+  unpublished: '未发布',
+  online: '在线',
+  paused: '暂停',
+};
+
+export const STATUS_TONE: Record<
+  ProjectStatus,
+  { badge: string; dot: string }
+> = {
+  draft: { badge: 'bg-line-4 text-ink-55', dot: 'bg-ink-30' },
+  unpublished: { badge: 'bg-warning/10 text-warning', dot: 'bg-warning' },
+  online: { badge: 'bg-positive/10 text-positive', dot: 'bg-positive' },
+  paused: { badge: 'bg-line-6 text-ink-55', dot: 'bg-ink-30' },
+};
+
+/** Fall back to the persisted versions if an older response omits status. */
+export function projectStatus(project: StatusFields): ProjectStatus {
+  if (project.status) return project.status;
+  if (project.built_version == null) return 'draft';
+  if (project.published_version == null) return 'unpublished';
+  return project.paused ? 'paused' : 'online';
+}
+
+export function statusLabel(project: StatusFields): string {
+  return STATUS_LABEL[projectStatus(project)];
+}
+
+export function absoluteUrl(path: string | null | undefined): string | null {
+  if (!path) return null;
+  try {
+    return new URL(path, window.location.origin).toString();
+  } catch {
+    return null;
+  }
+}
 
 export const PROJECT_MODES: ProjectMode[] = ['frontend', 'fullstack', 'backend'];
 

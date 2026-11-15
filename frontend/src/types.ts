@@ -2,6 +2,7 @@ export type Role = "user" | "assistant";
 export type AgentKey = "mike" | "bob" | "alex";
 export type ExecutionStatus = "running" | "success" | "warning" | "error";
 export type ProjectMode = "frontend" | "fullstack" | "backend";
+export type ProjectStatus = "draft" | "unpublished" | "online" | "paused";
 
 export interface Conversation {
   id: number;
@@ -59,6 +60,14 @@ export interface Project {
   name: string;
   user_id?: string | null;
   created_at: string;
+  built_version?: number | null;
+  built_at?: string | null;
+  published_version?: number | null;
+  published_at?: string | null;
+  paused?: boolean;
+  status?: ProjectStatus;
+  has_changes?: boolean;
+  published_url?: string | null;
 }
 
 export interface ProjectState {
@@ -69,6 +78,10 @@ export interface ProjectState {
   mode: ProjectMode;
   preview_url: string | null;
   generating?: boolean;
+  status?: ProjectStatus;
+  has_changes?: boolean;
+  published_url?: string | null;
+  paused?: boolean;
 }
 
 export interface ProjectSummary {
@@ -83,6 +96,14 @@ export interface ProjectSummary {
   has_frontend?: number;
   has_backend?: number;
   generating?: boolean;
+  built_version?: number | null;
+  built_at?: string | null;
+  published_version?: number | null;
+  published_at?: string | null;
+  paused?: boolean;
+  status?: ProjectStatus;
+  has_changes?: boolean;
+  published_url?: string | null;
 }
 
 export interface Health {

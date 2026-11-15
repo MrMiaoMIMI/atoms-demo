@@ -1,6 +1,12 @@
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import { timeAgo } from '../lib/format';
-import { coverFor, modeLabel } from '../lib/projects';
+import {
+  STATUS_LABEL,
+  STATUS_TONE,
+  coverFor,
+  modeLabel,
+  projectStatus,
+} from '../lib/projects';
 import type { ProjectSummary } from '../types';
 import { AtomsMark, Spinner, Trash } from './Icons';
 
@@ -88,6 +94,7 @@ export default function ProjectCard({
   onDelete,
   deleting = false,
 }: ProjectCardProps) {
+  const status = projectStatus(project);
   return (
     <div
       role="button"
@@ -104,6 +111,12 @@ export default function ProjectCard({
         style={{ background: coverFor(project.id) }}
       >
         <ProjectCover project={project} />
+        <div className="absolute left-2 top-2 inline-flex items-center gap-1.5 rounded-full bg-white/90 px-2 py-1 text-[10px] font-medium text-ink-80 shadow-sm backdrop-blur">
+          <span
+            className={`h-1.5 w-1.5 rounded-full ${STATUS_TONE[status].dot}`}
+          />
+          {STATUS_LABEL[status]}
+        </div>
         {onDelete ? (
           <button
             type="button"

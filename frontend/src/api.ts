@@ -179,6 +179,24 @@ export const api = {
     await request(`/api/projects/${pid}`, { method: "DELETE" });
   },
 
+  publishProject: (pid: string) =>
+    postJson<{ ok: boolean; project: Project; published_url: string }>(
+      `/api/projects/${pid}/publish`,
+      {}
+    ),
+
+  pauseProject: (pid: string) =>
+    postJson<{ ok: boolean; project: Project }>(
+      `/api/projects/${pid}/pause`,
+      {}
+    ),
+
+  resumeProject: (pid: string) =>
+    postJson<{ ok: boolean; project: Project }>(
+      `/api/projects/${pid}/resume`,
+      {}
+    ),
+
   exportProject: async (
     pid: string
   ): Promise<{ blob: Blob; filename: string }> => {

@@ -31,6 +31,7 @@ import config
 import db
 import mailer
 import naming
+import publisher
 import runtime
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,9 @@ _title_tasks: dict[str, asyncio.Task] = {}
 # Project id -> in-flight generation task. It deliberately outlives the SSE
 # connection so closing the workspace tab does not abort a running build.
 _generation_tasks: dict[str, asyncio.Task] = {}
+# Project ids currently being snapshotted for publish. Publish is deliberately
+# exclusive with generation so a half-built tree can never go online.
+_publishing: set[str] = set()
 
 
 class _GenerationHub:
@@ -107,6 +111,10 @@ _hubs: dict[str, _GenerationHub] = {}
 def _is_generating(pid: str) -> bool:
     task = _generation_tasks.get(pid)
     return task is not None and not task.done()
+
+
+def _is_publishing(pid: str) -> bool:
+    return pid in _publishing
 
 
 def _sse(event: str, payload: dict) -> str:
@@ -564,6 +572,30 @@ def _project_mode(paths: set[str]) -> str:
     return "frontend"
 
 
+def _project_mode_on_disk(pid: str) -> str:
+    """Cheap mode lookup for publish snapshots (no artifact content load)."""
+    root = config.APPS_DIR / pid
+    has_frontend = (root / "frontend" / "src" / "main.tsx").is_file()
+    has_backend = (root / "backend" / "main.py").is_file()
+    if has_frontend and has_backend:
+        return "fullstack"
+    if has_backend:
+        return "backend"
+    return "frontend"
+
+
+def _decorate_state(state: dict) -> dict:
+    """Expose the derived lifecycle fields at both state and project level."""
+    project = state.get("project")
+    if project:
+        db.decorate_project(project)
+        state["status"] = project["status"]
+        state["has_changes"] = project["has_changes"]
+        state["published_url"] = project["published_url"]
+        state["paused"] = project["paused"]
+    return state
+
+
 @app.get("/api/health")
 async def health() -> dict:
     return {
@@ -591,6 +623,7 @@ async def list_projects(user: dict = Depends(auth.current_user)) -> dict:
         else:
             project["mode"] = "frontend"
         project["generating"] = _is_generating(project["id"])
+        db.decorate_project(project)
     return {"projects": projects}
 
 
@@ -650,7 +683,89 @@ async def get_project(pid: str, user: dict = Depends(auth.current_user)) -> dict
         f"/apps/{pid}/?v={version or 1}" if artifacts and ready else None
     )
     state["generating"] = _is_generating(pid)
-    return state
+    return _decorate_state(state)
+
+
+@app.post("/api/projects/{pid}/publish")
+async def publish_project(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    """Snapshot the last successful build and make it publicly reachable."""
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if _is_generating(pid) or _is_publishing(pid):
+        raise HTTPException(status_code=409, detail="项目正在构建或发布中，请稍候")
+    built = project.get("built_version")
+    if built is None:
+        raise HTTPException(status_code=409, detail="项目还没有成功构建，无法发布")
+    if not _preview_ready(pid):
+        raise HTTPException(status_code=409, detail="构建产物不存在，请先重新构建")
+
+    # Mark synchronously before the first await inside the snapshot section;
+    # the re-check below closes the window opened by the ownership query.
+    _publishing.add(pid)
+    try:
+        if _is_generating(pid):
+            raise HTTPException(status_code=409, detail="项目正在构建，请稍候")
+        mode = _project_mode_on_disk(pid)
+        # The published process must not keep the old tree open while it is
+        # swapped; it restarts lazily on the next visitor request.
+        await runtime.runtime.stop(pid, published=True)
+        manifest = await asyncio.to_thread(
+            publisher.snapshot, pid, int(built), mode, project["name"]
+        )
+        await db.mark_published(pid, int(built))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface the snapshot failure
+        logger.exception("publish failed for %s", pid)
+        raise HTTPException(status_code=500, detail=f"发布失败：{exc}") from exc
+    finally:
+        _publishing.discard(pid)
+
+    updated = await db.get_project(pid)
+    if updated:
+        db.decorate_project(updated)
+    return {
+        "ok": True,
+        "project": updated,
+        "manifest": manifest,
+        "published_url": f"/s/{pid}/",
+    }
+
+
+@app.post("/api/projects/{pid}/pause")
+async def pause_project(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    """Block every visitor without rebuilding or touching the snapshot."""
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if project.get("published_version") is None:
+        raise HTTPException(status_code=409, detail="项目还没有发布")
+    if _is_publishing(pid):
+        raise HTTPException(status_code=409, detail="项目正在发布中，请稍候")
+    await db.set_project_paused(pid, True)
+    # Free the process slot; resume starts it lazily on the first request.
+    await runtime.runtime.stop(pid, published=True)
+    updated = await db.get_project(pid)
+    if updated:
+        db.decorate_project(updated)
+    return {"ok": True, "project": updated}
+
+
+@app.post("/api/projects/{pid}/resume")
+async def resume_project(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    if project.get("published_version") is None:
+        raise HTTPException(status_code=409, detail="项目还没有发布")
+    if _is_publishing(pid):
+        raise HTTPException(status_code=409, detail="项目正在发布中，请稍候")
+    await db.set_project_paused(pid, False)
+    updated = await db.get_project(pid)
+    if updated:
+        db.decorate_project(updated)
+    return {"ok": True, "project": updated}
 
 
 def _zip_artifacts(files: dict[str, str]) -> bytes:
@@ -692,6 +807,7 @@ async def delete_project(pid: str, user: dict = Depends(auth.current_user)) -> d
     if not await db.get_project_for_user(pid, user["id"]):
         raise HTTPException(status_code=404, detail="项目不存在")
     await runtime.runtime.stop(pid)
+    await runtime.runtime.stop(pid, published=True)
     await db.delete_project(pid)
     target = config.APPS_DIR / pid
     if target.exists():
@@ -710,8 +826,8 @@ async def generate(
         raise HTTPException(status_code=400, detail="需求不能为空")
 
     async def event_stream():
-        if _is_generating(pid):
-            yield _sse("error", {"message": "该项目正在生成中，请稍候。"})
+        if _is_generating(pid) or _is_publishing(pid):
+            yield _sse("error", {"message": "该项目正在生成或发布中，请稍候。"})
             yield _sse("done", {"project_id": pid})
             return
 
@@ -849,6 +965,7 @@ async def _resume_event_stream(pid: str, hub: _GenerationHub):
                 else None
             )
             state["generating"] = True
+            _decorate_state(state)
             yield _sse(
                 "snapshot",
                 {"state": state, "stream": stream, "seq": snap_seq},
@@ -971,6 +1088,29 @@ def _static_target(pid: str, path: str) -> Path | None:
     return candidate if candidate.exists() and candidate.is_file() else None
 
 
+def _published_target(pid: str, path: str) -> Path | None:
+    """Resolve a public static path inside the published snapshot only."""
+    base = publisher.site_dir(pid)
+    if not (base / "index.html").is_file():
+        return None
+    relative = path.strip("/") or "index.html"
+    if ".." in Path(relative).parts:
+        return None
+    candidate = (base / relative).resolve()
+    try:
+        candidate.relative_to(base.resolve())
+    except ValueError:
+        return None
+    if candidate.is_dir():
+        candidate = candidate / "index.html"
+    if not candidate.exists():
+        if "." not in Path(relative).name:
+            candidate = base / "index.html"
+        else:
+            return None
+    return candidate if candidate.is_file() else None
+
+
 async def _serve_project_file(pid: str, path: str) -> FileResponse:
     target = _static_target(pid, path)
     if target is None:
@@ -984,17 +1124,24 @@ async def _serve_project_file(pid: str, path: str) -> FileResponse:
     return FileResponse(target, headers=headers)
 
 
-async def _proxy_backend(pid: str, path: str, request: Request):
-    if not await db.get_project(pid):
+async def _proxy_backend(
+    pid: str, path: str, request: Request, published: bool = False
+):
+    project = await db.get_project(pid)
+    if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    if not runtime.runtime.has_backend(pid):
+    if published and (
+        project.get("published_version") is None or project.get("paused")
+    ):
+        raise HTTPException(status_code=404, detail="站点不存在")
+    if not runtime.runtime.has_backend(pid, published):
         return JSONResponse(
             {"detail": "该项目没有后端服务"},
             status_code=404,
             headers=CORS_HEADERS,
         )
     try:
-        port = await runtime.runtime.ensure(pid)
+        port = await runtime.runtime.ensure(pid, published=published)
     except runtime.AppRuntimeError as exc:
         return JSONResponse(
             {"detail": str(exc)[:800]},
@@ -1103,3 +1250,47 @@ async def preview(pid: str, path: str, request: Request):
         if not await db.get_project_for_user(pid, user["id"]):
             raise HTTPException(status_code=404, detail="项目不存在")
     return await _serve_project_file(pid, path)
+
+
+# ---------------------------------------------------------------------------
+# Published site (public, unlike the owner-only /apps/ workspace preview)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/s/{pid}")
+async def published_root(pid: str):
+    project = await db.get_project(pid)
+    if (
+        not project
+        or project.get("published_version") is None
+        or project.get("paused")
+    ):
+        raise HTTPException(status_code=404, detail="站点不存在")
+    return RedirectResponse(url=f"/s/{pid}/", status_code=307)
+
+
+@app.api_route(
+    "/s/{pid}/{path:path}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def published_site(pid: str, path: str, request: Request):
+    project = await db.get_project(pid)
+    if (
+        not project
+        or project.get("published_version") is None
+        or project.get("paused")
+    ):
+        raise HTTPException(status_code=404, detail="站点不存在")
+    if _is_backend_path(path):
+        return await _proxy_backend(pid, path, request, published=True)
+    if request.method not in {"GET", "HEAD"}:
+        raise HTTPException(status_code=405, detail="静态站点只支持 GET")
+    target = _published_target(pid, path)
+    if target is None:
+        raise HTTPException(status_code=404, detail="页面不存在")
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+    }
+    return FileResponse(target, headers=headers)

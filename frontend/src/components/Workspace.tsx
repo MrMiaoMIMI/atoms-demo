@@ -4,6 +4,7 @@ import { api, generate, resumeGeneration } from '../api';
 import { AGENT_KEYS, agentFor, isAgentKey } from '../lib/agents';
 import { copyText } from '../lib/clipboard';
 import { buildGroups, type ChatGroup } from '../lib/groups';
+import { projectStatus } from '../lib/projects';
 import type {
   AgentKey,
   Artifact,
@@ -26,11 +27,14 @@ import {
   Code,
   Eye,
   ExternalLink,
+  Grid,
   Home,
   PanelLeft,
   Spinner,
 } from './Icons';
+import OverviewPane from './OverviewPane';
 import PreviewPane from './PreviewPane';
+import PublishDialog from './PublishDialog';
 
 interface Props {
   projectId: string;
@@ -100,7 +104,11 @@ export default function Workspace({
   const [error, setError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [pane, setPane] = useState<'preview' | 'code'>('preview');
+  const [pane, setPane] = useState<'preview' | 'overview' | 'code'>('preview');
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [publishBusy, setPublishBusy] = useState(false);
+  const [statusBusy, setStatusBusy] = useState(false);
+  const [publishError, setPublishError] = useState<string | null>(null);
   const [chatOpen, setChatOpen] = useState(
     () => window.localStorage.getItem('atoms-chat-open') !== '0'
   );
@@ -134,6 +142,28 @@ export default function Workspace({
       ),
     [artifacts],
   );
+
+  const status = project ? projectStatus(project) : 'draft';
+  const hasOverview = status !== 'draft';
+  const building = running || watching;
+  const publicUrl = project?.published_url ?? null;
+  const hasChanges = Boolean(
+    project?.has_changes ??
+      (project?.published_version != null &&
+        project?.built_version != null &&
+        project.built_version > project.published_version),
+  );
+  const publishLabel = building
+    ? '构建中…'
+    : status === 'online'
+      ? hasChanges
+        ? '更新'
+        : '已发布'
+      : status === 'paused'
+        ? hasChanges
+          ? '更新'
+          : '已暂停'
+        : '发布';
 
   const chattedAgents = useMemo<AgentKey[]>(() => {
     const seen = new Set<string>();
@@ -180,6 +210,8 @@ export default function Workspace({
     setLoadError(null);
     setPreviewUrl(null);
     setActiveFile(null);
+    setPublishOpen(false);
+    setPublishError(null);
     api
       .getProject(projectId)
       .then((state) => {
@@ -201,6 +233,12 @@ export default function Workspace({
       cancelled = true;
     };
   }, [projectId, applyState]);
+
+  // The overview only exists after the first successful build; never leave the
+  // right pane pointing at a hidden mode.
+  useEffect(() => {
+    if (pane === 'overview' && !hasOverview) setPane('preview');
+  }, [pane, hasOverview]);
 
   useEffect(() => {
     window.localStorage.setItem('atoms-chat-width', String(chatWidth));
@@ -642,15 +680,99 @@ export default function Workspace({
     setRefreshKey((value) => value + 1);
   }
 
-  async function share() {
-    const url = previewUrl
-      ? new URL(previewUrl, window.location.origin).toString()
-      : window.location.href;
-    const ok = await copyText(url);
+  const copyToClipboard = useCallback(async (value: string | null) => {
+    if (!value) return;
+    const ok = await copyText(value);
     if (!ok) return;
     setShareCopied(true);
     window.setTimeout(() => setShareCopied(false), 1500);
+  }, []);
+
+  async function share() {
+    // Once published, sharing should hand out the public site rather than the
+    // login-gated workspace preview.
+    const target =
+      publicUrl && (status === 'online' || status === 'paused')
+        ? new URL(publicUrl, window.location.origin).toString()
+        : previewUrl
+          ? new URL(previewUrl, window.location.origin).toString()
+          : window.location.href;
+    await copyToClipboard(target);
   }
+
+  const reloadProject = useCallback(async () => {
+    try {
+      applyState(await api.getProject(projectId));
+    } catch {
+      // Keep the dialog error visible; the next action refreshes state.
+    }
+  }, [projectId, applyState]);
+
+  const openPublish = useCallback(() => {
+    setPublishError(null);
+    setPublishOpen(true);
+  }, []);
+
+  const closePublish = useCallback(() => {
+    setPublishOpen(false);
+    setPublishError(null);
+  }, []);
+
+  const doPublish = useCallback(async () => {
+    setPublishBusy(true);
+    setPublishError(null);
+    try {
+      await api.publishProject(projectId);
+      await reloadProject();
+      setPublishOpen(false);
+    } catch (err) {
+      setPublishError((err as Error).message || '发布失败');
+    } finally {
+      setPublishBusy(false);
+    }
+  }, [projectId, reloadProject]);
+
+  const doPause = useCallback(async () => {
+    setStatusBusy(true);
+    setPublishError(null);
+    try {
+      await api.pauseProject(projectId);
+      await reloadProject();
+      setPublishOpen(false);
+    } catch (err) {
+      setPublishError((err as Error).message || '暂停失败');
+    } finally {
+      setStatusBusy(false);
+    }
+  }, [projectId, reloadProject]);
+
+  const doResume = useCallback(async () => {
+    setStatusBusy(true);
+    setPublishError(null);
+    try {
+      await api.resumeProject(projectId);
+      await reloadProject();
+      setPublishOpen(false);
+    } catch (err) {
+      setPublishError((err as Error).message || '恢复失败');
+    } finally {
+      setStatusBusy(false);
+    }
+  }, [projectId, reloadProject]);
+
+  const openSite = useCallback(() => {
+    if (!publicUrl) return;
+    window.open(
+      new URL(publicUrl, window.location.origin).toString(),
+      '_blank',
+      'noopener,noreferrer',
+    );
+  }, [publicUrl]);
+
+  const copyPublicUrl = useCallback(() => {
+    if (!publicUrl) return;
+    void copyToClipboard(new URL(publicUrl, window.location.origin).toString());
+  }, [copyToClipboard, publicUrl]);
 
   if (!loaded) {
     return (
@@ -800,6 +922,22 @@ export default function Workspace({
               <Eye size={17} />
               {pane === 'preview' ? '预览' : null}
             </button>
+            {hasOverview ? (
+              <button
+                type="button"
+                onClick={() => setPane('overview')}
+                title="概览"
+                aria-label="概览"
+                className={`flex h-[30px] items-center gap-1.5 rounded-full text-[14px] transition ${
+                  pane === 'overview'
+                    ? 'bg-white px-2.5 font-medium text-brand-text shadow-[0_1px_3px_rgba(12,12,12,0.10)]'
+                    : 'w-[34px] justify-center text-ink-55 hover:text-ink-80'
+                }`}
+              >
+                <Grid size={17} />
+                {pane === 'overview' ? '概览' : null}
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={() => setPane('code')}
@@ -842,6 +980,16 @@ export default function Workspace({
             </button>
             <button
               type="button"
+              onClick={openPublish}
+              disabled={building || publishBusy || statusBusy}
+              title={publishLabel}
+              className="flex h-[30px] items-center gap-1.5 rounded-full bg-[#0C0C0C] px-3 text-[13px] font-medium text-white transition hover:bg-[#232323] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {building ? <Spinner size={13} /> : null}
+              {publishLabel}
+            </button>
+            <button
+              type="button"
               onClick={refreshPreview}
               disabled={!previewUrl}
               title="刷新预览"
@@ -881,15 +1029,23 @@ export default function Workspace({
           />
         ) : null}
 
-        {pane === 'preview' ? (
-          <PreviewPane
-            url={previewUrl}
-            running={running}
-            version={latestVersion}
+        {pane === 'overview' && project ? (
+          <OverviewPane
+            project={project}
+            status={status}
             mode={mode}
-            refreshKey={refreshKey}
+            latestVersion={latestVersion}
+            building={building}
+            busy={statusBusy}
+            copied={shareCopied}
+            error={publishError}
+            onOpenPublish={openPublish}
+            onPause={() => void doPause()}
+            onResume={() => void doResume()}
+            onCopyUrl={copyPublicUrl}
+            onOpenSite={openSite}
           />
-        ) : (
+        ) : pane === 'code' ? (
           <FilePanel
             projectId={projectId}
             artifacts={artifacts}
@@ -898,9 +1054,35 @@ export default function Workspace({
             streamingFile={streamingFile}
             streamingBuffer={streamingBuffer}
           />
+        ) : (
+          <PreviewPane
+            url={previewUrl}
+            running={running}
+            version={latestVersion}
+            mode={mode}
+            refreshKey={refreshKey}
+          />
         )}
       </div>
       </div>
+
+      {project ? (
+        <PublishDialog
+          open={publishOpen}
+          project={project}
+          status={status}
+          building={building}
+          busy={publishBusy || statusBusy}
+          error={publishError}
+          copied={shareCopied}
+          onClose={closePublish}
+          onPublish={() => void doPublish()}
+          onPause={() => void doPause()}
+          onResume={() => void doResume()}
+          onOpenSite={openSite}
+          onCopyUrl={copyPublicUrl}
+        />
+      ) : null}
     </div>
   );
 }

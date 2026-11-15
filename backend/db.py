@@ -46,7 +46,12 @@ CREATE TABLE IF NOT EXISTS projects (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     user_id     TEXT,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    built_version     INTEGER,
+    built_at          TEXT,
+    published_version INTEGER,
+    published_at      TEXT,
+    paused            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -105,7 +110,14 @@ async def _migrate(conn) -> None:
     migrations = {
         "conversations": {"agent": "TEXT", "run_id": "TEXT", "run_index": "INTEGER"},
         "executions": {"run_id": "TEXT"},
-        "projects": {"user_id": "TEXT"},
+        "projects": {
+            "user_id": "TEXT",
+            "built_version": "INTEGER",
+            "built_at": "TEXT",
+            "published_version": "INTEGER",
+            "published_at": "TEXT",
+            "paused": "INTEGER NOT NULL DEFAULT 0",
+        },
     }
     for table, columns in migrations.items():
         async with conn.execute(f"PRAGMA table_info({table})") as cur:
@@ -333,6 +345,66 @@ async def update_project_name(pid: str, name: str) -> None:
         await conn.commit()
 
 
+def decorate_project(project: dict) -> dict:
+    """Attach derived lifecycle fields used by every project response.
+
+    ``built_version`` is only written after a full successful build, so a
+    failed or rolled-back round can never make a project look publishable.
+    """
+    built = project.get("built_version")
+    published = project.get("published_version")
+    if built is None:
+        status = "draft"
+    elif published is None:
+        status = "unpublished"
+    elif project.get("paused"):
+        status = "paused"
+    else:
+        status = "online"
+    project["status"] = status
+    project["paused"] = bool(project.get("paused"))
+    project["has_changes"] = bool(
+        published is not None and built is not None and built > published
+    )
+    project["published_url"] = (
+        f"/s/{project['id']}/" if published is not None else None
+    )
+    return project
+
+
+async def mark_built(pid: str, version: int) -> None:
+    """Record the last version whose preview and runtime both came up."""
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE projects SET built_version = ?, built_at = ? WHERE id = ?",
+            (version, now(), pid),
+        )
+        await conn.commit()
+
+
+async def mark_published(pid: str, version: int) -> None:
+    """Point the public snapshot at a successfully built version.
+
+    ``paused`` is intentionally preserved: updating a paused site keeps it
+    paused until the owner explicitly resumes it.
+    """
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE projects SET published_version = ?, published_at = ? WHERE id = ?",
+            (version, now(), pid),
+        )
+        await conn.commit()
+
+
+async def set_project_paused(pid: str, paused: bool) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE projects SET paused = ? WHERE id = ?",
+            (1 if paused else 0, pid),
+        )
+        await conn.commit()
+
+
 async def list_projects(user_id: str | None = None) -> list[dict]:
     """List projects, scoped to one owner for every user-facing route."""
     where = "WHERE p.user_id = ?" if user_id is not None else ""
@@ -341,6 +413,8 @@ async def list_projects(user_id: str | None = None) -> list[dict]:
         async with conn.execute(
             f"""
             SELECT p.id, p.name, p.user_id, p.created_at,
+                   p.built_version, p.built_at,
+                   p.published_version, p.published_at, p.paused,
                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS message_count,
                    (SELECT COUNT(DISTINCT filename) FROM artifacts a WHERE a.project_id = p.id) AS artifact_count,
                    (SELECT MAX(a.version) FROM artifacts a WHERE a.project_id = p.id) AS latest_version,

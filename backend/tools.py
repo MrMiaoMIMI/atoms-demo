@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -75,26 +73,32 @@ async def publish_files(ctx: ToolContext, files: dict[str, str]) -> None:
     target = config.APPS_DIR / ctx.pid
 
     def write() -> None:
-        backup: Path | None = None
-        data_dir = target / "backend" / "data"
-        try:
-            if data_dir.exists():
-                backup = Path(tempfile.mkdtemp()) / "data"
-                shutil.move(str(data_dir), str(backup))
-            if target.exists():
-                shutil.rmtree(target)
-            target.mkdir(parents=True, exist_ok=True)
-            for name, content in files.items():
-                dest = target / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(content, encoding="utf-8")
-        finally:
-            if backup is not None:
-                restore = target / "backend" / "data"
-                restore.parent.mkdir(parents=True, exist_ok=True)
-                if restore.exists():
-                    shutil.rmtree(restore)
-                shutil.move(str(backup), str(restore))
+        target.mkdir(parents=True, exist_ok=True)
+        backend = target / "backend"
+        backend.mkdir(parents=True, exist_ok=True)
+        # Keep the published snapshot and the project SQLite data in place.
+        # Moving data aside would also briefly dangle the published runtime's
+        # symlink, so both are preserved rather than recreated.
+        keep = {".published", "backend"}
+        for child in target.iterdir():
+            if child.name in keep:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        for child in backend.iterdir():
+            if child.name == "data":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        (backend / "data").mkdir(parents=True, exist_ok=True)
+        for name, content in files.items():
+            dest = target / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
 
     await asyncio.to_thread(write)
 
