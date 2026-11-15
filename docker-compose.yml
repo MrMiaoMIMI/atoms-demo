@@ -34,19 +34,28 @@ services:
   web:
     build:
       context: .
-      dockerfile: nginx/Dockerfile
+      dockerfile: caddy/Dockerfile
     ports:
       - "80:80"
       - "443:443"
+      # HTTP/3 (optional). Without inbound UDP 443 browsers fall back to HTTP/2.
+      - "443:443/udp"
     environment:
-      DOMAIN: hajimi.site
+      # Domain and ACME contact email. Override in a root .env file; Compose
+      # loads it automatically. Caddy issues and renews the certificate.
+      DOMAIN: ${DOMAIN:-hajimi.site}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@hajimi.site}
     volumes:
-      # nginx needs write access on first boot to create a temporary
-      # self-signed certificate; certbot later replaces it with the real one.
-      - ./certbot/conf:/etc/letsencrypt
-      - ./certbot/www:/var/www/certbot:ro
+      # /data holds the ACME account and certificates. Keep this volume so a
+      # container rebuild never re-issues (Let's Encrypt rate limits apply).
+      - caddy_data:/data
+      - caddy_config:/config
     depends_on:
       - backend
     mem_limit: 192m
     cpus: "0.5"
     restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

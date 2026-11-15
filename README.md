@@ -10,7 +10,7 @@
 - 后端：Python 3.11 + FastAPI + uvicorn（单 worker）
 - 数据库：SQLite（WAL），Atoms 自己的库在 `backend/data/atoms.db`
 - 实时通信：SSE（`StreamingResponse`），不用 WebSocket
-- 部署：Docker Compose + Nginx + Let's Encrypt，单机 2C2G
+- 部署：Docker Compose + Caddy + Let's Encrypt，单机 2C2G
 - LLM：DeepSeek（OpenAI 兼容接口）远程流式调用；无 Key 自动 Mock
 
 ## 注册登录与用户隔离
@@ -119,7 +119,7 @@ apps/{project_id}/
  │                 projects(user_id, description, category, view_count, cover_version) /
  │                 project_saves / conversations(agent, run_id, run_index) / artifacts / executions(run_id)
  │
- ├─ iframe /apps/{id}/ ───────────────► Nginx ──► FastAPI 预览静态文件（需登录）
+ ├─ iframe /apps/{id}/ ───────────────► Caddy ──► FastAPI 预览静态文件（需登录）
  │                                        └─► /apps/{id}/api/* ──► 工作区 uvicorn
  │
  ├─ /s/{id}/（公开）──────────────────► 发布快照静态文件（暂停/未发布 404）
@@ -267,32 +267,30 @@ cd backend
 
 ## Docker 部署（HTTPS）
 
-生产域名为 `https://hajimi.site`，证书由 Let's Encrypt 自动签发。
+生产域名为 `https://hajimi.site`，证书由 Caddy 自动向 Let's Encrypt 申请并续期，不需要 certbot，也不需要 cron。
 
 前置条件：
 
 1. DNS：`hajimi.site` 的 A 记录指向服务器公网 IP。
-2. 腾讯云安全组放行 TCP `80` 和 `443`。
+2. 腾讯云安全组放行 TCP `80` 和 `443`（80 用于 ACME 验证与跳转 HTTPS；HTTP/3 可选放行 UDP `443`）。
 3. 服务器上准备 `backend/.env`（共享密钥）和 `backend/.env.production`（线上 origin、Cookie、开发模式开关）。
+4. 可选：在项目根目录创建 `.env` 设置 `DOMAIN` / `ACME_EMAIL`（Compose 自动读取）；不设置时回退到 `hajimi.site` / `admin@hajimi.site`。
 
 ```bash
 cp backend/.env.example backend/.env                         # 填 LLM / SMTP / Google 凭据
 cp backend/.env.production.example backend/.env.production   # 确认 PUBLIC_BASE_URL 等
-docker compose up -d --build               # HTTP 启动，nginx 先使用临时自签名证书
-CERTBOT_EMAIL=you@example.com ./scripts/init-letsencrypt.sh
+cp .env.example .env                                         # 按需修改 DOMAIN / ACME_EMAIL
+docker compose up -d --build                                 # 首次启动时 Caddy 自动申请证书
 ```
 
 > `docker-compose.yml` 的 `env_file` 同时加载 `.env` 与 `.env.production`（后者覆盖前者），并设置 `APP_ENV=production`。缺少 `backend/.env.production` 时 Compose 会直接报错，请先从模板创建。
 
-完成后打开 `https://hajimi.site`。证书续期：
+首次启动后 Caddy 会花几秒到几十秒完成签发；DNS 尚未生效时它会在后台自动重试，无需人工执行脚本。完成后打开 `https://hajimi.site`。
 
-```cron
-0 3 * * * cd /path/to/atoms-demo && ./scripts/renew-cert.sh >> /var/log/atoms-cert.log 2>&1
-```
-
-- `web`：Nginx，托管工作台构建产物，反代 `/api/` 与 `/apps/`；80 端口负责 ACME 验证并跳转 HTTPS，443 关闭 SSE 缓冲。
+- 证书和 ACME 账户保存在 named volume `caddy_data`（容器内 `/data`）。`docker compose down` 或重建容器都不会重签；只有 `docker compose down -v` 会删除证书并触发重新签发。
+- Let's Encrypt 对同一域名的重复证书有限流（每周 5 张）。调试时可临时打开 `caddy/Caddyfile` 全局块里的 staging `acme_ca`，确认配置后再切回正式环境。
+- `web`：Caddy，托管工作台构建产物，反代 `/api/`、`/apps/` 与 `/s/`；自动完成 HTTP→HTTPS 与证书续期，SSE 通过 `flush_interval -1` 关闭响应缓冲。
 - `backend`：FastAPI 单 worker + Node 共享 esbuild 工具链；内存上限 1G，生成项目后端另受 LRU 与单进程内存上限约束。
-- `certbot/conf` 与 `certbot/www` 是证书与 ACME 验证目录，已加入 `.gitignore`。
 - `backend/data/` 是宿主机挂载卷，容器重建后账号、项目、demo SQLite 与每个项目自己的 SQLite 都保留。
 
 详细的 Google OAuth、QQ 邮箱 SMTP、DNS/HTTPS 配置步骤见 `docs-local/auth-setup.md`（本地参考文档，不提交到仓库）。
@@ -406,7 +404,7 @@ SSE 事件：
 - [x] 刷新/重启后项目、对话分组与业务数据都保留
 - [x] 对话续改（版本递增、按 need 更新前后端、其余文件合并保留、SQLite 数据保留）
 - [x] 无 Key 提供 Mock 演示占位页；LLM 失败按配置重试，最终失败回滚并保留上一个可用版本（含前端构建 / 后端启动失败）
-- [x] Docker Compose + Nginx + 内存上限与运行时 LRU
+- [x] Docker Compose + Caddy + 内存上限与运行时 LRU
 - [x] 生命周期状态：未构建 / 未发布 / 在线 / 暂停；首次构建成功后工作台出现「概览」
 - [x] 发布快照与公开链接 `/s/{id}/`；发布后继续构建不影响线上，概览提示变更并可重新发布
 - [x] 暂停 / 恢复只切状态不重建；项目列表显示状态徽标；顶栏发布按钮按状态展示不同弹窗

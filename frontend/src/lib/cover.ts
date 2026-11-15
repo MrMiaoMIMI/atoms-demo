@@ -97,7 +97,7 @@ async function captureCover(
 
       if (data.type !== "atoms-cover") return;
       const dataUrl = data.dataUrl;
-      // Keep the upload below nginx's 2m body limit, and let the backend
+      // Keep the upload below Caddy's 2m body limit, and let the backend
       // validate the actual image bytes.
       if (
         typeof dataUrl !== "string" ||

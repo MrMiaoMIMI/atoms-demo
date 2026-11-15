@@ -11,16 +11,16 @@
 - 后端：Python 3.11 + FastAPI + uvicorn（单 worker）
 - 数据库：SQLite（WAL 模式），不引入 Postgres/Redis
 - 实时通信：SSE（Server-Sent Events），不用 WebSocket
-- 部署：Docker Compose + Nginx + Let's Encrypt，单机 2C2G 腾讯云轻量服务器，域名 `hajimi.site` HTTPS 访问
+- 部署：Docker Compose + Caddy + Let's Encrypt（Caddy 自动签发与续期），单机 2C2G 腾讯云轻量服务器，域名 `hajimi.site` HTTPS 访问
 - LLM：远程调用（OpenAI 兼容接口），服务端不加载任何模型
 
 ## 架构约束
 
 - 两栏布局：左侧对话（执行步骤内联折叠，角色执行中自动展开）/ 右侧 App Viewer（预览、概览、代码三个模式；概览仅在首次构建成功后显示；代码模式内可切换「文件 / 未发布改动」，时间线中带 diff 的步骤可点击查看单次工具改动），两栏分界线可拖拽
-- 生成代码写入 `backend/data/apps/{project_id}/`，nginx 将 `/apps/` 反代到 FastAPI；FastAPI 托管 `.preview/` 静态产物，并把 `/apps/{id}/api/*` 代理到项目自己的 uvicorn 进程
+- 生成代码写入 `backend/data/apps/{project_id}/`，Caddy 将 `/apps/` 反代到 FastAPI；FastAPI 托管 `.preview/` 静态产物，并把 `/apps/{id}/api/*` 代理到项目自己的 uvicorn 进程
 - 项目生命周期：`draft`（未构建）→ `unpublished`（首次构建成功）→ `online`（发布）⇄ `paused`（暂停）；`projects.built_version/built_at/published_version/published_at/paused` 持久化，派生 `status` 与 `has_changes = built_version > published_version`。只有完整构建成功才写 `built_version`，失败/回滚不写
 - 发布是构建快照：`apps/{id}/.published/{site,backend,manifest.json,source.json}`；`source.json` 是发布时的源码基线，用于「未发布改动」diff；`site` 的 `<base>` 改写为 `/s/{id}/`，`backend/data` 软链到工作区 `backend/data/app.db`；发布快照由独立 uvicorn 进程（`pid#published`，`APP_ROOT_PATH=/s/{id}`）运行。发布后的 chat 构建只改写工作区，不得触碰 `.published/` 或发布进程
-- `/s/{id}/` 与 `/s/{id}/api/*` 是公开入口（未发布/暂停统一 404），`/apps/{id}/` 仍仅项目所有者可打开；nginx 与 Vite dev proxy 都要加 `/s/`（Vite 必须写成 `/s/`，写成 `/s` 会把 `/src/*` 也代理走）
+- `/s/{id}/` 与 `/s/{id}/api/*` 是公开入口（未发布/暂停统一 404），`/apps/{id}/` 仍仅项目所有者可打开；Caddy 与 Vite dev proxy 都要加 `/s/`（Vite 必须写成 `/s/`，写成 `/s` 会把 `/src/*` 也代理走）
 - 暂停/恢复只改 `projects.paused` 并停止发布运行时，不重新构建；恢复后首个请求懒启动。线上与工作台共用项目 SQLite
 - 生成物是按需的完整 Web 项目：`frontend`（Vite + React 18 + TS）、`fullstack`（前端 + FastAPI + SQLite）、`backend`（FastAPI + SQLite）；不针对每个项目执行 `npm install`，预览用共享 esbuild 打包
 - 每个生成项目拥有独立 SQLite：`apps/{id}/backend/data/app.db`，与 demo 的 `backend/data/atoms.db` 完全隔离；重写代码时保留该数据目录
@@ -102,9 +102,7 @@ atoms-demo/
 │ ├── mocks/ # Mock 演示模板（仅无 Key 时使用：中性占位页 + agents.py 角色回复）
 │ ├── runtime/frontend/ # 共享 React + esbuild 工具链（node_modules 不入库）
 │ └── data/ # sqlite 与生成项目挂载（apps/{id}/backend/data/app.db）
-├── nginx/ # HTTP→HTTPS、ACME challenge、API/SSE/预览反代、临时自签名证书
-├── scripts/ # init-letsencrypt.sh / renew-cert.sh
-├── certbot/ # 证书与 ACME webroot（gitignored，运行时生成）
+├── caddy/ # 自动 HTTPS（Let's Encrypt 签发/续期）、ACME、API/SSE/预览反代、前端静态托管
 └── docker-compose.yml
 
 ## 代码规范

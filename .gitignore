@@ -29,6 +29,3 @@ frontend/public/preview-assets/
 
 # Misc
 docs-local/
-
-# TLS certificates and ACME webroot
-certbot/

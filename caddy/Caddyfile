@@ -1,0 +1,95 @@
+# Caddy configuration for the public entrypoint.
+#
+# Automatic HTTPS: Caddy obtains and renews the Let's Encrypt certificate on
+# its own and stores the ACME account + certificate in the caddy_data volume.
+# There is no certbot and no renewal cron.
+#
+# DOMAIN / ACME_EMAIL are injected by docker-compose.yml.
+
+{
+	email {$ACME_EMAIL}
+
+	# Uncomment to test issuance without hitting the Let's Encrypt production
+	# rate limits (certificates will be untrusted by browsers):
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$DOMAIN} {
+	@html header Accept *text/html*
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	# HTML navigations are never cached, otherwise a rebuilt image can keep
+	# serving a stale shell that points at the previous hashed assets.
+	header @html Cache-Control "no-store, no-cache, must-revalidate"
+	header @html Pragma "no-cache"
+
+	request_body {
+		max_size 2m
+	}
+
+	# API + SSE. flush_interval -1 disables response buffering so tokens and
+	# execution events reach the browser as they are produced.
+	handle /api/* {
+		reverse_proxy backend:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	# Generated projects: static preview + /apps/{id}/api/* proxy to the
+	# per-project uvicorn process, both handled by the backend.
+	handle /apps/* {
+		reverse_proxy backend:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	# Published sites: public snapshot + /s/{id}/api/* proxy to the published
+	# per-project uvicorn process. Kept separate from the owner-only /apps/.
+	handle /s/* {
+		reverse_proxy backend:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	# Hashed build assets are immutable.
+	handle /assets/* {
+		root * /srv
+		header Cache-Control "public, max-age=604800, immutable"
+		encode zstd gzip
+		file_server
+	}
+
+	# Never cache the SPA shell, otherwise a rebuilt image can keep serving
+	# an index.html that points at the previous hashed assets.
+	handle = /index.html {
+		root * /srv
+		header Cache-Control "no-store, no-cache, must-revalidate"
+		header Pragma "no-cache"
+		file_server
+	}
+
+	# SPA fallback for client-side routes.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		encode zstd gzip
+		file_server
+	}
+}
