@@ -1950,6 +1950,48 @@ async def _apply_and_build(
         },
     )
 
+    # Backend-only projects have no frontend to bundle, but they still need a
+    # static entry for the workspace preview and the publish snapshot. The API
+    # console is a deterministic shell, so build it here instead of relying on
+    # the model to call build_preview.
+    if plan["mode"] == "backend":
+        preview = await emit(
+            "execution",
+            {
+                "step": "生成 API 预览",
+                "status": "running",
+                "log": "纯后端项目生成内置 API 控制台…",
+            },
+        )
+        try:
+            await asyncio.to_thread(
+                frontend_builder.publish_api_page,
+                pid,
+                plan["title"],
+                plan.get("api") or [],
+            )
+        except Exception as exc:  # noqa: BLE001 - preview errors are repair input
+            text = f"{type(exc).__name__}: {exc}"
+            await emit(
+                "execution",
+                {
+                    "id": preview,
+                    "step": "生成 API 预览",
+                    "status": "error",
+                    "log": text.replace("\n", " ")[:180],
+                },
+            )
+            return False, text
+        await emit(
+            "execution",
+            {
+                "id": preview,
+                "step": "生成 API 预览",
+                "status": "success",
+                "log": "预览产物已生成",
+            },
+        )
+
     if plan["mode"] in ("frontend", "fullstack"):
         build = await emit(
             "execution",
@@ -2154,6 +2196,22 @@ async def _build_project_tools(
             )
         except Exception:  # noqa: BLE001 - best effort on a no-op round
             pass
+        # A no-op round can still be the first visit to a backend-only project
+        # built before its API console existed; repair the derived preview so
+        # the workspace preview and publish stay available.
+        if (
+            plan["mode"] == "backend"
+            and not (config.APPS_DIR / pid / ".preview" / "index.html").is_file()
+        ):
+            try:
+                await asyncio.to_thread(
+                    frontend_builder.publish_api_page,
+                    pid,
+                    plan["title"],
+                    plan.get("api") or [],
+                )
+            except Exception:  # noqa: BLE001 - best effort on a no-op round
+                pass
         return loop_result.text or "本轮没有检测到需要修改的文件。"
 
     repair_notes: list[str] = []

@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
@@ -10,6 +10,7 @@ import config
 import db
 import main
 import publisher
+import runtime
 
 
 class PublisherBaselineTests(unittest.TestCase):
@@ -163,6 +164,56 @@ class ChangesApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await main.get_project_changes(self.pid, {"id": "user-2"})
         self.assertEqual(ctx.exception.status_code, 404)
+
+
+class BackendPreviewRepairTests(unittest.IsolatedAsyncioTestCase):
+    """Backend-only projects built without an API console stay usable."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.apps = self.root / "apps"
+        self.apps.mkdir(parents=True)
+        self._patches = [
+            patch.object(db, "DB_PATH", self.root / "test.db"),
+            patch.object(config, "APPS_DIR", self.apps),
+        ]
+        for item in self._patches:
+            item.start()
+        await db.init_db()
+        project = await db.create_project("记账 API", "user-1")
+        self.pid = project["id"]
+        self.user = {"id": "user-1"}
+        self.project_root = self.apps / self.pid
+        (self.project_root / "backend").mkdir(parents=True)
+        (self.project_root / "backend/main.py").write_text(
+            "app = object()\n", encoding="utf-8"
+        )
+        await db.add_artifact(self.pid, "backend/main.py", "app = object()\n", 1)
+        await db.mark_built(self.pid, 1)
+
+    async def asyncTearDown(self) -> None:
+        for item in reversed(self._patches):
+            item.stop()
+        self._tmp.cleanup()
+
+    async def test_get_project_repairs_missing_api_preview(self) -> None:
+        self.assertFalse((self.project_root / ".preview/index.html").exists())
+        state = await main.get_project(self.pid, self.user)
+        self.assertEqual(state["mode"], "backend")
+        self.assertTrue((self.project_root / ".preview/index.html").is_file())
+        self.assertIsNotNone(state["preview_url"])
+
+    async def test_publish_repairs_missing_api_preview(self) -> None:
+        with patch.object(runtime.runtime, "stop", AsyncMock()):
+            result = await main.publish_project(self.pid, None, self.user)
+        self.assertTrue(result["ok"])
+        self.assertTrue(
+            (self.project_root / ".published/site/index.html").is_file()
+        )
+        project = await db.get_project(self.pid)
+        assert project is not None
+        self.assertEqual(project["published_version"], 1)
 
 
 if __name__ == "__main__":

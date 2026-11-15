@@ -35,6 +35,7 @@ import categories
 import config
 import db
 import diffing
+import frontend_builder
 import mailer
 import naming
 import publisher
@@ -695,9 +696,26 @@ def _preview_ready(pid: str) -> bool:
     return (config.APPS_DIR / pid / ".preview" / "index.html").exists()
 
 
+async def _repair_api_preview(pid: str, title: str) -> None:
+    """Recreate the derived API console for backend-only projects.
+
+    Builds made before the tool loop emitted this shell have a valid
+    ``built_version`` but no ``.preview/index.html``, so both the workspace
+    preview and publish would be blocked. The shell is deterministic, so it can
+    be regenerated without touching the project source.
+    """
+    try:
+        await asyncio.to_thread(
+            frontend_builder.publish_api_page, pid, title, []
+        )
+    except Exception as exc:  # noqa: BLE001 - repair is best effort
+        logger.warning("api preview repair failed for %s: %s", pid, exc)
+
+
 @app.get("/api/projects/{pid}")
 async def get_project(pid: str, user: dict = Depends(auth.current_user)) -> dict:
-    if not await db.get_project_for_user(pid, user["id"]):
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
     state = await db.get_state(pid)
     if not state:
@@ -706,6 +724,13 @@ async def get_project(pid: str, user: dict = Depends(auth.current_user)) -> dict
     artifacts = state["artifacts"]
     version = max((artifact["version"] for artifact in artifacts), default=0)
     state["mode"] = _project_mode(paths)
+    if (
+        state["mode"] == "backend"
+        and project.get("built_version") is not None
+        and not _preview_ready(pid)
+        and not _is_generating(pid)
+    ):
+        await _repair_api_preview(pid, project["name"])
     ready = _preview_ready(pid)
     state["preview_url"] = (
         f"/apps/{pid}/?v={version or 1}" if artifacts and ready else None
@@ -807,6 +832,10 @@ async def publish_project(
     built = project.get("built_version")
     if built is None:
         raise HTTPException(status_code=409, detail="项目还没有成功构建，无法发布")
+    if not _preview_ready(pid) and _project_mode_on_disk(pid) == "backend":
+        # Backend-only projects may predate the API console shell; regenerate
+        # the derived entry instead of failing a publish of a built project.
+        await _repair_api_preview(pid, project["name"])
     if not _preview_ready(pid):
         raise HTTPException(status_code=409, detail="构建产物不存在，请先重新构建")
 

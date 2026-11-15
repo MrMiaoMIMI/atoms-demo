@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import agent
 import db
+import publisher
 from llm import AssistantTurn, ToolCall
 
 
@@ -285,6 +286,73 @@ class BuildToolLoopTests(unittest.IsolatedAsyncioTestCase):
         assert project is not None
         self.assertEqual(project["built_version"], 2)
         self.assertEqual(await db.next_version(self.pid), 3)
+
+    async def test_backend_only_build_generates_api_preview(self) -> None:
+        """A backend-only build must ship a static entry for preview/publish."""
+        plan = {
+            "summary": "测试纯后端 API",
+            "title": "记账 API",
+            "mode": "backend",
+            "entities": [
+                {
+                    "table": "items",
+                    "fields": [
+                        {
+                            "name": "id",
+                            "type": "INTEGER",
+                            "primary_key": True,
+                            "autoincrement": True,
+                        }
+                    ],
+                }
+            ],
+            "api": [
+                {"method": "GET", "path": "/api/items", "description": "列表"},
+                {"method": "GET", "path": "/api/health", "description": "健康检查"},
+            ],
+            "files": [{"path": "backend/main.py", "purpose": "后端"}],
+        }
+        llm = ScriptedLLM(
+            [
+                call(
+                    "write_file",
+                    {"path": "backend/main.py", "content": BACKEND},
+                ),
+                AssistantTurn(text="API 完成", finish_reason="stop"),
+            ]
+        )
+        progress = {"published": False}
+        answer = await agent._build_project_tools(
+            self.pid,
+            "只做后端 API",
+            plan,
+            self.emitter(1),
+            existing={},
+            version=1,
+            llm=llm,
+            progress=progress,
+        )
+        self.assertIn("已完成 v1", answer)
+        # The API console is generated deterministically; no esbuild/frontend.
+        self.build.assert_not_awaited()
+        preview = self.root / "apps" / self.pid / ".preview" / "index.html"
+        self.assertTrue(preview.is_file())
+        html = preview.read_text(encoding="utf-8")
+        self.assertIn("记账 API", html)
+        self.assertIn("/api/items", html)
+
+        manifest = publisher.snapshot(self.pid, 1, "backend", "记账 API")
+        self.assertEqual(manifest["mode"], "backend")
+        self.assertTrue(
+            (
+                self.root
+                / "apps"
+                / self.pid
+                / ".published"
+                / "site"
+                / "index.html"
+            ).is_file()
+        )
 
 
 if __name__ == "__main__":

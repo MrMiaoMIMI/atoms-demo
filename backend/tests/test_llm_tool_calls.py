@@ -68,9 +68,13 @@ class MockToolTurnTests(unittest.IsolatedAsyncioTestCase):
             json.loads(first.tool_calls[0].arguments)["path"],
             "backend/main.py",
         )
-        messages.append(assistant_message())
+        messages += [assistant_message(), tool_message("")]
         second = await llm.turn(messages=messages, tools=[], meta=meta)
-        self.assertEqual(second.tool_calls[0].name, "start_runtime")
+        self.assertEqual(second.tool_calls[0].name, "build_preview")
+
+        messages += [assistant_message(), tool_message("")]
+        third = await llm.turn(messages=messages, tools=[], meta=meta)
+        self.assertEqual(third.tool_calls[0].name, "start_runtime")
 
     async def test_iteration_read_then_edit(self) -> None:
         llm = MockLLM()

@@ -146,8 +146,9 @@ class MockLLM:
                         },
                     )
                 )
-            if mode in ("frontend", "fullstack"):
-                script.append(("build_preview", {}))
+            # Backend-only builds also need the static API console entry so the
+            # preview iframe and publish have something to serve.
+            script.append(("build_preview", {}))
             if mode in ("backend", "fullstack"):
                 script.append(("start_runtime", {}))
             if step < len(script):
@@ -180,7 +181,11 @@ class MockLLM:
                     content = str(payload.get("data", {}).get("content") or "")
                 except (TypeError, ValueError):
                     content = ""
-            marker = "/* mock iteration: 未配置 LLM_API_KEY */"
+            marker = (
+                "# mock iteration: 未配置 LLM_API_KEY"
+                if target.endswith(".py")
+                else "/* mock iteration: 未配置 LLM_API_KEY */"
+            )
             if content:
                 return call(
                     "edit_file",
@@ -199,8 +204,8 @@ class MockLLM:
                 },
             )
         if step == 2:
-            if mode in ("frontend", "fullstack"):
-                return call("build_preview", {})
+            return call("build_preview", {})
+        if step == 3 and mode in ("backend", "fullstack"):
             return call("start_runtime", {})
         return AssistantTurn(
             text="Mock 模式：已完成一次占位修改。配置 LLM_API_KEY 后会按需求真实修改代码。",
