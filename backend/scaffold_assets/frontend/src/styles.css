@@ -1,0 +1,61 @@
+/* App-specific styles and theme overrides.
+ * design-system.css owns the tokens, reset and UI primitives; override
+ * variables here instead of redefining buttons and inputs.
+ */
+
+:root {
+  --ds-bg: #f6f6f6;
+  --ds-surface: #ffffff;
+  --ds-text: #0c0c0c;
+  --ds-accent: #4267ff;
+  --ds-accent-hover: #3154e8;
+  --ds-accent-soft: #eaf0ff;
+}
+
+.app {
+  min-height: 100vh;
+  padding: 56px 0 88px;
+  background:
+    radial-gradient(
+      900px 520px at 8% -10%,
+      rgba(66, 103, 255, 0.1),
+      transparent 60%
+    ),
+    radial-gradient(
+      760px 480px at 108% 8%,
+      rgba(15, 157, 118, 0.07),
+      transparent 55%
+    ),
+    var(--ds-bg);
+}
+
+.app__container {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.app__container > * {
+  transition:
+    transform 180ms var(--ds-ease),
+    opacity 180ms var(--ds-ease);
+}
+
+.app__container > *:hover {
+  transform: translateY(-1px);
+}
+
+@media (max-width: 768px) {
+  .app {
+    padding: 28px 0 56px;
+  }
+  .app__container {
+    gap: 20px;
+  }
+}
+
+@media (max-width: 480px) {
+  .app {
+    padding: 20px 0 48px;
+  }
+}

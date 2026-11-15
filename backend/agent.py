@@ -50,7 +50,20 @@ JSON 结构：
     ]}
   ],
   "api": [{"method": "GET", "path": "/api/items", "description": "获取列表"}],
-  "files": [{"path": "frontend/src/App.tsx", "purpose": "该文件的职责"}]
+  "files": [{"path": "frontend/src/App.tsx", "purpose": "该文件的职责"}],
+  "design": {
+    "archetype": "landing | dashboard | saas-tool | ecommerce | content | utility",
+    "style": "minimal-saas | editorial | bold-gradient | soft-neutral | brutalist",
+    "palette": {
+      "bg": "#F6F6F6", "surface": "#FFFFFF", "text": "#0C0C0C",
+      "muted": "#6B7280", "accent": "#4267FF", "accentSoft": "#EAF0FF"
+    },
+    "typography": {"display": "sans | serif | mono", "scale": "compact | regular | spacious"},
+    "layout": "topbar+sidebar | topbar+content | hero+sections | split-pane | centered-card",
+    "sections": ["hero", "features", "cta"],
+    "interactions": ["tabs", "toast", "skeleton"],
+    "density": "comfortable | compact"
+  }
 }
 
 形态判断：
@@ -61,17 +74,31 @@ JSON 结构：
 
 文件规则：
 1. 只允许这些路径：
-   - 前端：frontend/src/**，扩展名 .tsx/.ts/.css
+   - 前端：frontend/src/**，扩展名 .tsx/.ts/.css/.svg
    - 后端：backend/**，扩展名 .py
 2. 不要规划 package.json、vite.config.ts、tsconfig.json、index.html、src/main.tsx、
-   backend/db.py、backend/schema.sql、backend/requirements.txt、README.md，这些由系统生成。
+   src/design-system.css、src/ui/**、backend/db.py、backend/schema.sql、
+   backend/requirements.txt、README.md，这些由系统生成。
 3. frontend 形态必须规划 frontend/src/App.tsx 与 frontend/src/styles.css。
    fullstack 形态还必须规划 backend/main.py。
-4. 前端只能 import react / react-dom 和本轮规划中的本地文件；禁止第三方库。
-5. 前端所有后端请求使用相对路径 "api/..."（不要以 / 开头），例如 fetch("api/items")。
-6. 后端只能使用 fastapi、pydantic、aiosqlite、uvicorn 与 Python 标准库。
-7. 用户是在续改已有项目时，列出所有需要新增或修改的文件；不要重复列出不需要改的文件。
-8. 如果已有项目是 fullstack，除非用户明确要求去掉后端，否则继续保持 fullstack。
+4. 前端可以 import react / react-dom、本轮规划中的本地文件，以及这些已内置的库：
+   lucide-react（图标）、clsx（className）、sonner（toast）、framer-motion（动效）、
+   recharts（图表）、react-router-dom（多页路由，必须用 HashRouter）。禁止其他第三方库。
+5. 优先复用 frontend/src/ui/ 的组件（Button/IconButton、Input/Textarea/Select/Field、
+   Card/CardHeader/CardBody、Badge/Avatar/Skeleton/EmptyState/Stat、Dialog/Drawer/Toaster、
+   Tabs/PageHeader/Breadcrumb/SidebarNav/AppShell/Pagination、Icon）。不要重新发明按钮和输入框。
+6. 前端所有后端请求使用相对路径 "api/..."（不要以 / 开头），例如 fetch("api/items")。
+7. 后端只能使用 fastapi、pydantic、aiosqlite、uvicorn 与 Python 标准库。
+8. 用户是在续改已有项目时，列出所有需要新增或修改的文件；不要重复列出不需要改的文件。
+9. 如果已有项目是 fullstack，除非用户明确要求去掉后端，否则继续保持 fullstack。
+
+设计要求：
+1. design 必填（backend 形态可省略）。根据需求选择页面原型、风格、配色、布局与交互。
+2. palette 必须是 6 位 hex；accent 只选一个主色；bg 与 surface 要形成清晰层级。
+3. sections 是真实页面区块（hero/features/pricing/dashboard/table/...），不要写空泛词。
+4. interactions 从 tabs/drawer/toast/hover-card/skeleton/dialog/filter/search/pagination/
+   inline-edit/chart 中选，最多 8 个。
+5. 界面要像一个成熟产品，而不是模板：有明确的信息层级、间距节奏和真实文案。
 """
 
 BOB_TOOL_SYSTEM = (
@@ -87,14 +114,19 @@ FRONTEND_SYSTEM = """你是 "Coder" Agent，负责写出一个 React + TypeScrip
 
 要求：
 - React 18 函数组件 + hooks，TypeScript，单文件可独立被 Vite/esbuild 编译。
-- 只 import react / react-dom 以及本轮文件清单中的本地文件；禁止任何第三方库。
-- 不要 import CSS（样式统一写在 frontend/src/styles.css，由 main.tsx 引入）。
-- 所有 className 使用字面量字符串（条件样式用 "a" + (cond ? " b" : "")），不要在运行时拼出未定义的类名。
+- 优先复用 frontend/src/ui/ 的组件；可以 import react / react-dom、./ui、本轮文件清单中的本地文件，
+  以及 lucide-react、clsx、sonner、framer-motion、recharts、react-router-dom（HashRouter）。
+  禁止其他第三方库。React 类型（ReactNode/CSSProperties/FormEvent/ChangeEvent 等）从 react 导入，
+  不要依赖未导入的 React 命名空间；catch 变量是 unknown，先 instanceof Error。
+- 不要 import CSS（design-system.css 与 styles.css 由 main.tsx 引入）。
+- 所有 className 使用字面量字符串；条件样式用 clsx，不要在运行时拼出未定义的类名。
+- 视觉使用 design-system.css 的 --ds-* token 和 ui/ 组件；不要自己发明按钮、输入框、卡片。
+- 页面必须有明确层级与容器；交互元素有 hover/active/focus-visible；有 loading/empty/error 三态。
 - 全栈项目必须调用后端 API：所有请求使用相对路径 "api/..."，例如 fetch("api/items")，禁止以 / 开头。
 - fetch 后必须检查 res.ok；要有加载中、空数据、错误三种状态。
 - 禁止 localStorage / sessionStorage；持久化只能走后端 SQLite。
-- 视觉现代、精致、响应式，文案使用真实内容，不要 Lorem ipsum 占位。
-- 单个文件尽量控制在 8,000 字符以内；结构完整闭合，绝不能写到一半停止。
+- 文案使用真实内容，不要 Lorem ipsum；图标用 Icon/lucide，不要用 emoji 代替图标。
+- 单个文件尽量控制在 12,000 字符以内；超过请拆到 components/ 或 pages/；结构完整闭合。
 - 如果提供了当前文件内容，在保留原有可用功能的基础上修改。
 """
 
@@ -102,11 +134,15 @@ STYLES_SYSTEM = """你是 "Coder" Agent，负责写出前端样式文件 fronten
 只输出 CSS 本身：不要 markdown 代码围栏，不要任何解释。
 
 要求：
-- 覆盖 React 代码中出现的所有 className；布局容器必须有明确的 display / grid / flex 规则。
-- 现代、精致、一致的视觉语言；使用 React 代码里的真实类名，不要臆造。
-- 必须包含至少一个 @media (max-width: 768px) 媒体查询，保证窄屏可用。
-- 禁止 @import 外部字体之外的远程依赖；不要依赖构建工具。
-- 单个文件尽量控制在 8,000 字符以内；结构完整闭合。
+- frontend/src/design-system.css 已经提供 reset、tokens 与 UI 原语；你只写应用级样式。
+- 在 :root 覆盖 --ds-bg / --ds-surface / --ds-text / --ds-muted / --ds-accent /
+  --ds-accent-soft / --ds-font-display 等 token，不要重复定义按钮和输入框。
+- 覆盖 React 代码中出现的所有应用级 className；布局容器必须有明确的 display / grid / flex 规则。
+- 使用 8pt 间距节奏；section 间距 48–80px；圆角、阴影、边框保持统一。
+- 必须包含至少两个 @media 断点（建议 1024px 与 768px），保证窄屏可用。
+- 交互元素要有 hover / focus-visible / disabled；过渡 150–220ms。
+- 禁止 @import 远程依赖；不要依赖构建工具。
+- 单个文件尽量控制在 12,000 字符以内；结构完整闭合。
 - 如果提供了当前文件内容，在保留原有设计的基础上修改。
 """
 
@@ -377,7 +413,13 @@ def _normalize_files(raw: Any, mode: str) -> list[dict]:
             if not isinstance(item, dict):
                 continue
             path = str(item.get("path") or "").strip().replace("\\", "/")
-            if not path or path in blocked or not scaffold.safe_project_path(path):
+            if (
+                not path
+                or path in blocked
+                or path == scaffold.DESIGN_SYSTEM_FILE
+                or path.startswith(scaffold.UI_KIT_PREFIX)
+                or not scaffold.safe_project_path(path)
+            ):
                 continue
             ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
             frontend_ok = path.startswith("frontend/src/") and ext in {".tsx", ".ts", ".jsx", ".js", ".css"}
@@ -402,6 +444,220 @@ def _normalize_files(raw: Any, mode: str) -> list[dict]:
             files.append(required)
             seen.add(required["path"])
     return files
+
+
+DESIGN_ARCHETYPES = {
+    "landing",
+    "dashboard",
+    "saas-tool",
+    "ecommerce",
+    "content",
+    "utility",
+}
+DESIGN_STYLES = {
+    "minimal-saas",
+    "editorial",
+    "bold-gradient",
+    "soft-neutral",
+    "brutalist",
+}
+DESIGN_LAYOUTS = {
+    "topbar+sidebar",
+    "topbar+content",
+    "hero+sections",
+    "split-pane",
+    "centered-card",
+}
+DESIGN_TYPOGRAPHY = {"sans", "serif", "mono"}
+DESIGN_SCALES = {"compact", "regular", "spacious"}
+DESIGN_DENSITIES = {"comfortable", "compact"}
+DESIGN_INTERACTIONS = {
+    "tabs",
+    "drawer",
+    "toast",
+    "hover-card",
+    "skeleton",
+    "dialog",
+    "filter",
+    "search",
+    "pagination",
+    "inline-edit",
+    "chart",
+    "drag",
+    "infinite-scroll",
+    "wizard",
+}
+PALETTE_KEYS = ("bg", "surface", "text", "muted", "accent", "accentSoft")
+DEFAULT_PALETTE = {
+    "bg": "#F6F6F6",
+    "surface": "#FFFFFF",
+    "text": "#0C0C0C",
+    "muted": "#6B7280",
+    "accent": "#4267FF",
+    "accentSoft": "#EAF0FF",
+}
+_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+DESIGN_STYLE_GUIDE = {
+    "minimal-saas": "浅色中性底、一个主色、细边框、克制的阴影；大量留白；标题紧凑字距。",
+    "editorial": "serif display + 大字号、非对称网格、黑白/米色为主、色块或图片作为视觉锚点。",
+    "bold-gradient": "深色或高对比底、渐变 accent、半透明表面；动效克制但明确。",
+    "soft-neutral": "暖灰底、更大的圆角、低对比边框、柔和阴影；亲和、轻盈。",
+    "brutalist": "高对比黑白、粗边框、mono 标签、硬阴影；布局故意不对称。",
+}
+DESIGN_LAYOUT_GUIDE = {
+    "topbar+sidebar": "顶部品牌栏 + 左侧固定侧边栏（AppShell + SidebarNav），主区最大宽度 1200px。",
+    "topbar+content": "顶栏 + 居中内容区（最大 1120px），适合工具、列表与详情。",
+    "hero+sections": "顶部 hero（大标题 + 副标题 + 主 CTA + 视觉锚点），下面 3–6 个 section。",
+    "split-pane": "左侧列表/导航 + 右侧详情；移动端改为上下堆叠。",
+    "centered-card": "居中的单卡片（最大 560px），适合登录、表单、单任务工具。",
+}
+DESIGN_ARCHETYPE_GUIDE = {
+    "landing": "hero + 3–6 个 section + 明确 CTA；首屏要有视觉锚点，不要只放一张卡片。",
+    "dashboard": "AppShell + 顶部筛选 + KPI/Stat 行 + 图表或表格 + 详情；信息密度较高但分组清晰。",
+    "saas-tool": "SidebarNav + 主工作区 + 右侧/下方详情；强调列表、表单与状态反馈。",
+    "ecommerce": "导航 + 商品网格 + 筛选/搜索 + 详情/购物车；图片或色块要有统一比例。",
+    "content": "页头 + 文章/内容列表 + 详情；排版优先，控制每行宽度，标题层级明确。",
+    "utility": "围绕单一任务组织页面；居中或分栏，减少导航和装饰。",
+}
+DESIGN_SCALE_GUIDE = {
+    "compact": "字号 12/13/15/20/26，section 间距 32–48px。",
+    "regular": "字号 12/14/16/22/28，section 间距 48–64px。",
+    "spacious": "字号 13/15/18/26/36，section 间距 64–96px。",
+}
+DESIGN_DENSITY_GUIDE = {
+    "comfortable": "卡片内边距 20–24px，列表行高 44px 以上。",
+    "compact": "卡片内边距 14–18px，列表行高 36–40px。",
+}
+
+
+def _default_design(mode: str) -> dict:
+    if mode == "backend":
+        return {}
+    if mode == "fullstack":
+        return {
+            "archetype": "saas-tool",
+            "style": "minimal-saas",
+            "palette": dict(DEFAULT_PALETTE),
+            "typography": {"display": "sans", "scale": "regular"},
+            "layout": "topbar+content",
+            "sections": ["header", "main", "detail"],
+            "interactions": ["tabs", "toast", "skeleton", "dialog"],
+            "density": "comfortable",
+        }
+    return {
+        "archetype": "landing",
+        "style": "minimal-saas",
+        "palette": dict(DEFAULT_PALETTE),
+        "typography": {"display": "sans", "scale": "regular"},
+        "layout": "hero+sections",
+        "sections": ["hero", "features", "cta"],
+        "interactions": ["hover-card", "skeleton"],
+        "density": "comfortable",
+    }
+
+
+def _clean_design_list(value: Any, *, limit: int, max_length: int = 24) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item or "").strip()[:max_length]
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _normalize_design(raw: Any, mode: str) -> dict:
+    """Clamp the planner's visual brief to a safe, renderable contract."""
+    base = _default_design(mode)
+    if not base:
+        return {}
+    if not isinstance(raw, dict):
+        return base
+
+    archetype = str(raw.get("archetype") or "").strip().lower()
+    if archetype in DESIGN_ARCHETYPES:
+        base["archetype"] = archetype
+    style = str(raw.get("style") or "").strip().lower()
+    if style in DESIGN_STYLES:
+        base["style"] = style
+
+    palette_raw = raw.get("palette") if isinstance(raw.get("palette"), dict) else {}
+    palette = dict(base["palette"])
+    for key in PALETTE_KEYS:
+        value = (
+            palette_raw.get(key)
+            or palette_raw.get(re.sub(r"([A-Z])", r"_\1", key).lower())
+            or ""
+        )
+        value = str(value).strip()
+        if _HEX_COLOR.match(value):
+            palette[key] = value.upper()
+    base["palette"] = palette
+
+    typography_raw = (
+        raw.get("typography") if isinstance(raw.get("typography"), dict) else {}
+    )
+    display = str(typography_raw.get("display") or "").strip().lower()
+    scale = str(typography_raw.get("scale") or "").strip().lower()
+    base["typography"] = {
+        "display": display if display in DESIGN_TYPOGRAPHY else base["typography"]["display"],
+        "scale": scale if scale in DESIGN_SCALES else base["typography"]["scale"],
+    }
+
+    layout = str(raw.get("layout") or "").strip().lower()
+    if layout in DESIGN_LAYOUTS:
+        base["layout"] = layout
+    density = str(raw.get("density") or "").strip().lower()
+    if density in DESIGN_DENSITIES:
+        base["density"] = density
+
+    sections = _clean_design_list(raw.get("sections"), limit=8)
+    if sections:
+        base["sections"] = sections
+    interactions = [
+        item
+        for item in _clean_design_list(raw.get("interactions"), limit=8)
+        if item in DESIGN_INTERACTIONS
+    ]
+    if interactions:
+        base["interactions"] = interactions
+    return base
+
+
+def _design_brief(plan: dict) -> str:
+    mode = plan.get("mode") or "frontend"
+    if mode == "backend":
+        return "本项目没有前端界面，不需要视觉设计。"
+    design = plan.get("design") or _default_design(mode)
+    palette = design["palette"]
+    typography = design["typography"]
+    font_token = {
+        "sans": "var(--ds-font-sans)",
+        "serif": "var(--ds-font-serif)",
+        "mono": "var(--ds-font-mono)",
+    }.get(typography["display"], "var(--ds-font-sans)")
+    return (
+        "视觉方向（必须执行）：\n"
+        f"- 页面原型：{design['archetype']} — "
+        f"{DESIGN_ARCHETYPE_GUIDE.get(design['archetype'], '')}\n"
+        f"- 风格：{design['style']} — {DESIGN_STYLE_GUIDE.get(design['style'], '')}\n"
+        f"- 布局：{design['layout']} — {DESIGN_LAYOUT_GUIDE.get(design['layout'], '')}\n"
+        f"- 配色：bg {palette['bg']} / surface {palette['surface']} / "
+        f"text {palette['text']} / muted {palette['muted']} / "
+        f"accent {palette['accent']} / accentSoft {palette['accentSoft']}\n"
+        f"- 字体：display {typography['display']}（--ds-font-display: {font_token}）；"
+        f"scale {typography['scale']} — {DESIGN_SCALE_GUIDE.get(typography['scale'], '')}\n"
+        f"- 密度：{design['density']} — "
+        f"{DESIGN_DENSITY_GUIDE.get(design['density'], '')}\n"
+        f"- 重点区块：{'、'.join(design['sections'])}\n"
+        f"- 必须包含的交互：{'、'.join(design['interactions'])}\n"
+        "执行要求：在 frontend/src/styles.css 的 :root 覆盖对应的 --ds-* 变量；"
+        "不要修改 frontend/src/design-system.css。"
+    )
 
 
 def _parse_plan_json(text: str) -> dict | None:
@@ -463,7 +719,64 @@ def _plan_from_text(
         "entities": entities,
         "api": api,
         "files": files,
+        "design": _normalize_design(data.get("design"), mode),
     }
+
+
+def _with_design_import(content: str) -> str:
+    """Add the design-system import to an existing main.tsx once."""
+    if "design-system.css" in content:
+        return content
+    if 'import "./styles.css";' in content:
+        return content.replace(
+            'import "./styles.css";',
+            f'{scaffold.DESIGN_SYSTEM_IMPORT}\nimport "./styles.css";',
+            1,
+        )
+    return f"{scaffold.DESIGN_SYSTEM_IMPORT}\n{content}"
+
+
+def _migrate_tsconfig(content: str) -> str:
+    """Drop the old vite/client type reference so tsc works without Vite."""
+    if '"vite/client"' not in content:
+        return content
+    migrated = re.sub(r'"vite/client"\s*,?\s*', "", content)
+    migrated = re.sub(r",(\s*\])", r"\1", migrated)
+    return migrated
+
+
+def _migrate_vite_env(content: str) -> str:
+    """Replace the Vite-only declaration with the scaffold's minimal one."""
+    if "vite/client" not in content:
+        return content
+    return scaffold.FRONTEND_ENV_TYPES
+
+
+def _migrate_package_json(content: str, title: str) -> str:
+    """Merge the curated dependencies into an older generated package.json."""
+    try:
+        data = json.loads(content)
+    except (TypeError, ValueError):
+        return content
+    if not isinstance(data, dict):
+        return content
+    canonical = json.loads(
+        scaffold.FRONTEND_PACKAGE.replace("__NAME__", scaffold._package_name(title))
+    )
+    changed = False
+    for key in ("dependencies", "devDependencies"):
+        current = data.get(key)
+        if not isinstance(current, dict):
+            current = {}
+        merged = dict(current)
+        for name, version in canonical.get(key, {}).items():
+            if name not in merged:
+                merged[name] = version
+                changed = True
+        data[key] = merged
+    if not changed:
+        return content
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
 def _scaffold_files(
@@ -476,8 +789,18 @@ def _scaffold_files(
     }
     if mode in ("frontend", "fullstack"):
         for path, content in scaffold.frontend_files(plan["title"]).items():
-            if path not in existing:
-                files[path] = content
+            if path in existing:
+                current = existing[path]
+                if path == "frontend/src/main.tsx":
+                    files[path] = _with_design_import(current)
+                elif path == "frontend/tsconfig.json":
+                    files[path] = _migrate_tsconfig(current)
+                elif path == "frontend/src/vite-env.d.ts":
+                    files[path] = _migrate_vite_env(current)
+                elif path == "frontend/package.json":
+                    files[path] = _migrate_package_json(current, plan["title"])
+                continue
+            files[path] = content
     if mode in ("backend", "fullstack"):
         for path, content in scaffold.backend_common_files().items():
             if path not in existing:
@@ -527,11 +850,19 @@ def _review(files: dict[str, str], mode: str) -> list[str]:
     if mode in ("frontend", "fullstack"):
         app = files.get("frontend/src/App.tsx", "")
         css = files.get("frontend/src/styles.css", "")
-        frontend_source = "\n".join(
-            content
+        design_system = files.get(scaffold.DESIGN_SYSTEM_FILE, "")
+        main_tsx = files.get("frontend/src/main.tsx", "")
+        frontend_sources = {
+            name: content
             for name, content in files.items()
-            if name.startswith("frontend/src/")
-        )
+            if name.startswith("frontend/src/") and name.endswith((".tsx", ".ts", ".jsx", ".js"))
+        }
+        frontend_css = {
+            name: content
+            for name, content in files.items()
+            if name.startswith("frontend/src/") and name.endswith(".css")
+        }
+        frontend_source = "\n".join(frontend_sources.values())
         if not app:
             issues.append("frontend/src/App.tsx 缺失")
         elif "export default" not in app:
@@ -543,15 +874,28 @@ def _review(files: dict[str, str], mode: str) -> list[str]:
                 issues.append("styles.css 括号不完整")
             if "@media" not in css:
                 issues.append("styles.css 缺少移动端媒体查询")
-            used: set[str] = set()
-            for value in re.findall(r'className\s*=\s*"([^"]+)"', app):
+        if not design_system:
+            issues.append("frontend/src/design-system.css 缺失（设计系统底座）")
+        if not main_tsx:
+            issues.append("frontend/src/main.tsx 缺失")
+        elif "design-system.css" not in main_tsx:
+            issues.append("main.tsx 未引入 design-system.css")
+
+        used: set[str] = set()
+        for source in frontend_sources.values():
+            for value in re.findall(r'className\s*=\s*"([^"]+)"', source):
                 used.update(token for token in value.split() if token)
-            for value in re.findall(r"className\s*=\s*'([^']+)'", app):
+            for value in re.findall(r"className\s*=\s*'([^']+)'", source):
                 used.update(token for token in value.split() if token)
-            defined = set(re.findall(r"\.([A-Za-z_][\w-]*)", css))
-            missing = sorted(used - defined)
-            if missing:
-                issues.append("样式缺口：" + "、".join("." + name for name in missing[:6]))
+        defined: set[str] = set()
+        for stylesheet in frontend_css.values():
+            defined.update(
+                re.findall(r"\.([A-Za-z_][\w-]*)", stylesheet)
+            )
+        missing = sorted(used - defined)
+        if missing:
+            issues.append("样式缺口：" + "、".join("." + name for name in missing[:6]))
+
         if (
             "localstorage" in frontend_source.lower()
             or "sessionstorage" in frontend_source.lower()
@@ -586,6 +930,58 @@ def _review(files: dict[str, str], mode: str) -> list[str]:
             ):
                 issues.append("backend/main.py 只能使用 SQLite，禁止其他数据库依赖")
     return issues
+
+
+_EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF☀-➿]")
+
+
+def _design_review(files: dict[str, str], mode: str) -> list[str]:
+    """Soft visual-quality checks. These never trigger a blocking repair loop."""
+    if mode not in ("frontend", "fullstack"):
+        return []
+    notes: list[str] = []
+    css = files.get("frontend/src/styles.css", "")
+    app = files.get("frontend/src/App.tsx", "")
+    source = "\n".join(
+        content
+        for name, content in files.items()
+        if name.startswith("frontend/src/")
+        and name.endswith((".tsx", ".ts", ".jsx", ".js"))
+        and not name.startswith(scaffold.UI_KIT_PREFIX)
+    )
+    if css and "--ds-" not in css:
+        notes.append("styles.css 未覆盖 --ds-* 主题变量")
+    if css and css.count("@media") < 2:
+        notes.append("styles.css 少于 2 个响应式断点")
+    if css and "transition" not in css:
+        notes.append("styles.css 未定义过渡/动效")
+    if css and ":hover" not in css:
+        notes.append("styles.css 未定义 hover 状态")
+    if not re.search(r"loading|Loading|加载|Skeleton|Spinner", source):
+        notes.append("缺少加载态（Skeleton/Spinner/加载文案）")
+    if not re.search(r"empty|Empty|空|EmptyState", source):
+        notes.append("缺少空状态（EmptyState/空数据文案）")
+    if not re.search(r"error|Error|错误|InlineNotice", source):
+        notes.append("缺少错误态（错误文案/InlineNotice）")
+    if _EMOJI_RE.search(app):
+        notes.append("界面中使用了 emoji，建议改用 Icon/lucide 图标")
+    if "Icon" not in source and "lucide" not in source:
+        notes.append("未使用图标组件，界面容易显得单薄")
+    if not re.search(r'from\s+["\']\./ui(?:/|["\'])', source):
+        notes.append("未使用 ui/ 组件，界面一致性可能不足")
+    large = [
+        name
+        for name, content in files.items()
+        if name.startswith("frontend/src/")
+        and name.endswith((".tsx", ".ts", ".jsx", ".js"))
+        and len(content) > config.FILE_SIZE_WARN_CHARS
+    ]
+    if large:
+        notes.append(
+            "以下前端文件较大，建议拆到 components/ 或 pages/："
+            + "、".join(large[:4])
+        )
+    return notes
 
 
 def _needs_style_repair(issues: list[str]) -> bool:
@@ -1636,16 +2032,54 @@ ALEX_TOOL_SYSTEM = """你是 Alex，团队的工程师。你通过工具读写�
 工具使用规则：
 1. 修改已有文件前先 read_file；优先 edit_file（精确匹配）。write_file 只用于新建文件，或显式 overwrite=true 的整文件重写。
 2. 只操作项目内的源码路径；不要碰 .published、.preview、backend/data、node_modules、.runtime.log。
-3. 新项目工作区只有确定性脚手架：前端必须创建 frontend/src/App.tsx（export default function App()）和 frontend/src/styles.css；全栈/后端必须创建 backend/main.py。
+3. 工作区已经包含 frontend/src/design-system.css、frontend/src/ui/**、starter App.tsx 与 styles.css。
+   不要修改 design-system.css 和 ui/**；在 styles.css 的 :root 覆盖 --ds-* token。
+   starter App.tsx/styles.css 是可运行的占位实现：整文件替换时 write_file 必须 overwrite=true，更推荐 read_file 后 edit_file。
+   如果 App.tsx 缺失，仍需创建 frontend/src/App.tsx（export default function App()）和 styles.css；全栈/后端必须创建 backend/main.py。
 4. 如果项目形态升级（例如新增后端），请创建缺失侧的最小必需文件。
-5. 前端只 import react / react-dom 和本轮规划中的本地文件；禁止第三方库；不要 import CSS（styles.css 由 main.tsx 引入）。
+5. 前端可以 import react / react-dom、./ui、本轮规划中的本地文件，以及 lucide-react、clsx、sonner、
+   framer-motion、recharts、react-router-dom。多页应用必须用 HashRouter（不要 BrowserRouter）；
+   单页应用不要引入路由。禁止其他第三方库；不要 import CSS（design-system.css 与 styles.css 由 main.tsx 引入）。
+   React 类型（ReactNode、CSSProperties、FormEvent、ChangeEvent 等）从 react 导入，不要依赖未导入的 React 命名空间。
+   catch 变量是 unknown，访问 message 前先 instanceof Error。
 6. 全栈项目前端所有请求使用相对路径 "api/..."，不要以 / 开头；禁止 localStorage/sessionStorage。
 7. 后端只允许 fastapi、pydantic、aiosqlite 和标准库；必须 from db import connection, init_db；lifespan 中 await init_db()；app = FastAPI(root_path=os.getenv("APP_ROOT_PATH",""), lifespan=lifespan)；CORS 全开；至少实现 GET /api/health。
-8. 单个文件尽量控制在 8,000 字符以内；结构完整闭合，不要写到一半停止。
+8. 单个文件尽量控制在 12,000 字符以内；超过请拆到 frontend/src/components/ 或 frontend/src/pages/；结构完整闭合，不要写到一半停止。
 9. 改完代码后调用 build_preview；后端项目还要 start_runtime 并 check_health。构建/启动失败时先 read_file 看真实错误，再用 edit_file 精准修复，不要整文件瞎改。
 10. 保持现有 UI、文案、交互与数据；不要重写与本次需求无关的文件。
-11. 完成时用中文简短总结：修改了哪些文件、是否构建/启动成功。不要声称成功但没有跑 build。
+11. 视觉要求（必须执行）：
+   - 优先复用 ui/ 组件：Button/IconButton、Input/Textarea/Select/Field、Card/CardHeader/CardBody、Badge/Avatar/Skeleton/EmptyState/Stat、Dialog/Drawer/Toaster、Tabs/PageHeader/Breadcrumb/SidebarNav/AppShell/Pagination、Icon。
+   - 只用 --ds-* token 与一个主色；不要自己发明按钮、输入框、卡片样式。
+   - 页面要有明确 shell / 层级 / 容器；8pt 间距节奏；section 间距 48–80px；移动端 16px gutter。
+   - 每个页面必须有 loading / empty / error 三态；所有交互元素有 hover / active / focus-visible / disabled。
+   - transition 150–220ms，尊重 prefers-reduced-motion；至少 2 个断点（≤1024 / ≤768）。
+   - 图标用 Icon 或 lucide-react，不要用 emoji 代替图标；文案真实具体，不要 Lorem ipsum。
+   - 配色克制：一个 accent，中性色负责层级；圆角、阴影、边框保持一致。
+12. 完成时用中文简短总结：修改了哪些文件、是否构建/启动成功。不要声称成功但没有跑 build。
 """
+
+
+DESIGN_PASS_SYSTEM = """你是团队的视觉设计师，负责把已经能运行的界面打磨到高完成度。
+硬性规则：
+1. 只修改 frontend/src/App.tsx、frontend/src/styles.css、frontend/src/components/**、frontend/src/pages/**。
+2. 绝不修改 backend/**、package.json、main.tsx、design-system.css、ui/**、数据流、API 调用或业务规则。
+3. 先 read_file 看现有实现；优先 edit_file；不要整文件重写无关内容。
+4. 使用 design-system.css 的 --ds-* token 和 ui/ 组件；不要在 styles.css 里重复定义按钮/输入框。
+5. 必须补齐 loading / empty / error / disabled / hover / focus-visible 状态。
+6. 至少两个响应式断点（≤1024 / ≤768）；移动端可用。
+7. transition 150–220ms；不要滥用动画，尊重 prefers-reduced-motion。
+8. 图标用 Icon/lucide，不要用 emoji；文案真实具体，不要 Lorem ipsum。
+9. 完成后调用 build_preview；如果构建失败，先 read_file 看错误再修复。
+10. 用中文简短总结改了什么、是否构建成功。不要声称成功但没有跑 build。
+"""
+
+
+def _design_pass_allowed(path: str) -> bool:
+    return (
+        path in {"frontend/src/App.tsx", "frontend/src/styles.css"}
+        or path.startswith("frontend/src/components/")
+        or path.startswith("frontend/src/pages/")
+    )
 
 
 def _schema_changed(plan: dict, existing: dict[str, str]) -> bool:
@@ -1679,6 +2113,22 @@ def _tool_budget(
     return steps, seconds, max_calls
 
 
+def _ui_kit_reference() -> str:
+    return """可复用 UI（从 "./ui" 导入）：
+- Button: variant primary|secondary|soft|ghost|danger, size sm|md|lg, icon, iconRight, loading, block
+- IconButton: icon, label, variant, size
+- Field: label/hint/error/required；Input/Textarea/Select（invalid、options）；Checkbox；FormGrid
+- Card/CardHeader/CardBody/CardFooter；Badge（tone/dot）；Avatar；Skeleton；EmptyState；Stat；Section；Divider；Table
+- Dialog/ConfirmDialog/Drawer；Toaster + toast；InlineNotice
+- Tabs；PageHeader；Breadcrumb；SidebarNav；AppShell（≤860px 隐藏 sidebar，移动端用 Drawer 包导航）；Pagination；Icon
+推荐组合：
+- Landing：PageHeader + Section + ds-grid--3 + Card + 主 CTA
+- Dashboard：AppShell + SidebarNav + Stat 行 + Card/Table + 筛选 Tabs
+- 工具/列表：PageHeader + Tabs/筛选 + Card 列表 + EmptyState/Skeleton/Pagination
+示例：import { AppShell, SidebarNav, PageHeader, Button, Card, CardBody, Badge, Icon } from "./ui";
+样式用 --ds-* token；不要修改 design-system.css 和 ui/**。"""
+
+
 def _workspace_context(workspace: Workspace, plan: dict) -> str:
     files = workspace.files
     tree = "\n".join(
@@ -1686,7 +2136,18 @@ def _workspace_context(workspace: Workspace, plan: dict) -> str:
         for path, content in sorted(files.items())
     )
     blocks = [f"当前文件树（{len(files)} 个）：\n{tree or '（空）'}"]
+    if plan.get("mode") in ("frontend", "fullstack") and (
+        scaffold.DESIGN_SYSTEM_FILE in files
+        or any(path.startswith(scaffold.UI_KIT_PREFIX) for path in files)
+    ):
+        blocks.append(
+            "设计系统（内容未内联，需要时 read_file 查看）：\n"
+            f"- {scaffold.DESIGN_SYSTEM_FILE}：CSS tokens、reset、基础原语\n"
+            f"- {scaffold.UI_KIT_PREFIX}*：可复用 React 组件\n"
+            "不要修改这些文件；在 frontend/src/styles.css 覆盖 --ds-* 变量。"
+        )
 
+    skip_inline = {scaffold.DESIGN_SYSTEM_FILE}
     targets = [item["path"] for item in plan.get("files") or []]
     preferred: list[str] = []
     for path in [
@@ -1695,11 +2156,22 @@ def _workspace_context(workspace: Workspace, plan: dict) -> str:
         "backend/main.py",
         *targets,
     ]:
-        if path in files and path not in preferred:
+        if (
+            path in files
+            and path not in preferred
+            and path not in skip_inline
+            and not path.startswith(scaffold.UI_KIT_PREFIX)
+        ):
             preferred.append(path)
-    total_size = sum(len(content) for content in files.values())
+    inline_candidates = {
+        path: content
+        for path, content in files.items()
+        if path not in skip_inline
+        and not path.startswith(scaffold.UI_KIT_PREFIX)
+    }
+    total_size = sum(len(content) for content in inline_candidates.values())
     if total_size <= config.AGENT_CONTEXT_INLINE_CHARS:
-        include = sorted(files)
+        include = sorted(inline_candidates)
     else:
         include = preferred
     chunks: list[str] = []
@@ -1739,16 +2211,21 @@ def _alex_tool_user(
         "Planner 建议文件："
         + ("、".join(item["path"] for item in plan["files"]) or "（未指定）"),
         _contract(plan),
+        _design_brief(plan),
+        _ui_kit_reference(),
     ]
     if first_build:
         blocks.append(
-            "这是一个新项目：工作区只有确定性脚手架。"
-            "请先用 write_file 创建最小必需文件，再实现完整需求。"
+            "这是一个新项目：工作区已经包含 design-system.css、ui/ 组件和 starter App.tsx/styles.css。"
+            "starter 是可运行的占位实现，请替换为真实需求并实现完整功能。"
+            "整文件替换已存在的 starter 时 write_file 需要 overwrite=true；"
+            "更推荐先 read_file 再 edit_file。缺少必需文件时才用 write_file 新建。"
         )
     else:
         blocks.append(
             "这是对已有项目的迭代：先 read_file 看相关文件，"
             "优先 edit_file 精准修改；不要全量重写无关文件。"
+            "默认保持现有设计语言；只有用户明确要求换风格/重做界面时，才按上面的视觉方向重新设计。"
         )
     if bob_text:
         blocks.append(f"Bob 的建筑方案：\n{bob_text}")
@@ -1765,7 +2242,13 @@ async def _seed_scaffold(
     scaffold_files = _scaffold_files(plan, workspace.base)
     writes: dict[str, str] = {}
     for path, content in scaffold_files.items():
-        if path == "backend/schema.sql":
+        if path in (
+            "backend/schema.sql",
+            "frontend/src/main.tsx",
+            "frontend/tsconfig.json",
+            "frontend/src/vite-env.d.ts",
+            "frontend/package.json",
+        ):
             if workspace.base.get(path) != content:
                 writes[path] = content
         elif path not in workspace.base:
@@ -1860,6 +2343,22 @@ async def _review_with_tools(
     workspace = toolbox.ctx.workspace
     assert workspace is not None
     issues = _review(workspace.files, plan["mode"])
+    design_notes = _design_review(workspace.files, plan["mode"])
+
+    async def emit_design_check(notes: list[str]) -> None:
+        await emit(
+            "execution",
+            {
+                "step": "设计质量检查",
+                "status": "warning" if notes else "success",
+                "log": (
+                    "；".join(notes)[:180]
+                    if notes
+                    else "视觉变量、状态、动效与图标检查通过"
+                ),
+            },
+        )
+
     if not issues:
         await emit(
             "execution",
@@ -1869,6 +2368,7 @@ async def _review_with_tools(
                 "log": f"{len(workspace.files)} 个文件通过检查",
             },
         )
+        await emit_design_check(design_notes)
         return loop_result, issues
     if not config.AUTO_REPAIR:
         await emit(
@@ -1879,6 +2379,7 @@ async def _review_with_tools(
                 "log": "；".join(issues)[:180],
             },
         )
+        await emit_design_check(design_notes)
         return loop_result, issues
 
     check = await emit(
@@ -1920,7 +2421,204 @@ async def _review_with_tools(
             ),
         },
     )
+    design_notes = _design_review(workspace.files, plan["mode"])
+    await emit_design_check(design_notes)
     return loop_result, issues
+
+
+def _restore_design_snapshot(
+    workspace: Workspace,
+    snapshot: dict[str, str],
+    deleted: set[str],
+) -> None:
+    """Roll the staged tree back without inventing a second version."""
+    for path in sorted(set(workspace.files) - set(snapshot)):
+        if _design_pass_allowed(path):
+            workspace.files.pop(path, None)
+    for path, content in snapshot.items():
+        if workspace.files.get(path) != content:
+            workspace.files[path] = content
+    workspace.deleted = set(deleted)
+
+
+async def _reconcile_design_artifacts(
+    pid: str,
+    version: int,
+    before: dict[str, str],
+    after: dict[str, str],
+) -> None:
+    """Make the DB artifacts match a restored design-pass snapshot."""
+    for path in sorted(set(before) | set(after)):
+        if before.get(path) == after.get(path):
+            continue
+        if path in after:
+            await db.add_artifact(pid, path, after[path], version)
+        else:
+            await db.add_artifact_deleted(pid, path, version)
+
+
+async def _design_pass_with_tools(
+    *,
+    pid: str,
+    plan: dict,
+    message: str,
+    emit: RoleEmitter,
+    ctx: ToolContext,
+    workspace: Workspace,
+    llm,
+    first_build: bool,
+) -> tuple[bool, str]:
+    """Best-effort visual polish after a successful first build."""
+    if (
+        not first_build
+        or not config.DESIGN_PASS_FIRST_BUILD
+        or plan.get("mode") not in ("frontend", "fullstack")
+        or isinstance(llm, MockLLM)
+    ):
+        return False, ""
+
+    snapshot = dict(workspace.files)
+    snapshot_deleted = set(workspace.deleted)
+    toolbox = Toolbox(
+        ctx,
+        frozenset(
+            {
+                "read_project_state",
+                "list_files",
+                "read_file",
+                "grep",
+                "write_file",
+                "edit_file",
+                "delete_file",
+                "build_preview",
+            }
+        ),
+    )
+    ctx.write_allowlist = (
+        "frontend/src/App.tsx",
+        "frontend/src/styles.css",
+        "frontend/src/components",
+        "frontend/src/pages",
+    )
+    user = "\n\n".join(
+        [
+            "这是首次构建成功后的视觉打磨。当前界面已经能构建和运行；"
+            "不要修改业务逻辑、API 调用、数据结构或后端文件。",
+            f"用户需求：\n{message}",
+            _design_brief(plan),
+            _ui_kit_reference(),
+            "打磨清单（逐项检查并在代码中落实）：\n"
+            "- 页面 shell / 视觉层级 / 容器宽度\n"
+            "- 间距节奏与排版（标题、正文、辅助文字）\n"
+            "- 配色一致性（一个 accent，中性色负责层级）\n"
+            "- 组件复用与一致性（优先 ui/ 组件）\n"
+            "- loading / empty / error / disabled / hover / focus-visible\n"
+            "- 响应式（≤1024 / ≤768）与移动端 gutter\n"
+            "- 细节：圆角、阴影、边框、图标、微动效\n"
+            "完成后调用 build_preview；如果构建失败，先 read_file 看错误再精准修复。",
+            _workspace_context(workspace, plan),
+        ]
+    )
+    step = await emit(
+        "execution",
+        {
+            "step": "视觉打磨",
+            "status": "running",
+            "log": "按设计系统统一层级、间距、状态与响应式…",
+        },
+    )
+    meta = {
+        "prompt": message,
+        "mode": plan["mode"],
+        "title": plan["title"],
+        "existing": workspace.files,
+        "iteration": False,
+        "design_pass": True,
+    }
+    loop_error = ""
+    try:
+        loop_result = await run_tool_loop(
+            llm=llm,
+            toolbox=toolbox,
+            system=DESIGN_PASS_SYSTEM,
+            user=user,
+            meta=meta,
+            emit=emit,
+            max_steps=config.DESIGN_PASS_MAX_STEPS,
+            timeout_seconds=config.DESIGN_PASS_SECONDS,
+            max_tool_calls=config.DESIGN_PASS_MAX_TOOL_CALLS,
+            max_tool_calls_per_step=config.AGENT_MAX_TOOL_CALLS_PER_STEP,
+            no_progress_limit=config.AGENT_MAX_NO_PROGRESS_STEPS,
+        )
+    except Exception as exc:  # noqa: BLE001 - polish must never fail the build
+        loop_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+        loop_result = None
+    finally:
+        ctx.write_allowlist = None
+
+    if workspace.files == snapshot:
+        await emit(
+            "execution",
+            {
+                "id": step,
+                "step": "视觉打磨",
+                "status": "warning" if loop_error else "success",
+                "log": "界面已符合设计基线，无需调整"
+                + (f"（{loop_error}）" if loop_error else ""),
+            },
+        )
+        return False, ""
+
+    ok, error = await _apply_and_build(
+        pid,
+        workspace,
+        plan,
+        emit,
+        ctx,
+        stop_backend=False,
+        frontend_only=True,
+    )
+    if ok:
+        await emit(
+            "execution",
+            {
+                "id": step,
+                "step": "视觉打磨",
+                "status": "success",
+                "log": "视觉打磨完成并构建通过",
+            },
+        )
+        return True, "视觉打磨完成"
+
+    design_state = dict(workspace.files)
+    _restore_design_snapshot(workspace, snapshot, snapshot_deleted)
+    await _reconcile_design_artifacts(
+        pid, ctx.version, design_state, workspace.files
+    )
+    restored, restore_error = await _apply_and_build(
+        pid,
+        workspace,
+        plan,
+        emit,
+        ctx,
+        stop_backend=False,
+        frontend_only=True,
+    )
+    detail = error[:120] if error else (loop_error or "构建未通过")
+    await emit(
+        "execution",
+        {
+            "id": step,
+            "step": "视觉打磨",
+            "status": "warning",
+            "log": (
+                f"视觉打磨未通过，已保留功能版本：{detail}"
+                if restored
+                else f"视觉打磨回退失败：{(restore_error or detail)[:120]}"
+            ),
+        },
+    )
+    return False, f"视觉打磨未通过，已保留功能版本（{detail[:80]}）"
 
 
 async def _apply_and_build(
@@ -1931,6 +2629,7 @@ async def _apply_and_build(
     ctx: ToolContext,
     *,
     stop_backend: bool,
+    frontend_only: bool = False,
 ) -> tuple[bool, str]:
     if stop_backend:
         await runtime.runtime.stop(pid)
@@ -2083,7 +2782,7 @@ async def _apply_and_build(
             },
         )
 
-    if plan["mode"] in ("backend", "fullstack"):
+    if plan["mode"] in ("backend", "fullstack") and not frontend_only:
         start = await emit(
             "execution",
             {
@@ -2316,6 +3015,23 @@ async def _build_project_tools(
             emit=emit,
             max_steps=min(16, steps),
         )
+
+    _, design_note = await _design_pass_with_tools(
+        pid=pid,
+        plan=plan,
+        message=message,
+        emit=emit,
+        ctx=ctx,
+        workspace=workspace,
+        llm=llm,
+        first_build=first_build,
+    )
+    if design_note:
+        repair_notes.append(design_note)
+    if first_build and plan["mode"] in ("frontend", "fullstack"):
+        post_design_issues = _review(workspace.files, plan["mode"])
+        if post_design_issues:
+            issues = post_design_issues
 
     # Reconcile files that disappeared (mode changes, deletes that bypassed the
     # tool loop) with tombstones so latest_artifacts matches the workspace.

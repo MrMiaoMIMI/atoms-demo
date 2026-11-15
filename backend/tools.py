@@ -22,7 +22,7 @@ import frontend_builder
 import runtime
 import scaffold
 import views
-from workspace import Workspace, WorkspaceError
+from workspace import PathDenied, Workspace, WorkspaceError, normalize_path
 
 Emit = Callable[[str, dict], Awaitable[Any]]
 
@@ -41,9 +41,40 @@ class ToolContext:
     execution_id: int | None = None
     plan: dict | None = None
     workspace: Workspace | None = None
+    # Optional write scope for phases that must not touch other files (the
+    # first-build visual polish pass). ``None`` means the normal path policy.
+    write_allowlist: tuple[str, ...] | None = None
+    # Scaffold-managed presentation files are never model-writable.
+    read_only_prefixes: tuple[str, ...] = (
+        scaffold.DESIGN_SYSTEM_FILE,
+        scaffold.UI_KIT_PREFIX,
+    )
     # Set by ``Toolbox.invoke`` so the tool loop can attach the view kind to
     # the execution event the UI renders.
     last_view_type: str | None = None
+
+
+def _check_write_scope(ctx: ToolContext, path: str) -> None:
+    normalized = normalize_path(path)
+    for prefix in ctx.read_only_prefixes:
+        cleaned = prefix.rstrip("/")
+        if normalized == cleaned or normalized.startswith(cleaned + "/"):
+            raise PathDenied(
+                "设计系统文件由脚手架管理，不能修改；"
+                "请在 frontend/src/styles.css 覆盖 --ds-* 变量",
+                path=path,
+            )
+    allow = ctx.write_allowlist
+    if allow is None:
+        return
+    for prefix in allow:
+        cleaned = prefix.rstrip("/")
+        if normalized == cleaned or normalized.startswith(cleaned + "/"):
+            return
+    raise PathDenied(
+        "当前阶段只允许修改前端展示文件：" + "、".join(allow),
+        path=path,
+    )
 
 
 def _project_mode(paths: set[str]) -> str:
@@ -308,6 +339,7 @@ async def llm_write_file(
     content: str,
     overwrite: bool = False,
 ) -> dict:
+    _check_write_scope(ctx, path)
     ws = await _workspace(ctx)
     change = ws.write(path, content, overwrite=bool(overwrite))
     if change is None:
@@ -333,6 +365,7 @@ async def llm_edit_file(
     new_string: str,
     replace_all: bool = False,
 ) -> dict:
+    _check_write_scope(ctx, path)
     ws = await _workspace(ctx)
     change = ws.edit(
         path,
@@ -357,6 +390,7 @@ async def llm_edit_file(
 
 
 async def llm_delete_file(ctx: ToolContext, path: str) -> dict:
+    _check_write_scope(ctx, path)
     ws = await _workspace(ctx)
     change = ws.delete(path)
     await db.add_artifact_deleted(ctx.pid, change.path, ctx.version)

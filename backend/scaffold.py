@@ -3,18 +3,59 @@
 The LLM only writes app-specific code (React components / FastAPI routes).
 Everything that must be byte-for-byte correct for the project to build and
 run — package.json, tsconfig, Vite config, SQLite helpers, README, preview
-shells — is produced here by plain Python.
+shells — is produced here by plain Python. The design system and UI kit live
+as plain asset files under ``scaffold_assets/`` so they stay lintable and
+editable without giant Python string literals.
 """
 from __future__ import annotations
 
 import html
+import json
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 MODES = ("frontend", "fullstack", "backend")
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,119}$")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,30}$")
-ALLOWED_EXT = {".tsx", ".ts", ".jsx", ".js", ".css", ".py", ".json", ".md", ".html", ".txt", ".sql"}
+ALLOWED_EXT = {
+    ".tsx",
+    ".ts",
+    ".jsx",
+    ".js",
+    ".css",
+    ".py",
+    ".json",
+    ".md",
+    ".html",
+    ".txt",
+    ".sql",
+    ".svg",
+}
+
+# Scaffold-managed frontend files. They are injected into every generated
+# project and should not be rewritten by the model during a normal iteration.
+SCAFFOLD_ASSETS_DIR = Path(__file__).resolve().parent / "scaffold_assets"
+DESIGN_SYSTEM_FILE = "frontend/src/design-system.css"
+UI_KIT_PREFIX = "frontend/src/ui/"
+DESIGN_SYSTEM_IMPORT = 'import "./design-system.css";'
+
+UI_KIT_FILES = (
+    "frontend/src/ui/index.ts",
+    "frontend/src/ui/Button.tsx",
+    "frontend/src/ui/Field.tsx",
+    "frontend/src/ui/Icon.tsx",
+    "frontend/src/ui/Navigation.tsx",
+    "frontend/src/ui/Overlay.tsx",
+    "frontend/src/ui/Surface.tsx",
+)
+
+
+@lru_cache(maxsize=32)
+def _asset(*parts: str) -> str:
+    """Read a scaffold asset. Templates are plain files so they stay editable."""
+    return (SCAFFOLD_ASSETS_DIR.joinpath(*parts)).read_text(encoding="utf-8")
 
 FRONTEND_PACKAGE = """{
   "name": "__NAME__",
@@ -28,8 +69,14 @@ FRONTEND_PACKAGE = """{
     "preview": "vite preview"
   },
   "dependencies": {
+    "clsx": "2.1.1",
+    "framer-motion": "11.15.0",
+    "lucide-react": "0.468.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-router-dom": "6.28.1",
+    "recharts": "2.13.3",
+    "sonner": "1.7.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
@@ -86,7 +133,7 @@ FRONTEND_TSCONFIG = """{
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true,
-    "types": ["vite/client"]
+    "types": []
   },
   "include": ["src"]
 }
@@ -95,6 +142,7 @@ FRONTEND_TSCONFIG = """{
 FRONTEND_MAIN = """import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import "./design-system.css";
 import "./styles.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
@@ -104,7 +152,18 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
 );
 """
 
-FRONTEND_ENV_TYPES = """/// <reference types="vite/client" />
+FRONTEND_ENV_TYPES = """interface ImportMetaEnv {
+  readonly [key: string]: string | boolean | undefined;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
+declare module "*.svg" {
+  const src: string;
+  export default src;
+}
 """
 
 BACKEND_REQUIREMENTS = """fastapi==0.115.6
@@ -230,14 +289,24 @@ def _package_name(title: str) -> str:
 
 
 def frontend_files(title: str) -> dict[str, str]:
-    return {
+    files = {
         "frontend/package.json": FRONTEND_PACKAGE.replace("__NAME__", _package_name(title)),
         "frontend/index.html": FRONTEND_INDEX.replace("__TITLE__", _esc(title)),
         "frontend/vite.config.ts": FRONTEND_VITE_CONFIG,
         "frontend/tsconfig.json": FRONTEND_TSCONFIG,
         "frontend/src/main.tsx": FRONTEND_MAIN,
         "frontend/src/vite-env.d.ts": FRONTEND_ENV_TYPES,
+        # Design system + UI kit. These are the floor for every generated UI.
+        "frontend/src/design-system.css": _asset("frontend", "src", "design-system.css"),
+        "frontend/src/styles.css": _asset("frontend", "src", "styles.css"),
+        "frontend/src/App.tsx": _asset("frontend", "src", "App.tsx").replace(
+            "__TITLE_JSON__", json.dumps(title, ensure_ascii=False)
+        ),
     }
+    for path in UI_KIT_FILES:
+        relative = path[len("frontend/src/") :]
+        files[path] = _asset("frontend", "src", *relative.split("/"))
+    return files
 
 
 def backend_common_files() -> dict[str, str]:
@@ -333,6 +402,11 @@ def readme(title: str, mode: str, api: list[dict]) -> str:
             "npm run dev       # http://127.0.0.1:5173",
             "npm run build     # 产物输出到 frontend/dist",
             "```",
+            "",
+            "- 设计系统：`frontend/src/design-system.css`（tokens、reset、基础原语）"
+            "与 `frontend/src/ui/`（可复用组件）。",
+            "- 已内置依赖：lucide-react、clsx、sonner、framer-motion、recharts、"
+            "react-router-dom；请勿再引入其他前端库。",
             "",
         ]
     if mode in ("backend", "fullstack"):

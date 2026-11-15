@@ -59,6 +59,15 @@ TITLE_TIMEOUT = float(os.getenv("TITLE_TIMEOUT", "12"))
 LLM_MODE = "deepseek" if LLM_API_KEY else "mock"
 AUTO_REPAIR = os.getenv("AUTO_REPAIR", "1") != "0"
 
+# First-build visual polish. The pass only edits presentation files and is
+# best-effort: if it cannot rebuild, the functional build is kept unchanged.
+DESIGN_PASS_FIRST_BUILD = os.getenv("DESIGN_PASS_FIRST_BUILD", "1") != "0"
+DESIGN_PASS_MAX_STEPS = max(4, int(os.getenv("DESIGN_PASS_MAX_STEPS", "16")))
+DESIGN_PASS_SECONDS = max(60.0, float(os.getenv("DESIGN_PASS_SECONDS", "420")))
+DESIGN_PASS_MAX_TOOL_CALLS = max(
+    8, int(os.getenv("DESIGN_PASS_MAX_TOOL_CALLS", "120"))
+)
+
 # ---------------------------------------------------------------------------
 # Agent tool loop
 # ---------------------------------------------------------------------------
@@ -91,6 +100,10 @@ MAX_RUNNING_APPS = max(1, int(os.getenv("MAX_RUNNING_APPS", "2")))
 GENERATED_APP_MEMORY_MB = max(0, int(os.getenv("GENERATED_APP_MEMORY_MB", "256")))
 RUNTIME_START_TIMEOUT = float(os.getenv("RUNTIME_START_TIMEOUT", "20"))
 FRONTEND_BUILD_TIMEOUT = float(os.getenv("FRONTEND_BUILD_TIMEOUT", "120"))
+# esbuild only strips types. A real tsc pass catches wrong component props and
+# third-party API misuse before the iframe shows a blank screen.
+FRONTEND_TYPECHECK = os.getenv("FRONTEND_TYPECHECK", "1") != "0"
+FRONTEND_TYPECHECK_TIMEOUT = float(os.getenv("FRONTEND_TYPECHECK_TIMEOUT", "60"))
 
 # Shared Node toolchain used only to bundle generated React sources for preview.
 PREVIEW_NODE_MODULES = Path(

@@ -112,6 +112,8 @@ class MockLLM:
                                 mode=mode,
                                 title=title,
                             ),
+                            # The scaffold seeds a starter App.tsx.
+                            "overwrite": True,
                         },
                     )
                 )
@@ -127,6 +129,8 @@ class MockLLM:
                                 mode=mode,
                                 title=title,
                             ),
+                            # The scaffold seeds starter styles.
+                            "overwrite": True,
                         },
                     )
                 )

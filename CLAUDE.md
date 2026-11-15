@@ -23,6 +23,9 @@
 - `/s/{id}/` 与 `/s/{id}/api/*` 是公开入口（未发布/暂停统一 404），`/apps/{id}/` 仍仅项目所有者可打开；Caddy 与 Vite dev proxy 都要加 `/s/`（Vite 必须写成 `/s/`，写成 `/s` 会把 `/src/*` 也代理走）
 - 暂停/恢复只改 `projects.paused` 并停止发布运行时，不重新构建；恢复后首个请求懒启动。线上与工作台共用项目 SQLite
 - 生成物是按需的完整 Web 项目：`frontend`（Vite + React 18 + TS）、`fullstack`（前端 + FastAPI + SQLite）、`backend`（FastAPI + SQLite）；不针对每个项目执行 `npm install`，预览用共享 esbuild 打包
+- 生成项目前端预置设计底座：`frontend/src/design-system.css`（tokens/reset/原语）与 `frontend/src/ui/`（Button/Field/Surface/Overlay/Navigation/Icon）；模板文件存放在 `backend/scaffold_assets/`，由 `scaffold.py` 注入。模型只改 `styles.css` 覆盖 `--ds-*`，不改 design-system/ui；旧项目迭代时自动补齐底座并迁移 main.tsx/tsconfig/vite-env/package.json
+- Planner 输出 `design` 契约（archetype/style/palette/typography/layout/sections/interactions/density），Alex 按契约实现；首建成功后可选一次视觉打磨（`DESIGN_PASS_FIRST_BUILD=1`，只允许改 App.tsx/styles.css/components/pages，失败回退并保留功能版本）
+- 预览构建前跑 `tsc --noEmit`（`FRONTEND_TYPECHECK=1`），esbuild 只负责打包；共享工具链内置 lucide-react/clsx/sonner/framer-motion/recharts/react-router-dom（多页必须用 HashRouter），生成项目支持 `.svg`（dataurl 内联），字体使用同源 `/fonts/`
 - 每个生成项目拥有独立 SQLite：`apps/{id}/backend/data/app.db`，与 demo 的 `backend/data/atoms.db` 完全隔离；重写代码时保留该数据目录
 - 生成后端按项目启动独立 uvicorn 子进程（仅 127.0.0.1、随机端口、LRU 上限、内存上限）；环境变量裁剪，不泄露 demo 的 LLM Key
 - 一次生成请求返回单一 SSE 流，事件类型：`project` / `agent_start` / `execution` / `token` / `file_start` / `artifact` / `file_change` / `changes_reset` / `preview` / `message` / `agent_end` / `error` / `done`；事件带 `agent` + `run_id`，消息另带 `run_index`；工具与构建类步骤的 `execution` 事件另带 `view_type`（`diff` / `terminal` / `file` / `files` / `search` / `http` / `json`），diff 继续走 `file_changes`，其他视图通过 `GET /api/projects/{id}/executions/{eid}/view` 按需拉取
@@ -129,7 +132,9 @@ Phase 7：发现模块。
 登录后 `/discover` 浏览其他用户已发布的应用（内容排除自己的项目，侧边栏与首页一致）；官方九类 + 其他、最新/最热、搜索、收藏/已保存；每次打开详情页浏览数 +1，首页项目 tab 和项目列表卡片展示浏览数并去掉对话/文件数；`/discover/{id}` 详情页 16:9 iframe 运行发布快照；发布弹窗增加简介/分类/自动识别；构建成功后浏览器端生成 build cover，发布后生成 published cover，项目卡片按 published > build > CSS 展示，发现页只用 published cover，失败回退 CSS。本期不做克隆/Remix/点赞/模板 tab。
 Phase 8：迭代能力重构（统一 tool loop + diff）。
 首建与迭代共用 Workspace + 原生 function calling 工具循环（Alex）；Bob 增加只读文件工具，先读后规划；`edit_file` 精确匹配、`write_file` 覆盖保护、tombstone 删除；每次工具改动写 `file_changes` 并通过 `file_change` SSE 实时下发；代码模式增加「文件 / 未发布改动」切换与时间线步骤 diff；发布成功写 `.published/source.json` 作为未发布 diff 基线；回滚保留 diff 并标记 `rolled_back=1`；旧 per-file 生成链路保留为 `AGENT_TOOL_LOOP=0` 兜底。
-下一步：在 `https://hajimi.site` 完成 Let's Encrypt 签发、Google OAuth 与 QQ 邮箱 SMTP 配置；跑一遍完整验收（含 diff 交互）并整理截图。
+Phase 9：生成 UI 质量提升。
+Planner 增加 `design` 契约；脚手架预置 `design-system.css`、`ui/` 组件与 starter App；首建成功后视觉打磨 pass；预览构建前 `tsc --noEmit`；共享依赖 lucide-react/clsx/sonner/framer-motion/recharts/react-router-dom；`.svg` 内联与同源字体；旧项目迭代时自动迁移设计底座与 tsconfig/package.json。
+下一步：在 `https://hajimi.site` 完成 Let's Encrypt 签发、Google OAuth 与 QQ 邮箱 SMTP 配置；跑一遍完整验收（含 diff 交互）并整理截图；用 5 个固定 prompt 做生成 UI 的 A/B 回归。
 
 ## 硬性验收
 

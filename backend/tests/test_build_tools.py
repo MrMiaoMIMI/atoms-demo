@@ -170,6 +170,7 @@ class BuildToolLoopTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "path": "frontend/src/App.tsx",
                         "content": APP,
+                        "overwrite": True,
                     },
                 ),
                 call(
@@ -177,6 +178,7 @@ class BuildToolLoopTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "path": "frontend/src/styles.css",
                         "content": CSS,
+                        "overwrite": True,
                     },
                 ),
                 call(

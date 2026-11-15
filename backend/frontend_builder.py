@@ -44,6 +44,52 @@ def toolchain_hint() -> str:
     )
 
 
+def _toolchain_bin(name: str) -> Path | None:
+    modules = config.PREVIEW_NODE_MODULES
+    candidates = [
+        modules / ".bin" / name,
+        modules / name / "bin" / name,
+    ]
+    if name == "tsc":
+        candidates.append(modules / "typescript" / "bin" / "tsc")
+    for candidate in candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+async def _run_typecheck(work: Path) -> None:
+    """Block on real TypeScript errors before esbuild strips the types."""
+    tsc = _toolchain_bin("tsc")
+    if not tsc:
+        return
+    proc = await asyncio.create_subprocess_exec(
+        str(tsc),
+        "--noEmit",
+        "-p",
+        "tsconfig.json",
+        cwd=str(work),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=config.FRONTEND_TYPECHECK_TIMEOUT
+        )
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise BuildError(
+            "TypeScript 类型检查超时（超过 "
+            f"{int(config.FRONTEND_TYPECHECK_TIMEOUT)}s）"
+        ) from exc
+    if proc.returncode != 0:
+        output = (stdout + stderr).decode("utf-8", "ignore").strip()
+        raise BuildError(
+            "TypeScript 类型检查失败：\n" + (output[-4000:] or "未知错误")
+        )
+
+
 def _copy_sources(source: Path, target: Path) -> None:
     shutil.copytree(
         source,
@@ -78,6 +124,8 @@ async def build(pid: str, title: str) -> bool:
     work.parent.mkdir(parents=True, exist_ok=True)
     try:
         await asyncio.to_thread(_copy_sources, source, work)
+        if config.FRONTEND_TYPECHECK:
+            await _run_typecheck(work)
         cmd = [
             str(esbuild),
             "src/main.tsx",
@@ -89,6 +137,10 @@ async def build(pid: str, title: str) -> bool:
             "--loader:.tsx=tsx",
             "--loader:.ts=ts",
             "--loader:.css=css",
+            "--loader:.svg=dataurl",
+            # Fonts are served by the demo shell at /fonts/; keep the absolute
+            # URL instead of trying to resolve it from the project source.
+            "--external:/fonts/*",
             "--target=es2020",
             "--minify",
             '--define:process.env.NODE_ENV="production"',

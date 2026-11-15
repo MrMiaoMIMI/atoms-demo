@@ -1,0 +1,181 @@
+import type { LucideIcon, LucideProps } from "lucide-react";
+import {
+  Activity,
+  AlertCircle,
+  AlertTriangle,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
+  ArrowUpRight,
+  BarChart3,
+  Bell,
+  Bookmark,
+  Calendar,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  Clock,
+  Copy,
+  CreditCard,
+  Download,
+  Edit3,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  FileText,
+  Filter,
+  Folder,
+  Globe,
+  Heart,
+  Home,
+  Image,
+  Info,
+  LayoutDashboard,
+  Link,
+  List,
+  Loader2,
+  Lock,
+  LogOut,
+  Mail,
+  MapPin,
+  Menu,
+  MessageCircle,
+  Minus,
+  Moon,
+  MoreHorizontal,
+  Package,
+  Pause,
+  Phone,
+  Play,
+  Plus,
+  RefreshCw,
+  Search,
+  Send,
+  Settings,
+  Share2,
+  Shield,
+  ShoppingCart,
+  Sparkles,
+  Star,
+  Sun,
+  Tag,
+  Trash2,
+  TrendingDown,
+  TrendingUp,
+  Upload,
+  User,
+  Users,
+  X,
+  Zap,
+} from "lucide-react";
+
+/**
+ * A tiny, tree-shakeable icon layer. Prefer `<Icon name="plus" />` over
+ * importing lucide icons directly so every generated app uses one stroke
+ * weight and one accessible default.
+ */
+export const iconNames = {
+  activity: Activity,
+  alert: AlertCircle,
+  warning: AlertTriangle,
+  arrowDown: ArrowDown,
+  arrowLeft: ArrowLeft,
+  arrowRight: ArrowRight,
+  arrowUp: ArrowUp,
+  arrowUpRight: ArrowUpRight,
+  chart: BarChart3,
+  bell: Bell,
+  bookmark: Bookmark,
+  calendar: Calendar,
+  check: Check,
+  checkCircle: CheckCircle2,
+  chevronDown: ChevronDown,
+  chevronLeft: ChevronLeft,
+  chevronRight: ChevronRight,
+  chevronUp: ChevronUp,
+  clock: Clock,
+  copy: Copy,
+  card: CreditCard,
+  download: Download,
+  edit: Edit3,
+  external: ExternalLink,
+  eye: Eye,
+  eyeOff: EyeOff,
+  file: FileText,
+  filter: Filter,
+  folder: Folder,
+  globe: Globe,
+  heart: Heart,
+  home: Home,
+  image: Image,
+  info: Info,
+  dashboard: LayoutDashboard,
+  link: Link,
+  list: List,
+  loading: Loader2,
+  lock: Lock,
+  logout: LogOut,
+  mail: Mail,
+  location: MapPin,
+  menu: Menu,
+  message: MessageCircle,
+  minus: Minus,
+  moon: Moon,
+  more: MoreHorizontal,
+  package: Package,
+  pause: Pause,
+  phone: Phone,
+  play: Play,
+  plus: Plus,
+  refresh: RefreshCw,
+  search: Search,
+  send: Send,
+  settings: Settings,
+  share: Share2,
+  shield: Shield,
+  cart: ShoppingCart,
+  sparkles: Sparkles,
+  star: Star,
+  sun: Sun,
+  tag: Tag,
+  trash: Trash2,
+  trendingDown: TrendingDown,
+  trendingUp: TrendingUp,
+  upload: Upload,
+  user: User,
+  users: Users,
+  close: X,
+  zap: Zap,
+} satisfies Record<string, LucideIcon>;
+
+export type IconName = keyof typeof iconNames;
+
+export interface IconProps extends Omit<LucideProps, "ref"> {
+  name: IconName;
+  /** Accessible label. Omit for decorative icons. */
+  label?: string;
+}
+
+export function Icon({
+  name,
+  label,
+  size = 18,
+  strokeWidth = 1.8,
+  ...rest
+}: IconProps) {
+  const Component = iconNames[name];
+  return (
+    <Component
+      size={size}
+      strokeWidth={strokeWidth}
+      aria-hidden={label ? undefined : true}
+      aria-label={label}
+      role={label ? "img" : undefined}
+      {...rest}
+    />
+  );
+}
