@@ -1,29 +1,29 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../api";
-import { DISCOVER_CATEGORIES } from "../lib/discover";
-import { contentMaxWidth } from "../lib/layout";
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api } from '../api';
+import { DISCOVER_CATEGORIES } from '../lib/discover';
+import { contentMaxWidth } from '../lib/layout';
 import type {
   AuthUser,
   DiscoverApp,
   DiscoverSort,
   Health,
   ProjectSummary,
-} from "../types";
-import CardGrid from "./CardGrid";
-import HomeSidebar, { CollapsedSidebar } from "./HomeSidebar";
-import { Bookmark, BookmarkFill, Search, Sparkle, X } from "./Icons";
-import DiscoverCard from "./DiscoverCard";
-import Tabs, { type TabItem } from "./Tabs";
+} from '../types';
+import CardGrid from './CardGrid';
+import HomeSidebar, { CollapsedSidebar } from './HomeSidebar';
+import { Bookmark, BookmarkFill, Search, Sparkle, X } from './Icons';
+import DiscoverCard from './DiscoverCard';
+import Tabs, { type TabItem } from './Tabs';
 
 const PAGE_SIZE = 24;
 
-const CATEGORY_TABS: TabItem<string>[] = ["全部", ...DISCOVER_CATEGORIES].map(
-  (value) => ({ value, label: value })
+const CATEGORY_TABS: TabItem<string>[] = ['全部', ...DISCOVER_CATEGORIES].map(
+  (value) => ({ value, label: value }),
 );
 
 const SORT_TABS: TabItem<DiscoverSort>[] = [
-  { value: "latest", label: "最新" },
-  { value: "popular", label: "最热" },
+  { value: 'latest', label: '最新' },
+  { value: 'popular', label: '最热' },
 ];
 
 interface Props {
@@ -53,10 +53,10 @@ export default function DiscoverPage({
   onOpenDiscoverApp,
   onLogout,
 }: Props) {
-  const [sort, setSort] = useState<DiscoverSort>("latest");
-  const [category, setCategory] = useState<string>("全部");
-  const [query, setQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [sort, setSort] = useState<DiscoverSort>('latest');
+  const [category, setCategory] = useState<string>('全部');
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [savedOnly, setSavedOnly] = useState(false);
   const [items, setItems] = useState<DiscoverApp[]>([]);
   const [loading, setLoading] = useState(true);
@@ -68,20 +68,17 @@ export default function DiscoverPage({
 
   const ownIds = useMemo(
     () => new Set(sidebarProjects.map((project) => project.id)),
-    [sidebarProjects]
+    [sidebarProjects],
   );
   // The backend already excludes these; this is a defensive filter for a
   // stale project poll racing the discover response.
   const visibleItems = useMemo(
     () => items.filter((app) => !ownIds.has(app.id)),
-    [items, ownIds]
+    [items, ownIds],
   );
 
   useEffect(() => {
-    const timer = window.setTimeout(
-      () => setDebouncedQuery(query.trim()),
-      300
-    );
+    const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 300);
     return () => window.clearTimeout(timer);
   }, [query]);
 
@@ -98,7 +95,7 @@ export default function DiscoverPage({
       try {
         const data = await api.discover({
           sort,
-          category: category === "全部" ? undefined : category,
+          category: category === '全部' ? undefined : category,
           q: debouncedQuery || undefined,
           saved: savedOnly,
           offset,
@@ -109,7 +106,7 @@ export default function DiscoverPage({
         setHasMore(data.has_more);
       } catch (err) {
         if (request === requestRef.current) {
-          setError((err as Error).message || "发现列表加载失败");
+          setError((err as Error).message || '发现列表加载失败');
         }
       } finally {
         if (request === requestRef.current) {
@@ -118,7 +115,7 @@ export default function DiscoverPage({
         }
       }
     },
-    [sort, category, debouncedQuery, savedOnly]
+    [sort, category, debouncedQuery, savedOnly],
   );
 
   useEffect(() => {
@@ -134,18 +131,17 @@ export default function DiscoverPage({
       (entries) => {
         if (entries[0]?.isIntersecting) void load(items.length, true);
       },
-      { rootMargin: "400px" }
+      { rootMargin: '400px' },
     );
     observer.observe(node);
     return () => observer.disconnect();
   }, [hasMore, items.length, load, loading, loadingMore]);
 
-  const filtering =
-    category !== "全部" || query.trim().length > 0 || savedOnly;
+  const filtering = category !== '全部' || query.trim().length > 0 || savedOnly;
 
   function resetFilters() {
-    setCategory("全部");
-    setQuery("");
+    setCategory('全部');
+    setQuery('');
     setSavedOnly(false);
   }
 
@@ -214,7 +210,7 @@ export default function DiscoverPage({
                 {query ? (
                   <button
                     type="button"
-                    onClick={() => setQuery("")}
+                    onClick={() => setQuery('')}
                     title="清空搜索"
                     className="absolute right-2 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded-full text-ink-30 transition hover:bg-line-4 hover:text-ink-55"
                   >
@@ -231,8 +227,8 @@ export default function DiscoverPage({
                 aria-pressed={savedOnly}
                 className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-[13px] transition ${
                   savedOnly
-                    ? "border-brand bg-brand text-white hover:bg-brand-600"
-                    : "border-line-8 bg-white text-ink-80 hover:border-line-12 hover:text-ink-95"
+                    ? 'border-brand bg-brand text-white hover:bg-brand-600'
+                    : 'border-line-8 bg-white text-ink-80 hover:border-line-12 hover:text-ink-95'
                 }`}
               >
                 {savedOnly ? (
@@ -240,7 +236,7 @@ export default function DiscoverPage({
                 ) : (
                   <Bookmark size={14} />
                 )}
-                已保存
+                已收藏
               </button>
             </div>
           </div>
@@ -276,17 +272,17 @@ export default function DiscoverPage({
                 </span>
                 <p className="mt-4 text-[15px] font-medium text-ink-95">
                   {savedOnly
-                    ? "还没有收藏的应用"
+                    ? '还没有收藏的应用'
                     : filtering
-                      ? "没有匹配的应用"
-                      : "还没有其他用户公开应用"}
+                      ? '没有匹配的应用'
+                      : '还没有其他用户公开应用'}
                 </p>
                 <p className="mt-1.5 max-w-[340px] text-[13px] leading-[20px] text-ink-55">
                   {savedOnly
-                    ? "在应用详情页点收藏，之后可以在这里快速找到。"
+                    ? '在应用详情页点收藏，之后可以在这里快速找到。'
                     : filtering
-                      ? "换个关键词或分类，或者清除当前筛选条件。"
-                      : "发布你的应用后，其他用户会在这里看到它。"}
+                      ? '换个关键词或分类，或者清除当前筛选条件。'
+                      : '发布你的应用后，其他用户会在这里看到它。'}
                 </p>
                 {filtering ? (
                   <button
@@ -319,7 +315,7 @@ export default function DiscoverPage({
                       disabled={loadingMore}
                       className="inline-flex h-9 items-center gap-2 rounded-full border border-line-8 bg-white px-5 text-[13px] text-ink-80 transition hover:border-line-12 hover:text-ink-95 disabled:cursor-not-allowed disabled:opacity-40"
                     >
-                      {loadingMore ? "加载中…" : "加载更多"}
+                      {loadingMore ? '加载中…' : '加载更多'}
                     </button>
                   </div>
                 ) : (
