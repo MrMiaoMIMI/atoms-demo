@@ -74,6 +74,26 @@ export function flattenFiles(nodes: FileNode[]): string[] {
   return out;
 }
 
+/**
+ * Remove every directory on `path` from a collapsed-path set so the tree can
+ * reveal it. Pass a fake child (`dir/_`) to expand `dir` itself.
+ */
+export function expandDirPath(
+  current: Set<string>,
+  path: string
+): Set<string> | null {
+  const parts = path.split("/").filter(Boolean);
+  let next: Set<string> | null = null;
+  let prefix = "";
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    prefix = prefix ? `${prefix}/${parts[index]}` : parts[index];
+    if (!current.has(prefix)) continue;
+    if (!next) next = new Set(current);
+    next.delete(prefix);
+  }
+  return next;
+}
+
 export type CodeLanguage =
   | "ts"
   | "js"
@@ -85,6 +105,23 @@ export type CodeLanguage =
   | "sh"
   | "sql"
   | "txt";
+
+const LANGUAGE_LABEL: Record<CodeLanguage, string> = {
+  ts: "TypeScript",
+  js: "JavaScript",
+  py: "Python",
+  json: "JSON",
+  css: "CSS",
+  html: "HTML",
+  md: "Markdown",
+  sh: "Shell",
+  sql: "SQL",
+  txt: "纯文本",
+};
+
+export function languageLabel(filename: string): string {
+  return LANGUAGE_LABEL[languageForFile(filename)];
+}
 
 export function languageForFile(filename: string): CodeLanguage {
   const ext = filename.split(".").pop()?.toLowerCase() ?? "";

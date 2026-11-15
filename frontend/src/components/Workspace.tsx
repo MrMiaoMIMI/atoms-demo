@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, generate, resumeGeneration } from '../api';
 import { AGENT_KEYS, agentFor, isAgentKey } from '../lib/agents';
 import { copyText } from '../lib/clipboard';
+import { readLayout, writeLayout } from '../lib/codePrefs';
 import {
   captureBuildCover,
   capturePublishedCover,
@@ -99,6 +100,11 @@ const VIEW_KINDS: StepViewKind[] = [
   "json",
 ];
 
+interface HistoryEntry {
+  file: string;
+  line?: number;
+}
+
 function normalizeViewKind(value: string): StepViewKind {
   return VIEW_KINDS.includes(value as StepViewKind)
     ? (value as StepViewKind)
@@ -136,7 +142,9 @@ export default function Workspace({
   const [groups, setGroups] = useState<ChatGroup[]>([]);
   const [artifacts, setArtifacts] = useState<Record<string, Artifact>>({});
   const [activeFile, setActiveFile] = useState<string | null>(null);
-  const [codeView, setCodeView] = useState<'files' | 'changes'>('files');
+  const [codeView, setCodeView] = useState<'files' | 'changes'>(
+    () => readLayout(projectId).view,
+  );
   const [changes, setChanges] = useState<ChangesResponse | null>(null);
   const [changesLoading, setChangesLoading] = useState(false);
   const [changesError, setChangesError] = useState<string | null>(null);
@@ -189,6 +197,28 @@ export default function Workspace({
   const changesRequestRef = useRef(0);
   const stepViewRequestRef = useRef(0);
   const codeViewRef = useRef<'files' | 'changes'>('files');
+  const historyRef = useRef<{ entries: HistoryEntry[]; index: number }>({
+    entries: [],
+    index: -1,
+  });
+  const [historyState, setHistoryState] = useState({
+    canBack: false,
+    canForward: false,
+  });
+
+  const pushHistory = useCallback((file: string, line?: number) => {
+    const current = historyRef.current;
+    const entry = current.entries[current.index];
+    if (entry && entry.file === file && entry.line === line) return;
+    const entries = current.entries.slice(0, current.index + 1);
+    entries.push({ file, line });
+    const trimmed = entries.slice(-50);
+    historyRef.current = { entries: trimmed, index: trimmed.length - 1 };
+    setHistoryState({
+      canBack: trimmed.length > 1,
+      canForward: false,
+    });
+  }, []);
 
   const maybeCaptureBuildCover = useCallback(
     (version: number) => {
@@ -304,6 +334,13 @@ export default function Workspace({
     codeViewRef.current = codeView;
   }, [codeView]);
 
+  // Remember the file and code sub-view per project so a reload lands where
+  // the user left off; the workspace remounts on every project switch.
+  useEffect(() => {
+    if (!loaded) return;
+    writeLayout(projectId, { file: activeFile, view: codeView });
+  }, [projectId, activeFile, codeView, loaded]);
+
   useEffect(() => {
     if (codeView === 'changes' && !stepView) void refreshChanges();
   }, [codeView, stepView, refreshChanges]);
@@ -317,13 +354,14 @@ export default function Workspace({
 
   useEffect(() => {
     let cancelled = false;
+    const savedLayout = readLayout(projectId);
     setLoaded(false);
     setLoadError(null);
     setPreviewUrl(null);
     setActiveFile(null);
     setPublishOpen(false);
     setPublishError(null);
-    setCodeView('files');
+    setCodeView(savedLayout.view);
     setChanges(null);
     setChangesError(null);
     setChangesLoading(false);
@@ -337,6 +375,22 @@ export default function Workspace({
       .then((state) => {
         if (cancelled) return;
         applyState(state);
+        if (
+          savedLayout.file &&
+          state.artifacts.some(
+            (artifact) => artifact.filename === savedLayout.file,
+          )
+        ) {
+          setActiveFile(savedLayout.file);
+        }
+        const initialFile =
+          savedLayout.file &&
+          state.artifacts.some(
+            (artifact) => artifact.filename === savedLayout.file,
+          )
+            ? savedLayout.file
+            : pickDefaultFile(state.artifacts);
+        if (initialFile) pushHistory(initialFile);
         const built = state.project.built_version;
         const buildCover = state.project.build_cover_version;
         const hasPublishedCover =
@@ -367,7 +421,7 @@ export default function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [projectId, applyState, maybeCaptureBuildCover, refreshChanges]);
+  }, [projectId, applyState, maybeCaptureBuildCover, refreshChanges, pushHistory]);
 
   // The overview only exists after the first successful build; never leave the
   // right pane pointing at a hidden mode.
@@ -736,6 +790,10 @@ export default function Workspace({
               ),
               note: readFocusNote(payload),
             });
+            pushHistory(
+              path,
+              Math.max(1, numberField(payload.start_line, 1)),
+            );
             return;
           }
         }
@@ -757,7 +815,7 @@ export default function Workspace({
         }
       }
     },
-    [projectId, runChanges, artifacts],
+    [projectId, runChanges, artifacts, pushHistory],
   );
 
   const closeStepView = useCallback(() => {
@@ -767,12 +825,16 @@ export default function Workspace({
     setStepViewLoading(false);
   }, []);
 
-  const selectFile = useCallback((path: string) => {
-    setActiveFile(path);
-    setFileFocus((current) =>
-      current && current.path !== path ? null : current
-    );
-  }, []);
+  const selectFile = useCallback(
+    (path: string) => {
+      setActiveFile(path);
+      setFileFocus((current) =>
+        current && current.path !== path ? null : current
+      );
+      pushHistory(path);
+    },
+    [pushHistory],
+  );
 
   const openFileAt = useCallback(
     (path: string, line?: number) => {
@@ -793,9 +855,53 @@ export default function Workspace({
           ? { path, start: line, end: line, note: `定位第 ${line} 行` }
           : null
       );
+      pushHistory(path, line);
+    },
+    [artifacts, pushHistory],
+  );
+
+  const goHistory = useCallback(
+    (delta: number) => {
+      const current = historyRef.current;
+      let index = current.index + delta;
+      let entry: HistoryEntry | undefined;
+      while (index >= 0 && index < current.entries.length) {
+        const candidate = current.entries[index];
+        if (candidate.file in artifacts) {
+          entry = candidate;
+          break;
+        }
+        index += delta;
+      }
+      if (!entry) return;
+      historyRef.current = { entries: current.entries, index };
+      setHistoryState({
+        canBack: index > 0,
+        canForward: index < current.entries.length - 1,
+      });
+      stepViewRequestRef.current += 1;
+      setPane('code');
+      setStepView(null);
+      setStepViewError(null);
+      setStepViewLoading(false);
+      setCodeView('files');
+      setActiveFile(entry.file);
+      setFileFocus(
+        entry.line
+          ? {
+              path: entry.file,
+              start: entry.line,
+              end: entry.line,
+              note: `定位第 ${entry.line} 行`,
+            }
+          : null,
+      );
     },
     [artifacts],
   );
+
+  const goBack = useCallback(() => goHistory(-1), [goHistory]);
+  const goForward = useCallback(() => goHistory(1), [goHistory]);
 
   const run = useCallback(
     async (text: string) => {
@@ -1428,6 +1534,10 @@ export default function Workspace({
             onOpenFile={openFileAt}
             fileFocus={fileFocus}
             hasChanges={hasChanges}
+            canGoBack={historyState.canBack}
+            canGoForward={historyState.canForward}
+            onBack={goBack}
+            onForward={goForward}
           />
         ) : (
           <PreviewPane

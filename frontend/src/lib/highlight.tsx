@@ -92,18 +92,23 @@ function kindFor(lang: CodeLanguage, group: number): TokenKind | null {
   return null;
 }
 
-export function highlightLine(line: string, lang: CodeLanguage): ReactNode {
+export interface CodeToken {
+  text: string;
+  className?: string;
+}
+
+/** Split one line into syntax-colored tokens so the caller can overlay hits. */
+export function tokenizeLine(line: string, lang: CodeLanguage): CodeToken[] {
   const rule = ruleFor(lang);
-  if (!rule || !line) return line || "\u00A0";
+  if (!rule || !line) return [{ text: line || "\u00A0" }];
   rule.lastIndex = 0;
 
-  const nodes: ReactNode[] = [];
+  const tokens: CodeToken[] = [];
   let last = 0;
   let match: RegExpExecArray | null;
-  let key = 0;
 
   while ((match = rule.exec(line)) !== null) {
-    if (match.index > last) nodes.push(line.slice(last, match.index));
+    if (match.index > last) tokens.push({ text: line.slice(last, match.index) });
 
     let kind: TokenKind | null = null;
     for (let group = 1; group < match.length; group += 1) {
@@ -113,16 +118,26 @@ export function highlightLine(line: string, lang: CodeLanguage): ReactNode {
       }
     }
 
-    nodes.push(
-      <span key={`${key}-${match.index}`} className={kind ? CLASS[kind] : undefined}>
-        {match[0]}
-      </span>
-    );
-    key += 1;
+    tokens.push({
+      text: match[0],
+      className: kind ? CLASS[kind] : undefined,
+    });
     last = match.index + match[0].length;
     if (match[0].length === 0) rule.lastIndex += 1;
   }
 
-  if (last < line.length) nodes.push(line.slice(last));
-  return nodes.length ? nodes : line;
+  if (last < line.length) tokens.push({ text: line.slice(last) });
+  return tokens.length ? tokens : [{ text: line }];
+}
+
+export function highlightLine(line: string, lang: CodeLanguage): ReactNode {
+  return tokenizeLine(line, lang).map((token, index) =>
+    token.className ? (
+      <span key={index} className={token.className}>
+        {token.text}
+      </span>
+    ) : (
+      token.text
+    )
+  );
 }

@@ -548,10 +548,27 @@ export function ListTree(props: IconProps) {
   );
 }
 
+export function Keyboard(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="2.8" y="6.2" width="18.4" height="11.6" rx="2.2" />
+      <path d="M6 9.8h.01M9.4 9.8h.01M12.8 9.8h.01M16.2 9.8h.01M6 12.6h.01M9.4 12.6h.01M12.8 12.6h.01M16.2 12.6h.01M7.4 15.4h9.2" />
+    </Icon>
+  );
+}
+
 export function Expand(props: IconProps) {
   return (
     <Icon {...props}>
       <path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" />
+    </Icon>
+  );
+}
+
+export function Collapse(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M9 8H4V3M15 8h5V3M9 16H4v5M15 16h5v5" />
     </Icon>
   );
 }
