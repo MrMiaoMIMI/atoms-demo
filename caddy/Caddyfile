@@ -5,7 +5,6 @@
 # There is no certbot and no renewal cron.
 #
 # DOMAIN / ACME_EMAIL are injected by docker-compose.yml.
-
 {
 	email {$ACME_EMAIL}
 
@@ -78,7 +77,8 @@
 
 	# Never cache the SPA shell, otherwise a rebuilt image can keep serving
 	# an index.html that points at the previous hashed assets.
-	handle = /index.html {
+	@index path /index.html
+	handle @index {
 		root * /srv
 		header Cache-Control "no-store, no-cache, must-revalidate"
 		header Pragma "no-cache"
