@@ -22,6 +22,13 @@ import {
   Spinner,
 } from "./Icons";
 
+export interface FileFocus {
+  path: string;
+  start: number;
+  end: number;
+  note?: string;
+}
+
 interface Props {
   projectId: string;
   artifacts: Record<string, Artifact>;
@@ -29,6 +36,7 @@ interface Props {
   onSelect: (filename: string) => void;
   streamingFile: string | null;
   streamingBuffer: string;
+  focus?: FileFocus | null;
 }
 
 function TypeBadge({ name, size = 16 }: { name: string; size?: number }) {
@@ -138,6 +146,7 @@ export default function FilePanel({
   onSelect,
   streamingFile,
   streamingBuffer,
+  focus = null,
 }: Props) {
   const [query, setQuery] = useState("");
   const [treeOpen, setTreeOpen] = useState(true);
@@ -164,16 +173,38 @@ export default function FilePanel({
 
   const active = activeFile ? artifacts[activeFile] : undefined;
   const isStreaming = Boolean(activeFile && activeFile === streamingFile);
+  const focusActive = Boolean(focus && activeFile && focus.path === activeFile);
   const content = isStreaming ? streamingBuffer : active?.content ?? "";
   const lang = languageForFile(activeFile ?? "");
   const lines = useMemo(() => content.split("\n"), [content]);
   const simple = lines.length > 1800;
+  const focusRange =
+    focusActive && focus
+      ? {
+          start: Math.max(1, focus.start),
+          end: Math.max(focus.start, focus.end),
+        }
+      : null;
+  const lineInFocus = (index: number) =>
+    Boolean(
+      focusRange &&
+        index + 1 >= focusRange.start &&
+        index + 1 <= focusRange.end
+    );
 
   useEffect(() => {
     setCopied(false);
     const el = scrollRef.current;
     if (el) el.scrollTop = 0;
   }, [activeFile]);
+
+  useEffect(() => {
+    if (!focusActive || !focus) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const top = Math.max(0, (Math.max(1, focus.start) - 1) * 22 - 66);
+    el.scrollTop = top;
+  }, [focusActive, focus, activeFile, content]);
 
   useEffect(() => {
     if (!isStreaming) return;
@@ -347,6 +378,12 @@ export default function FilePanel({
                       {formatBytes(content.length)}
                     </span>
                   )}
+                  {focusActive ? (
+                    <span className="flex-none rounded-full bg-brand-50 px-2 py-0.5 text-[10px] font-medium text-brand-text">
+                      {focus?.note ??
+                        `L${focus?.start}–${focus?.end}`}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="flex flex-none items-center gap-1">
                   <button
@@ -379,12 +416,28 @@ export default function FilePanel({
                       style={{ minWidth: 54 }}
                     >
                       {lines.map((_, index) => (
-                        <div key={index}>{index + 1}</div>
+                        <div
+                          key={index}
+                          className={
+                            lineInFocus(index)
+                              ? "bg-[rgba(66,103,255,0.06)]"
+                              : ""
+                          }
+                        >
+                          {index + 1}
+                        </div>
                       ))}
                     </div>
                     <pre className="min-w-0 flex-1 px-4 py-4 text-ink-80">
                       {lines.map((line, index) => (
-                        <div key={index} className="min-h-[22px] whitespace-pre">
+                        <div
+                          key={index}
+                          className={`min-h-[22px] whitespace-pre ${
+                            lineInFocus(index)
+                              ? "bg-[rgba(66,103,255,0.06)]"
+                              : ""
+                          }`}
+                        >
                           {simple ? line || " " : highlightLine(line, lang)}
                         </div>
                       ))}

@@ -817,6 +817,30 @@ async def get_execution_changes(
     return {"changes": rows}
 
 
+@app.get("/api/projects/{pid}/executions/{execution_id}/view")
+async def get_execution_view(
+    pid: str,
+    execution_id: int,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Read-only payload behind one timeline step (file read, output, ...)."""
+    if not await db.get_project_for_user(pid, user["id"]):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    row = await db.get_execution_view(pid, execution_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="该步骤没有可查看的视图")
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return {
+        "execution_id": execution_id,
+        "view_type": row["view_type"],
+        "payload": payload,
+        "truncated": bool(row["truncated"]),
+    }
+
+
 @app.post("/api/projects/{pid}/publish")
 async def publish_project(
     pid: str,
@@ -1318,10 +1342,28 @@ async def generate(
             # sync, so a late subscriber never sees a half-applied step.
             async with hub.lock:
                 if event == "execution":
+                    # Non-tool pipeline steps may attach their read-only view to
+                    # the final event; it never goes over the wire.
+                    view = payload.pop("view", None)
+                    view_truncated = bool(payload.pop("view_truncated", False))
                     if payload.get("id"):
                         await db.update_execution(
                             int(payload["id"]), payload["status"], payload.get("log")
                         )
+                        if (
+                            isinstance(view, dict)
+                            and isinstance(payload.get("view_type"), str)
+                        ):
+                            try:
+                                await db.add_execution_view(
+                                    pid,
+                                    int(payload["id"]),
+                                    payload["view_type"],
+                                    view,
+                                    view_truncated,
+                                )
+                            except Exception:  # noqa: BLE001 - views are optional
+                                pass
                     else:
                         payload = {
                             **payload,
@@ -1353,15 +1395,38 @@ async def generate(
             return payload.get("id")
 
         async def worker():
+            cancelled = False
             try:
+                # Old step views are best-effort presentation data; prune them
+                # before the new run so the demo DB stays bounded.
+                try:
+                    await db.prune_execution_views(
+                        pid,
+                        keep_runs=config.EXECUTION_VIEW_KEEP_RUNS,
+                        max_bytes=config.EXECUTION_VIEW_MAX_BYTES,
+                    )
+                except Exception:  # noqa: BLE001 - pruning must not block a build
+                    pass
                 await db.interrupt_running_executions(pid=pid)
                 await db.add_conversation(pid, "user", message)
                 await agent.run_turn(pid, message, emit)
             except asyncio.CancelledError:
+                cancelled = True
                 raise
             except Exception as exc:  # noqa: BLE001 - surface everything to the UI
                 await emit("error", {"message": f"{type(exc).__name__}: {exc}"})
             finally:
+                # The run added a new batch of views; prune again so retention
+                # is exact after every completed (or failed) generation.
+                if not cancelled:
+                    try:
+                        await db.prune_execution_views(
+                            pid,
+                            keep_runs=config.EXECUTION_VIEW_KEEP_RUNS,
+                            max_bytes=config.EXECUTION_VIEW_MAX_BYTES,
+                        )
+                    except Exception:  # noqa: BLE001 - never block the UI
+                        pass
                 # Closed subscribers do not block the worker: publish() never
                 # awaits, it just appends to live queues.
                 async with hub.lock:

@@ -14,6 +14,7 @@ import asyncio
 import json
 import re
 import shutil
+import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
@@ -1963,6 +1964,7 @@ async def _apply_and_build(
                 "log": "纯后端项目生成内置 API 控制台…",
             },
         )
+        started = time.monotonic()
         try:
             await asyncio.to_thread(
                 frontend_builder.publish_api_page,
@@ -1979,6 +1981,14 @@ async def _apply_and_build(
                     "step": "生成 API 预览",
                     "status": "error",
                     "log": text.replace("\n", " ")[:180],
+                    "view_type": "terminal",
+                    "view": {
+                        "ok": False,
+                        "command": "生成内置 API 控制台",
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "exit_code": 1,
+                        "output": text,
+                    },
                 },
             )
             return False, text
@@ -1989,6 +1999,14 @@ async def _apply_and_build(
                 "step": "生成 API 预览",
                 "status": "success",
                 "log": "预览产物已生成",
+                "view_type": "terminal",
+                "view": {
+                    "ok": True,
+                    "command": "生成内置 API 控制台",
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "exit_code": 0,
+                    "output": "API 控制台已生成",
+                },
             },
         )
 
@@ -2001,6 +2019,8 @@ async def _apply_and_build(
                 "log": "esbuild 打包 React + TypeScript…",
             },
         )
+        started = time.monotonic()
+        command = "esbuild src/main.tsx --bundle --outdir=dist --format=iife"
         try:
             built = await frontend_builder.build(pid, plan["title"])
         except Exception as exc:  # noqa: BLE001 - build errors are repair input
@@ -2014,6 +2034,14 @@ async def _apply_and_build(
                     "step": "构建前端预览",
                     "status": "error",
                     "log": text.replace("\n", " ")[:180],
+                    "view_type": "terminal",
+                    "view": {
+                        "ok": False,
+                        "command": command,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "exit_code": 1,
+                        "output": text,
+                    },
                 },
             )
             return False, text
@@ -2026,6 +2054,14 @@ async def _apply_and_build(
                     "step": "构建前端预览",
                     "status": "error",
                     "log": text,
+                    "view_type": "terminal",
+                    "view": {
+                        "ok": False,
+                        "command": command,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "exit_code": 1,
+                        "output": text,
+                    },
                 },
             )
             return False, text
@@ -2036,6 +2072,14 @@ async def _apply_and_build(
                 "step": "构建前端预览",
                 "status": "success",
                 "log": "预览产物已生成",
+                "view_type": "terminal",
+                "view": {
+                    "ok": True,
+                    "command": command,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "exit_code": 0,
+                    "output": "预览产物已生成",
+                },
             },
         )
 
@@ -2048,6 +2092,8 @@ async def _apply_and_build(
                 "log": "独立 uvicorn 进程 · SQLite 跟随项目",
             },
         )
+        started = time.monotonic()
+        command = "python -m uvicorn main:app --host 127.0.0.1"
         try:
             port = await runtime.runtime.ensure(pid)
             await check_runtime_health(ctx, port)
@@ -2060,6 +2106,14 @@ async def _apply_and_build(
                     "step": "启动后端运行时",
                     "status": "error",
                     "log": text[:180],
+                    "view_type": "terminal",
+                    "view": {
+                        "ok": False,
+                        "command": command,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "exit_code": 1,
+                        "output": text,
+                    },
                 },
             )
             return False, text
@@ -2070,6 +2124,18 @@ async def _apply_and_build(
                 "step": "启动后端运行时",
                 "status": "success",
                 "log": f"运行时已就绪：/apps/{pid}/api/*",
+                "view_type": "terminal",
+                "view": {
+                    "ok": True,
+                    "command": f"{command} --port {port}",
+                    "port": port,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "exit_code": 0,
+                    "output": (
+                        f"✓ 服务已启动，监听 127.0.0.1:{port}\n"
+                        "✓ /api/health 通过"
+                    ),
+                },
             },
         )
     return True, ""

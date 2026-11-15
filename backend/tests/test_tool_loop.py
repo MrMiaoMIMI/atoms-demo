@@ -119,6 +119,14 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
         event_names = [name for name, _ in self.events]
         self.assertEqual(event_names.count("file_change"), 2)
         self.assertEqual(event_names.count("artifact"), 2)
+        self.assertEqual(
+            [
+                payload["view_type"]
+                for name, payload in self.events
+                if name == "execution" and payload.get("status") == "success"
+            ],
+            ["diff", "diff"],
+        )
         # The second model turn must contain the first tool result.
         self.assertTrue(
             any(
@@ -126,6 +134,42 @@ class ToolLoopTests(unittest.IsolatedAsyncioTestCase):
                 for message in llm.calls[1]
             )
         )
+
+    async def test_read_file_persists_view_payload(self) -> None:
+        await db.add_artifact(
+            self.pid, "frontend/src/App.tsx", "const a = 1;\n", 1
+        )
+        llm = ScriptedLLM(
+            [
+                call(
+                    "read_file",
+                    {"path": "frontend/src/App.tsx", "offset": 1, "limit": 400},
+                ),
+                AssistantTurn(text="完成", finish_reason="stop"),
+            ]
+        )
+        result = await run_tool_loop(
+            llm=llm,
+            toolbox=self._toolbox(),
+            system="system",
+            user="user",
+            meta={},
+            emit=self.emit,
+            max_steps=5,
+            timeout_seconds=30,
+            no_progress_limit=10,
+        )
+        self.assertTrue(result.completed)
+        step = next(
+            payload
+            for name, payload in self.events
+            if name == "execution" and payload.get("status") == "success"
+        )
+        self.assertEqual(step["view_type"], "file")
+        row = await db.get_execution_view(self.pid, step["id"])
+        assert row is not None
+        self.assertEqual(row["view_type"], "file")
+        self.assertIn("const a = 1", row["payload"])
 
     async def test_invalid_arguments_are_returned_to_model(self) -> None:
         llm = ScriptedLLM(

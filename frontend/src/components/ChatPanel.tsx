@@ -47,7 +47,7 @@ interface Props {
   onSend: (text: string) => void;
   onStop: () => void;
   onOpenCode: () => void;
-  onOpenDiff?: (execution: Execution) => void;
+  onOpenStep?: (execution: Execution) => void;
 }
 
 export default function ChatPanel({
@@ -57,7 +57,7 @@ export default function ChatPanel({
   onSend,
   onStop,
   onOpenCode,
-  onOpenDiff,
+  onOpenStep,
 }: Props) {
   const [input, setInput] = useState("");
   const [copied, setCopied] = useState<string | null>(null);
@@ -225,7 +225,7 @@ export default function ChatPanel({
                         <ExecutionSteps
                           executions={group.executions}
                           live={group.live}
-                          onOpenDiff={onOpenDiff}
+                          onOpenStep={onOpenStep}
                         />
 
                         {group.messages.map((message, messageIndex) => (

@@ -31,8 +31,17 @@ export interface Execution {
   created_at?: string;
   tool?: string | null;
   target?: string | null;
+  view_type?: string | null;
   change_id?: number | null;
   change_count?: number | null;
+}
+
+/** Read-only payload behind one timeline step. */
+export interface ExecutionView {
+  execution_id: number;
+  view_type: string;
+  payload: Record<string, unknown>;
+  truncated: boolean;
 }
 
 export type ChangeType = "created" | "modified" | "deleted";

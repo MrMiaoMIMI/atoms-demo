@@ -25,7 +25,7 @@ import type {
 } from '../types';
 import { PresenceBar } from './Avatar';
 import ChatPanel from './ChatPanel';
-import CodePanel, { type StepDiff } from './CodePanel';
+import CodePanel from './CodePanel';
 import HomeSidebar from './HomeSidebar';
 import {
   AtomsMark,
@@ -41,6 +41,8 @@ import {
 import OverviewPane from './OverviewPane';
 import PreviewPane from './PreviewPane';
 import PublishDialog from './PublishDialog';
+import type { StepView, StepViewKind } from './StepViewPanel';
+import type { FileFocus } from './FilePanel';
 
 interface Props {
   projectId: string;
@@ -87,6 +89,35 @@ function upsertExecution(list: Execution[], execution: Execution): Execution[] {
   return next;
 }
 
+const VIEW_KINDS: StepViewKind[] = [
+  "diff",
+  "terminal",
+  "file",
+  "files",
+  "search",
+  "http",
+  "json",
+];
+
+function normalizeViewKind(value: string): StepViewKind {
+  return VIEW_KINDS.includes(value as StepViewKind)
+    ? (value as StepViewKind)
+    : "json";
+}
+
+function numberField(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function readFocusNote(payload: Record<string, unknown>): string {
+  const start = Math.max(1, numberField(payload.start_line, 1));
+  const end =
+    payload.end_line == null
+      ? null
+      : Math.max(start, numberField(payload.end_line, start));
+  return end == null ? `读取 L${start}` : `读取 L${start}–${end}`;
+}
+
 export default function Workspace({
   projectId,
   initialPrompt,
@@ -109,9 +140,10 @@ export default function Workspace({
   const [changes, setChanges] = useState<ChangesResponse | null>(null);
   const [changesLoading, setChangesLoading] = useState(false);
   const [changesError, setChangesError] = useState<string | null>(null);
-  const [stepDiff, setStepDiff] = useState<StepDiff | null>(null);
-  const [stepDiffLoading, setStepDiffLoading] = useState(false);
-  const [stepDiffError, setStepDiffError] = useState<string | null>(null);
+  const [stepView, setStepView] = useState<StepView | null>(null);
+  const [stepViewLoading, setStepViewLoading] = useState(false);
+  const [stepViewError, setStepViewError] = useState<string | null>(null);
+  const [fileFocus, setFileFocus] = useState<FileFocus | null>(null);
   const [runChanges, setRunChanges] = useState<Record<number, FileChange>>({});
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [streamingFile, setStreamingFile] = useState<string | null>(null);
@@ -155,6 +187,7 @@ export default function Workspace({
   const buildCoverAttempt = useRef<string | null>(null);
   const changesTimerRef = useRef<number | null>(null);
   const changesRequestRef = useRef(0);
+  const stepViewRequestRef = useRef(0);
   const codeViewRef = useRef<'files' | 'changes'>('files');
 
   const maybeCaptureBuildCover = useCallback(
@@ -272,8 +305,8 @@ export default function Workspace({
   }, [codeView]);
 
   useEffect(() => {
-    if (codeView === 'changes' && !stepDiff) void refreshChanges();
-  }, [codeView, stepDiff, refreshChanges]);
+    if (codeView === 'changes' && !stepView) void refreshChanges();
+  }, [codeView, stepView, refreshChanges]);
 
   useEffect(
     () => () => {
@@ -294,8 +327,10 @@ export default function Workspace({
     setChanges(null);
     setChangesError(null);
     setChangesLoading(false);
-    setStepDiff(null);
-    setStepDiffError(null);
+    setStepView(null);
+    setStepViewError(null);
+    setStepViewLoading(false);
+    setFileFocus(null);
     setRunChanges({});
     api
       .getProject(projectId)
@@ -560,8 +595,11 @@ export default function Workspace({
       if (event === 'changes_reset') {
         setChanges(null);
         setRunChanges({});
-        setStepDiff(null);
-        setStepDiffError(null);
+        stepViewRequestRef.current += 1;
+        setStepView(null);
+        setStepViewError(null);
+        setStepViewLoading(false);
+        setFileFocus(null);
         if (codeViewRef.current === 'changes') scheduleChangesRefresh();
         return;
       }
@@ -622,38 +660,142 @@ export default function Workspace({
     [applyState, normalizeAgent, maybeCaptureBuildCover, scheduleChangesRefresh],
   );
 
-  const openStepDiff = useCallback(
+  const openStepView = useCallback(
     async (execution: Execution) => {
       const changeCount =
         execution.change_count ?? (execution.change_id ? 1 : 0);
-      if (!changeCount) return;
+      const request = ++stepViewRequestRef.current;
       setPane('code');
-      setStepDiffError(null);
-      const live = Object.values(runChanges).filter(
-        (change) => change.execution_id === execution.id,
-      );
-      if (live.length) {
-        setStepDiff({ title: execution.step, changes: live });
+      setStepViewError(null);
+      setStepViewLoading(false);
+      setFileFocus(null);
+
+      if (changeCount > 0) {
+        const live = Object.values(runChanges).filter(
+          (change) => change.execution_id === execution.id,
+        );
+        if (live.length) {
+          setStepView({
+            title: execution.step,
+            kind: 'diff',
+            changes: live,
+          });
+          return;
+        }
+        setStepView({ title: execution.step, kind: 'diff', changes: [] });
+        setStepViewLoading(true);
+        try {
+          const data = await api.executionChanges(projectId, execution.id);
+          if (stepViewRequestRef.current !== request) return;
+          setStepView({
+            title: execution.step,
+            kind: 'diff',
+            changes: data.changes,
+          });
+        } catch (err) {
+          if (stepViewRequestRef.current !== request) return;
+          setStepViewError(
+            (err as Error).message || '步骤 diff 加载失败',
+          );
+        } finally {
+          if (stepViewRequestRef.current === request) {
+            setStepViewLoading(false);
+          }
+        }
         return;
       }
-      setStepDiff({ title: execution.step, changes: [] });
-      setStepDiffLoading(true);
+
+      const viewType = execution.view_type;
+      if (!viewType || execution.status === 'running') return;
+      const kind = normalizeViewKind(viewType);
+      setStepView({ title: execution.step, kind, status: execution.status });
+      setStepViewLoading(true);
       try {
-        const data = await api.executionChanges(projectId, execution.id);
-        setStepDiff({ title: execution.step, changes: data.changes });
+        const data = await api.executionView(projectId, execution.id);
+        if (stepViewRequestRef.current !== request) return;
+        const payload = data.payload ?? {};
+        const nextKind = normalizeViewKind(data.view_type || viewType);
+        if (nextKind === 'file') {
+          const path =
+            typeof payload.path === 'string' ? payload.path : '';
+          if (path && (path in artifacts)) {
+            // The file still exists: open it at the range the agent read,
+            // rather than showing a duplicate read-only snapshot.
+            setStepView(null);
+            setCodeView('files');
+            setActiveFile(path);
+            setFileFocus({
+              path,
+              start: Math.max(1, numberField(payload.start_line, 1)),
+              end: Math.max(
+                1,
+                numberField(
+                  payload.end_line,
+                  numberField(payload.start_line, 1),
+                ),
+              ),
+              note: readFocusNote(payload),
+            });
+            return;
+          }
+        }
+        setStepView({
+          title: execution.step,
+          kind: nextKind,
+          payload,
+          truncated: data.truncated,
+          status: execution.status,
+        });
       } catch (err) {
-        setStepDiffError((err as Error).message || '步骤 diff 加载失败');
+        if (stepViewRequestRef.current !== request) return;
+        setStepViewError(
+          (err as Error).message || '步骤视图加载失败',
+        );
       } finally {
-        setStepDiffLoading(false);
+        if (stepViewRequestRef.current === request) {
+          setStepViewLoading(false);
+        }
       }
     },
-    [projectId, runChanges],
+    [projectId, runChanges, artifacts],
   );
 
-  const closeStepDiff = useCallback(() => {
-    setStepDiff(null);
-    setStepDiffError(null);
+  const closeStepView = useCallback(() => {
+    stepViewRequestRef.current += 1;
+    setStepView(null);
+    setStepViewError(null);
+    setStepViewLoading(false);
   }, []);
+
+  const selectFile = useCallback((path: string) => {
+    setActiveFile(path);
+    setFileFocus((current) =>
+      current && current.path !== path ? null : current
+    );
+  }, []);
+
+  const openFileAt = useCallback(
+    (path: string, line?: number) => {
+      if (!path) return;
+      if (!(path in artifacts)) {
+        setStepViewError('该文件已不在当前项目中，无法打开。');
+        return;
+      }
+      stepViewRequestRef.current += 1;
+      setPane('code');
+      setStepView(null);
+      setStepViewError(null);
+      setStepViewLoading(false);
+      setCodeView('files');
+      setActiveFile(path);
+      setFileFocus(
+        line
+          ? { path, start: line, end: line, note: `定位第 ${line} 行` }
+          : null
+      );
+    },
+    [artifacts],
+  );
 
   const run = useCallback(
     async (text: string) => {
@@ -672,6 +814,7 @@ export default function Workspace({
       setRunning(true);
       setStreamingFile(null);
       setStreamingBuffer('');
+      setFileFocus(null);
       setGroups((prev) => [
         ...prev,
         {
@@ -1115,8 +1258,7 @@ export default function Workspace({
             <button
               type="button"
               onClick={() => {
-                setStepDiff(null);
-                setStepDiffError(null);
+                closeStepView();
                 setPane('preview');
               }}
               title="预览"
@@ -1133,8 +1275,7 @@ export default function Workspace({
               <button
                 type="button"
                 onClick={() => {
-                  setStepDiff(null);
-                  setStepDiffError(null);
+                  closeStepView();
                   setPane('overview');
                 }}
                 title="概览"
@@ -1152,8 +1293,7 @@ export default function Workspace({
             <button
               type="button"
               onClick={() => {
-                setStepDiff(null);
-                setStepDiffError(null);
+                closeStepView();
                 setPane('code');
               }}
               title="代码"
@@ -1230,11 +1370,10 @@ export default function Workspace({
             onSend={(text) => void run(text)}
             onStop={stop}
             onOpenCode={() => {
-              setStepDiff(null);
-              setStepDiffError(null);
+              closeStepView();
               setPane('code');
             }}
-            onOpenDiff={(execution) => void openStepDiff(execution)}
+            onOpenStep={(execution) => void openStepView(execution)}
           />
         </div>
 
@@ -1270,23 +1409,24 @@ export default function Workspace({
             projectId={projectId}
             artifacts={artifacts}
             activeFile={activeFile}
-            onSelect={setActiveFile}
+            onSelect={selectFile}
             streamingFile={streamingFile}
             streamingBuffer={streamingBuffer}
             view={codeView}
             onViewChange={(view) => {
-              setStepDiff(null);
-              setStepDiffError(null);
+              closeStepView();
               setCodeView(view);
             }}
             changes={changes}
             changesLoading={changesLoading}
             changesError={changesError}
             onRefreshChanges={() => void refreshChanges()}
-            stepDiff={stepDiff}
-            stepDiffLoading={stepDiffLoading}
-            stepDiffError={stepDiffError}
-            onCloseStepDiff={closeStepDiff}
+            stepView={stepView}
+            stepViewLoading={stepViewLoading}
+            stepViewError={stepViewError}
+            onCloseStepView={closeStepView}
+            onOpenFile={openFileAt}
+            fileFocus={fileFocus}
             hasChanges={hasChanges}
           />
         ) : (

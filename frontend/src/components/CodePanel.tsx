@@ -8,7 +8,8 @@ import type {
 } from "../types";
 import { buildFileTree, fileBadge, flattenFiles, type FileNode } from "../lib/files";
 import DiffView from "./DiffView";
-import FilePanel from "./FilePanel";
+import FilePanel, { type FileFocus } from "./FilePanel";
+import StepViewPanel, { type StepView } from "./StepViewPanel";
 import {
   AlertTriangle,
   ChevronLeft,
@@ -21,11 +22,6 @@ import {
   Search,
   Spinner,
 } from "./Icons";
-
-export interface StepDiff {
-  title: string;
-  changes: FileChange[];
-}
 
 interface Props {
   projectId: string;
@@ -40,10 +36,12 @@ interface Props {
   changesLoading: boolean;
   changesError: string | null;
   onRefreshChanges: () => void;
-  stepDiff: StepDiff | null;
-  stepDiffLoading: boolean;
-  stepDiffError: string | null;
-  onCloseStepDiff: () => void;
+  stepView: StepView | null;
+  stepViewLoading: boolean;
+  stepViewError: string | null;
+  onCloseStepView: () => void;
+  onOpenFile: (path: string, line?: number) => void;
+  fileFocus?: FileFocus | null;
   hasChanges: boolean;
 }
 
@@ -455,10 +453,12 @@ export default function CodePanel({
   changesLoading,
   changesError,
   onRefreshChanges,
-  stepDiff,
-  stepDiffLoading,
-  stepDiffError,
-  onCloseStepDiff,
+  stepView,
+  stepViewLoading,
+  stepViewError,
+  onCloseStepView,
+  onOpenFile,
+  fileFocus = null,
   hasChanges,
 }: Props) {
   const changeCount = changes?.files.length ?? null;
@@ -469,24 +469,24 @@ export default function CodePanel({
       : !changes.baseline_ok
         ? "发布基线尚未建立，暂时无法计算未发布改动；下一次发布成功后会启用。"
         : null;
-  const stepNote = stepDiff?.changes.some((change) => change.rolled_back)
+  const stepNote = stepView?.changes?.some((change) => change.rolled_back)
     ? "本轮改动已回滚，以下为回滚前的 diff 记录。"
     : null;
 
   return (
     <section className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex h-10 flex-none items-center justify-between gap-2 px-2 pb-1">
-        {stepDiff ? (
+        {stepView ? (
           <div className="flex min-w-0 items-center gap-2">
             <button
               type="button"
-              onClick={onCloseStepDiff}
+              onClick={onCloseStepView}
               className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[12px] text-ink-55 transition hover:bg-line-4 hover:text-ink-95"
             >
               <ChevronLeft size={14} /> 返回代码
             </button>
             <span className="min-w-0 truncate text-[12px] text-ink-55">
-              步骤 diff · {stepDiff.title}
+              步骤 · {stepView.title}
             </span>
           </div>
         ) : (
@@ -525,14 +525,23 @@ export default function CodePanel({
         )}
       </div>
 
-      {stepDiff ? (
-        <DiffBrowser
-          files={stepDiff.changes.map(toChangeFile)}
-          loading={stepDiffLoading}
-          error={stepDiffError}
-          notice={stepNote}
-          emptyLabel="这次步骤没有记录到文件改动。"
-        />
+      {stepView ? (
+        stepView.kind === "diff" ? (
+          <DiffBrowser
+            files={(stepView.changes ?? []).map(toChangeFile)}
+            loading={stepViewLoading}
+            error={stepViewError}
+            notice={stepNote}
+            emptyLabel="这次步骤没有记录到文件改动。"
+          />
+        ) : (
+          <StepViewPanel
+            view={stepView}
+            loading={stepViewLoading}
+            error={stepViewError}
+            onOpenFile={onOpenFile}
+          />
+        )
       ) : view === "files" ? (
         <FilePanel
           projectId={projectId}
@@ -541,6 +550,7 @@ export default function CodePanel({
           onSelect={onSelect}
           streamingFile={streamingFile}
           streamingBuffer={streamingBuffer}
+          focus={fileFocus}
         />
       ) : (
         <DiffBrowser

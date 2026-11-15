@@ -4,10 +4,34 @@ import {
   AlertTriangle,
   CheckCircle,
   ChevronDown,
+  Code,
   FileText,
+  Folder,
+  Globe,
+  Search,
   Spinner,
+  Terminal,
   X,
 } from "./Icons";
+
+const VIEW_LABEL: Record<string, string> = {
+  diff: "diff",
+  terminal: "终端",
+  file: "文件",
+  files: "列表",
+  search: "搜索",
+  http: "请求",
+  json: "JSON",
+};
+
+function ViewIcon({ type, size = 10 }: { type: string; size?: number }) {
+  if (type === "terminal") return <Terminal size={size} />;
+  if (type === "files") return <Folder size={size} />;
+  if (type === "search") return <Search size={size} />;
+  if (type === "http") return <Globe size={size} />;
+  if (type === "json") return <Code size={size} />;
+  return <FileText size={size} />;
+}
 
 function StatusIcon({ status, size = 14 }: { status: Execution["status"]; size?: number }) {
   if (status === "running") return <Spinner size={size} className="text-brand" />;
@@ -19,13 +43,13 @@ function StatusIcon({ status, size = 14 }: { status: Execution["status"]; size?:
 interface Props {
   executions: Execution[];
   live?: boolean;
-  onOpenDiff?: (execution: Execution) => void;
+  onOpenStep?: (execution: Execution) => void;
 }
 
 export default function ExecutionSteps({
   executions,
   live = false,
-  onOpenDiff,
+  onOpenStep,
 }: Props) {
   const active = executions.some((execution) => execution.status === "running");
   const failed = executions.some((execution) => execution.status === "error");
@@ -85,27 +109,46 @@ export default function ExecutionSteps({
                   const changeCount =
                     execution.change_count ??
                     (execution.change_id ? 1 : 0);
-                  const hasDiff = changeCount > 0 && Boolean(onOpenDiff);
+                  const viewType =
+                    changeCount > 0 ? "diff" : execution.view_type ?? null;
+                  const canOpen = Boolean(
+                    viewType &&
+                      onOpenStep &&
+                      execution.status !== "running"
+                  );
+                  const label = viewType
+                    ? VIEW_LABEL[viewType] ?? viewType
+                    : null;
+                  const pillLabel =
+                    viewType === "diff" && changeCount > 1
+                      ? `diff ${changeCount}`
+                      : label;
                   return (
                     <div
                       onClick={
-                        hasDiff ? () => onOpenDiff?.(execution) : undefined
+                        canOpen ? () => onOpenStep?.(execution) : undefined
                       }
                       onKeyDown={
-                        hasDiff
+                        canOpen
                           ? (event) => {
                               if (event.key === "Enter" || event.key === " ") {
                                 event.preventDefault();
-                                onOpenDiff?.(execution);
+                                onOpenStep?.(execution);
                               }
                             }
                           : undefined
                       }
-                      role={hasDiff ? "button" : undefined}
-                      tabIndex={hasDiff ? 0 : undefined}
-                      title={hasDiff ? "查看本次改动的 diff" : undefined}
+                      role={canOpen ? "button" : undefined}
+                      tabIndex={canOpen ? 0 : undefined}
+                      title={
+                        canOpen
+                          ? viewType === "diff"
+                            ? "查看本次改动的 diff"
+                            : "查看步骤详情"
+                          : undefined
+                      }
                       className={`rounded-[8px] border border-line-4 bg-white/70 px-3 py-2 ${
-                        hasDiff
+                        canOpen
                           ? "cursor-pointer transition hover:border-brand/40 hover:bg-white focus:outline-none focus-visible:border-brand/60"
                           : ""
                       }`}
@@ -114,10 +157,10 @@ export default function ExecutionSteps({
                         <span className="min-w-0 flex-1 break-words text-[13px] leading-[20px] text-ink-80">
                           {execution.step}
                         </span>
-                        {hasDiff ? (
+                        {canOpen && pillLabel ? (
                           <span className="mt-0.5 inline-flex flex-none items-center gap-1 rounded-full bg-brand-50 px-1.5 py-0.5 text-[10px] font-medium text-brand-text">
-                            <FileText size={10} />
-                            diff{changeCount > 1 ? ` ${changeCount}` : ""}
+                            <ViewIcon type={viewType ?? "json"} />
+                            {pillLabel}
                           </span>
                         ) : null}
                         <span className="mt-0.5 flex-none">

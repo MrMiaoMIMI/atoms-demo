@@ -1,4 +1,5 @@
 """SQLite access layer (WAL, short-lived connections)."""
+import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -124,6 +125,17 @@ CREATE TABLE IF NOT EXISTS file_changes (
 );
 CREATE INDEX IF NOT EXISTS idx_file_changes_project ON file_changes(project_id, id);
 CREATE INDEX IF NOT EXISTS idx_file_changes_exec ON file_changes(project_id, execution_id);
+
+CREATE TABLE IF NOT EXISTS execution_views (
+    execution_id INTEGER PRIMARY KEY,
+    project_id   TEXT NOT NULL,
+    view_type    TEXT NOT NULL,
+    payload      TEXT NOT NULL DEFAULT '{}',
+    truncated    INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_views_project
+    ON execution_views(project_id, created_at);
 """
 
 
@@ -761,7 +773,17 @@ async def get_state(pid: str) -> dict | None:
                    (
                        SELECT COUNT(*) FROM file_changes c
                        WHERE c.execution_id = e.id
-                   ) AS change_count
+                   ) AS change_count,
+                   CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM file_changes c
+                           WHERE c.execution_id = e.id
+                       ) THEN 'diff'
+                       ELSE (
+                           SELECT v.view_type FROM execution_views v
+                           WHERE v.execution_id = e.id
+                       )
+                   END AS view_type
             FROM executions e
             WHERE e.project_id = ?
             ORDER BY e.id
@@ -889,6 +911,136 @@ async def update_execution(exec_id: int, status: str, log: str | None) -> None:
             (status, log, exec_id),
         )
         await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Execution views (read-only payloads for timeline steps)
+# ---------------------------------------------------------------------------
+
+
+async def add_execution_view(
+    pid: str,
+    execution_id: int,
+    view_type: str,
+    payload: dict,
+    truncated: bool = False,
+) -> None:
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        encoded = "{}"
+        truncated = True
+    async with _connect() as conn:
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO execution_views
+                (execution_id, project_id, view_type, payload, truncated, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                execution_id,
+                pid,
+                view_type,
+                encoded,
+                1 if truncated else 0,
+                now(),
+            ),
+        )
+        await conn.commit()
+
+
+async def get_execution_view(pid: str, execution_id: int) -> dict | None:
+    async with _connect() as conn:
+        async with conn.execute(
+            """
+            SELECT * FROM execution_views
+            WHERE project_id = ? AND execution_id = ?
+            """,
+            (pid, execution_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def prune_execution_views(
+    pid: str,
+    *,
+    keep_runs: int = 20,
+    max_bytes: int = 20_000_000,
+) -> dict:
+    """Drop view payloads from old runs and beyond the project byte budget.
+
+    Execution rows are untouched: only the fetched view disappears, so an old
+    step simply stops being clickable after the UI reloads. ``keep_runs <= 0``
+    or ``max_bytes <= 0`` disables the corresponding limit.
+    """
+    removed = 0
+    async with _connect() as conn:
+        if keep_runs > 0:
+            async with conn.execute(
+                """
+                SELECT e.run_id, MAX(e.id) AS last_id
+                FROM execution_views v
+                JOIN executions e ON e.id = v.execution_id
+                WHERE v.project_id = ? AND e.run_id IS NOT NULL
+                GROUP BY e.run_id
+                ORDER BY last_id DESC
+                """,
+                (pid,),
+            ) as cur:
+                rows = await cur.fetchall()
+            stale = [row["run_id"] for row in rows[keep_runs:]]
+            for index in range(0, len(stale), 200):
+                batch = stale[index : index + 200]
+                placeholders = ",".join("?" for _ in batch)
+                cur = await conn.execute(
+                    f"""
+                    DELETE FROM execution_views
+                    WHERE project_id = ?
+                      AND execution_id IN (
+                          SELECT id FROM executions
+                          WHERE project_id = ? AND run_id IN ({placeholders})
+                      )
+                    """,
+                    (pid, pid, *batch),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    removed += cur.rowcount
+
+        if max_bytes > 0:
+            async with conn.execute(
+                """
+                SELECT execution_id, LENGTH(CAST(payload AS BLOB)) AS size
+                FROM execution_views
+                WHERE project_id = ?
+                ORDER BY created_at DESC, execution_id DESC
+                """,
+                (pid,),
+            ) as cur:
+                rows = await cur.fetchall()
+            kept_bytes = 0
+            overflow = False
+            drop: list[int] = []
+            for row in rows:
+                size = int(row["size"] or 0)
+                if not overflow and kept_bytes + size <= max_bytes:
+                    kept_bytes += size
+                else:
+                    overflow = True
+                    drop.append(int(row["execution_id"]))
+            for index in range(0, len(drop), 200):
+                batch = drop[index : index + 200]
+                placeholders = ",".join("?" for _ in batch)
+                cur = await conn.execute(
+                    f"DELETE FROM execution_views "
+                    f"WHERE project_id = ? AND execution_id IN ({placeholders})",
+                    (pid, *batch),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    removed += cur.rowcount
+
+        await conn.commit()
+    return {"removed": removed}
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1196,7 @@ async def delete_project(pid: str) -> None:
             "conversations",
             "artifacts",
             "executions",
+            "execution_views",
             "file_changes",
             "project_saves",
             "projects",

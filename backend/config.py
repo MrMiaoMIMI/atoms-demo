@@ -77,6 +77,15 @@ AGENT_REPAIR_MAX_ROUNDS = max(0, int(os.getenv("AGENT_REPAIR_MAX_ROUNDS", "2")))
 AGENT_CONTEXT_INLINE_CHARS = max(0, int(os.getenv("AGENT_CONTEXT_INLINE_CHARS", "40000")))
 AGENT_CONTEXT_FILE_CHARS = max(0, int(os.getenv("AGENT_CONTEXT_FILE_CHARS", "12000")))
 
+# Execution step views (read_file snapshot / grep / build logs / ...). Each
+# generation prunes old views so the demo database cannot grow without bound.
+# The step rows stay; only the payload is dropped and the step stops being
+# clickable after a refresh.
+EXECUTION_VIEW_KEEP_RUNS = max(1, int(os.getenv("EXECUTION_VIEW_KEEP_RUNS", "20")))
+EXECUTION_VIEW_MAX_BYTES = max(
+    0, int(os.getenv("EXECUTION_VIEW_MAX_BYTES", "20000000"))
+)
+
 # Generated app runtime (each project backend is a dedicated uvicorn process).
 MAX_RUNNING_APPS = max(1, int(os.getenv("MAX_RUNNING_APPS", "2")))
 GENERATED_APP_MEMORY_MB = max(0, int(os.getenv("GENERATED_APP_MEMORY_MB", "256")))

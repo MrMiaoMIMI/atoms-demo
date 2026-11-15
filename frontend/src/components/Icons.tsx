@@ -565,6 +565,25 @@ export function ApiIcon(props: IconProps) {
   );
 }
 
+export function Terminal(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="m4.8 7.2 3.8 4.8-3.8 4.8" />
+      <path d="M11 16.8h8.2" />
+    </Icon>
+  );
+}
+
+export function Globe(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <circle cx="12" cy="12" r="8.6" />
+      <path d="M3.6 12h16.8" />
+      <path d="M12 3.4c2.4 2.4 3.6 5.3 3.6 8.6s-1.2 6.2-3.6 8.6c-2.4-2.4-3.6-5.3-3.6-8.6s1.2-6.2 3.6-8.6z" />
+    </Icon>
+  );
+}
+
 export function DropdownChevron(props: IconProps) {
   return (
     <Icon {...props}>

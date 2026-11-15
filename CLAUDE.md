@@ -25,7 +25,7 @@
 - 生成物是按需的完整 Web 项目：`frontend`（Vite + React 18 + TS）、`fullstack`（前端 + FastAPI + SQLite）、`backend`（FastAPI + SQLite）；不针对每个项目执行 `npm install`，预览用共享 esbuild 打包
 - 每个生成项目拥有独立 SQLite：`apps/{id}/backend/data/app.db`，与 demo 的 `backend/data/atoms.db` 完全隔离；重写代码时保留该数据目录
 - 生成后端按项目启动独立 uvicorn 子进程（仅 127.0.0.1、随机端口、LRU 上限、内存上限）；环境变量裁剪，不泄露 demo 的 LLM Key
-- 一次生成请求返回单一 SSE 流，事件类型：`project` / `agent_start` / `execution` / `token` / `file_start` / `artifact` / `file_change` / `changes_reset` / `preview` / `message` / `agent_end` / `error` / `done`；事件带 `agent` + `run_id`，消息另带 `run_index`
+- 一次生成请求返回单一 SSE 流，事件类型：`project` / `agent_start` / `execution` / `token` / `file_start` / `artifact` / `file_change` / `changes_reset` / `preview` / `message` / `agent_end` / `error` / `done`；事件带 `agent` + `run_id`，消息另带 `run_index`；工具与构建类步骤的 `execution` 事件另带 `view_type`（`diff` / `terminal` / `file` / `files` / `search` / `http` / `json`），diff 继续走 `file_changes`，其他视图通过 `GET /api/projects/{id}/executions/{eid}/view` 按需拉取
 - 项目名由后端在创建后后台生成：用一次轻量 LLM 调用把首条需求概括为 ≤24 字的名称；无 Key 或失败时回退到首句启发式；最终名称通过生成流的 `project` 事件回填前端
 - 多智能体用“单 LLM + 角色 prompt 路由”模拟，不真起多进程：Mike（团队领导）→ Bob（架构师）→ Alex（工程师）；Bob 在有现有项目时用只读工具循环查看文件后输出 JSON 方案；Alex 用统一 tool loop 完成首建和迭代；构建请求按依赖顺序串行、尾部 `@` 交接，咨询请求由被 `@` 的角色并行回答；超时/循环用队列去重、单角色 2 次、整轮 5 次上限
 - 用户消息按 `@` 位置确定性切段，每个 Agent 只收到自己名下的问题文本；同一 Agent 的多个问题合并为一轮；分段不额外调用 LLM
@@ -66,6 +66,7 @@
 - artifacts(id, project_id, filename, content, version, deleted) — `deleted=1` 是 tombstone，最新版本为 tombstone 时文件从当前树消失
 - executions(id, project_id, agent, step, status, log, run_id, tool, target, created_at)
 - file_changes(id, project_id, version, run_id, agent, execution_id, filename, change_type, diff, additions, deletions, rolled_back, truncated, created_at) — 单次工具改动的 diff 历史
+- execution_views(execution_id PK, project_id, view_type, payload, truncated, created_at) — 工具/构建步骤的只读视图（读文件快照、grep 命中、构建/运行日志、HTTP 响应、方案 JSON）；payload 按需拉取并截断，每次生成前后按最近 `EXECUTION_VIEW_KEEP_RUNS`（默认 20）轮与 `EXECUTION_VIEW_MAX_BYTES`（默认 20MB）清理
 
 ## 目录结构
 
@@ -83,6 +84,7 @@ atoms-demo/
 │ ├── agents.py # 角色表 / prompt / 意图判断 / @ 解析 / 依赖排序
 │ ├── agent.py # 编排器：Mike/Bob/Alex、统一 tool loop 构建流水线
 │ ├── tool_loop.py # 原生 function calling 有界循环（预算/无进展/回滚）
+│ ├── views.py # 工具步骤视图 payload（terminal/file/files/search/http/json）
 │ ├── tools.py # Toolbox + 角色白名单工具 + LLM tool schema
 │ ├── workspace.py # 暂存工作区 / 路径安全 / 精确编辑 / apply_to
 │ ├── diffing.py # unified diff / 源码树对比

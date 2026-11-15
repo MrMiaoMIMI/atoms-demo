@@ -202,6 +202,7 @@ async def _execute_call(
         toolbox.ctx.execution_id = execution_id
     else:
         toolbox.ctx.execution_id = None
+    toolbox.ctx.last_view_type = None
 
     if arguments is None:
         result = _error(
@@ -214,6 +215,7 @@ async def _execute_call(
     data = result.get("data") if isinstance(result, dict) else None
     ok = bool(result.get("ok")) if isinstance(result, dict) else False
     change_id = data.get("change_id") if isinstance(data, dict) else None
+    view_type = toolbox.ctx.last_view_type
     await emit(
         "execution",
         {
@@ -224,6 +226,7 @@ async def _execute_call(
             "kind": "tool",
             "tool": call.name,
             "target": target,
+            "view_type": view_type,
             "change_id": change_id,
             "change_count": 1 if change_id else 0,
         },
@@ -313,6 +316,9 @@ def _summary(result: dict) -> str:
         return f"{data.get('total', len(data.get('files') or []))} 个文件"
     if "matches" in data:
         return f"{data.get('total', len(data.get('matches') or []))} 处命中"
+    if "lines" in data and "text" in data:
+        lines = len(data.get("lines") or [])
+        return f"{lines} 行" + ("（已截断）" if data.get("truncated") else "")
     if "total_lines" in data:
         lines = int(data.get("total_lines") or 0)
         return f"{lines} 行" + ("（已截断）" if data.get("truncated") else "")
@@ -320,6 +326,15 @@ def _summary(result: dict) -> str:
         return f"端口 {data['port']}"
     if "valid" in data:
         return "方案有效" if data["valid"] else "方案无效"
+    if "status" in data and "method" in data:
+        status = data.get("status")
+        label = f"HTTP {status}" if status is not None else "请求失败"
+        duration = data.get("duration_ms")
+        return label + (f" · {duration} ms" if duration is not None else "")
+    if "exit_code" in data:
+        label = "成功" if int(data.get("exit_code") or 0) == 0 else "失败"
+        duration = data.get("duration_ms")
+        return label + (f" · {duration} ms" if duration is not None else "")
     if data.get("changed") is False:
         return "内容无变化"
     return "完成"

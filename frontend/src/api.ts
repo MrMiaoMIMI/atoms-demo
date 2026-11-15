@@ -5,6 +5,7 @@ import type {
   DiscoverApp,
   DiscoverDetail,
   DiscoverSort,
+  ExecutionView,
   FileChange,
   Health,
   Project,
@@ -184,6 +185,11 @@ export const api = {
   executionChanges: (pid: string, executionId: number) =>
     getJson<{ changes: FileChange[] }>(
       `/api/projects/${pid}/executions/${executionId}/changes`
+    ),
+
+  executionView: (pid: string, executionId: number) =>
+    getJson<ExecutionView>(
+      `/api/projects/${pid}/executions/${executionId}/view`
     ),
 
   // Generation outlives the SSE connection; stopping it needs an explicit call.

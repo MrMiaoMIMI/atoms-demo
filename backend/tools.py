@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,6 +21,7 @@ import diffing
 import frontend_builder
 import runtime
 import scaffold
+import views
 from workspace import Workspace, WorkspaceError
 
 Emit = Callable[[str, dict], Awaitable[Any]]
@@ -39,6 +41,9 @@ class ToolContext:
     execution_id: int | None = None
     plan: dict | None = None
     workspace: Workspace | None = None
+    # Set by ``Toolbox.invoke`` so the tool loop can attach the view kind to
+    # the execution event the UI renders.
+    last_view_type: str | None = None
 
 
 def _project_mode(paths: set[str]) -> str:
@@ -359,40 +364,137 @@ async def llm_delete_file(ctx: ToolContext, path: str) -> dict:
     return {"ok": True, "data": _change_data(change, change_id)}
 
 
+async def _runtime_log_text(pid: str) -> str:
+    path = config.APPS_DIR / pid / ".runtime.log"
+    if not path.is_file():
+        return ""
+    return await asyncio.to_thread(
+        path.read_text, encoding="utf-8", errors="replace"
+    )
+
+
 async def llm_build_preview(ctx: ToolContext) -> dict:
     if not ctx.plan:
         raise RuntimeError("缺少项目计划，无法构建预览")
-    ws = await _workspace(ctx)
-    # Build tools see the staged tree; only the build step materialises it.
-    await asyncio.to_thread(
-        ws.apply_to, config.APPS_DIR / ctx.pid, reconcile_source=True
+    mode = ctx.plan.get("mode")
+    command = (
+        "esbuild src/main.tsx --bundle --outdir=dist --format=iife"
+        if mode in ("frontend", "fullstack")
+        else "生成内置 API 控制台"
     )
-    await build_preview(ctx, ctx.plan)
-    return {"ok": True, "data": {"mode": ctx.plan.get("mode")}}
+    started = time.monotonic()
+    ws = await _workspace(ctx)
+    try:
+        # Build tools see the staged tree; only the build step materialises it.
+        await asyncio.to_thread(
+            ws.apply_to, config.APPS_DIR / ctx.pid, reconcile_source=True
+        )
+        await build_preview(ctx, ctx.plan)
+    except frontend_builder.BuildError as exc:
+        message = str(exc)
+        return {
+            "ok": False,
+            "error": {"code": "build_failed", "message": message},
+            "data": {
+                "mode": mode,
+                "command": command,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "exit_code": 1,
+                "output": message,
+            },
+        }
+    return {
+        "ok": True,
+        "data": {
+            "mode": mode,
+            "command": command,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "exit_code": 0,
+            "output": "构建成功",
+        },
+    }
 
 
 async def llm_start_runtime(ctx: ToolContext) -> dict:
+    command = "python -m uvicorn main:app --host 127.0.0.1"
+    started = time.monotonic()
     ws = await _workspace(ctx)
-    await asyncio.to_thread(
-        ws.apply_to, config.APPS_DIR / ctx.pid, reconcile_source=True
-    )
-    # The process must pick up the staged backend source, not the previous one.
-    await runtime.runtime.stop(ctx.pid)
-    port = await start_runtime(ctx)
-    return {"ok": True, "data": {"port": port}}
+    try:
+        await asyncio.to_thread(
+            ws.apply_to, config.APPS_DIR / ctx.pid, reconcile_source=True
+        )
+        # The process must pick up the staged backend source, not the previous one.
+        await runtime.runtime.stop(ctx.pid)
+        port = await start_runtime(ctx)
+    except runtime.AppRuntimeError as exc:
+        message = str(exc)
+        return {
+            "ok": False,
+            "error": {"code": "runtime_failed", "message": message},
+            "data": {
+                "command": command,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "exit_code": 1,
+                "log": message,
+            },
+        }
+    tail = (await _runtime_log_text(ctx.pid)).splitlines()[-40:]
+    log_text = "\n".join(tail)
+    if not log_text:
+        # uvicorn runs at warning level, so a clean start often has no output.
+        log_text = f"✓ 服务已启动，监听 127.0.0.1:{port}"
+    return {
+        "ok": True,
+        "data": {
+            "port": port,
+            "command": f"{command} --port {port}",
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "exit_code": 0,
+            "log": log_text,
+        },
+    }
 
 
 async def llm_check_health(ctx: ToolContext, port: int) -> dict:
-    await check_health(ctx, port)
-    return {"ok": True, "data": {"port": port}}
+    url = f"http://127.0.0.1:{port}/api/health"
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            response = await client.get(url)
+    except httpx.HTTPError as exc:
+        message = f"健康检查失败：{type(exc).__name__}: {exc}"
+        return {
+            "ok": False,
+            "error": {"code": "health_failed", "message": message},
+            "data": {
+                "method": "GET",
+                "url": "/api/health",
+                "status": None,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "body": "",
+            },
+        }
+    data = {
+        "method": "GET",
+        "url": "/api/health",
+        "status": response.status_code,
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "body": response.text[:16000],
+    }
+    if response.status_code >= 400:
+        return {
+            "ok": False,
+            "error": {
+                "code": "health_failed",
+                "message": f"健康检查返回 HTTP {response.status_code}",
+            },
+            "data": data,
+        }
+    return {"ok": True, "data": data}
 
 
 async def llm_read_runtime_log(ctx: ToolContext, lines: int = 80) -> dict:
-    path = config.APPS_DIR / ctx.pid / ".runtime.log"
-    if not path.is_file():
-        return {"ok": True, "data": {"lines": [], "text": "", "truncated": False}}
-    text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
-    all_lines = text.splitlines()
+    all_lines = (await _runtime_log_text(ctx.pid)).splitlines()
     limit = max(1, min(int(lines), 400))
     tail = all_lines[-limit:]
     return {
@@ -644,6 +746,7 @@ class Toolbox:
 
     async def invoke(self, name: str, arguments: dict | None = None) -> dict:
         """Execute one LLM tool call and always return a JSON-serialisable result."""
+        self.ctx.last_view_type = None
         if name not in self.allowed:
             return _tool_error(
                 "permission_denied",
@@ -657,20 +760,51 @@ class Toolbox:
         try:
             result = await tool(self.ctx, **kwargs)
         except WorkspaceError as exc:
-            return exc.to_result()
+            result = exc.to_result()
         except frontend_builder.BuildError as exc:
-            return _tool_error("build_failed", str(exc))
+            result = _tool_error("build_failed", str(exc))
         except runtime.AppRuntimeError as exc:
-            return _tool_error("runtime_failed", str(exc))
+            result = _tool_error("runtime_failed", str(exc))
         except asyncio.TimeoutError:
-            return _tool_error("timeout", f"工具 {name} 执行超时")
+            result = _tool_error("timeout", f"工具 {name} 执行超时")
         except TypeError as exc:
-            return _tool_error("invalid_args", f"{name} 参数不正确：{exc}")
+            result = _tool_error("invalid_args", f"{name} 参数不正确：{exc}")
         except Exception as exc:  # noqa: BLE001 - tool errors must reach the model
-            return _tool_error("internal", f"{type(exc).__name__}: {exc}")
-        if isinstance(result, dict) and "ok" in result:
-            return result
-        return {"ok": True, "data": result}
+            result = _tool_error("internal", f"{type(exc).__name__}: {exc}")
+        if not (isinstance(result, dict) and "ok" in result):
+            result = {"ok": True, "data": result}
+        await self._record_view(name, kwargs, result)
+        return result
+
+    async def _record_view(
+        self, name: str, arguments: dict, result: dict
+    ) -> None:
+        """Persist this step's read-only view; a failure must not fail the tool."""
+        try:
+            view = views.build_view(name, arguments, result)
+        except Exception:  # noqa: BLE001 - views are best-effort presentation
+            return
+        if view is None:
+            return
+        view_type, payload, truncated = view
+        if view_type == "diff":
+            # The diff itself lives in file_changes; only mark the step so the
+            # live SSE event and history agree on the view kind.
+            self.ctx.last_view_type = "diff"
+            return
+        if self.ctx.execution_id is None:
+            return
+        try:
+            await db.add_execution_view(
+                self.ctx.pid,
+                self.ctx.execution_id,
+                view_type,
+                payload,
+                truncated,
+            )
+        except Exception:  # noqa: BLE001 - keep the tool result usable
+            return
+        self.ctx.last_view_type = view_type
 
 
 def _tool_error(code: str, message: str) -> dict:
