@@ -38,6 +38,7 @@ import diffing
 import frontend_builder
 import mailer
 import naming
+import public_pages
 import publisher
 import runtime
 
@@ -1905,16 +1906,46 @@ async def preview(pid: str, path: str, request: Request):
 # Published site (public, unlike the owner-only /apps/ workspace preview)
 # ---------------------------------------------------------------------------
 
+PUBLIC_PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Robots-Tag": "noindex, nofollow",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
+def _wants_html(request: Request) -> bool:
+    """True for a browser navigation, false for fetch()/subresource loads.
+
+    The unavailable-app views are documents; API calls and asset requests still
+    get the JSON error they can actually parse.
+    """
+    accept = request.headers.get("accept", "").lower()
+    return "text/html" in accept or "application/xhtml+xml" in accept
+
+
+def _site_unavailable(request: Request, pid: str, paused: bool):
+    """404 with a rendered page for visitors, JSON for programmatic callers."""
+    if _wants_html(request):
+        page = (
+            public_pages.paused_page(pid)
+            if paused
+            else public_pages.not_found_page()
+        )
+        return HTMLResponse(
+            page, status_code=404, headers=PUBLIC_PAGE_HEADERS
+        )
+    raise HTTPException(
+        status_code=404, detail="站点已暂停" if paused else "站点不存在"
+    )
+
 
 @app.get("/s/{pid}")
-async def published_root(pid: str):
+async def published_root(pid: str, request: Request):
     project = await db.get_project(pid)
-    if (
-        not project
-        or project.get("published_version") is None
-        or project.get("paused")
-    ):
-        raise HTTPException(status_code=404, detail="站点不存在")
+    if not project or project.get("published_version") is None:
+        return _site_unavailable(request, pid, paused=False)
+    if project.get("paused"):
+        return _site_unavailable(request, pid, paused=True)
     return RedirectResponse(url=f"/s/{pid}/", status_code=307)
 
 
@@ -1924,18 +1955,22 @@ async def published_root(pid: str):
 )
 async def published_site(pid: str, path: str, request: Request):
     project = await db.get_project(pid)
-    if (
-        not project
-        or project.get("published_version") is None
-        or project.get("paused")
-    ):
-        raise HTTPException(status_code=404, detail="站点不存在")
+    if not project or project.get("published_version") is None:
+        return _site_unavailable(request, pid, paused=False)
+    if project.get("paused"):
+        return _site_unavailable(request, pid, paused=True)
     if _is_backend_path(path):
         return await _proxy_backend(pid, path, request, published=True)
     if request.method not in {"GET", "HEAD"}:
         raise HTTPException(status_code=405, detail="静态站点只支持 GET")
     target = _published_target(pid, path)
     if target is None:
+        if _wants_html(request):
+            return HTMLResponse(
+                public_pages.not_found_page(),
+                status_code=404,
+                headers=PUBLIC_PAGE_HEADERS,
+            )
         raise HTTPException(status_code=404, detail="页面不存在")
     headers = {
         "Cache-Control": "no-store",
