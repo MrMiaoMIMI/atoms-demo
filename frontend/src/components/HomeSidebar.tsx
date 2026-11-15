@@ -16,9 +16,10 @@ import {
 
 interface Props {
   projects: ProjectSummary[];
-  section: 'home' | 'projects' | 'workspace';
+  section: 'home' | 'projects' | 'workspace' | 'discover';
   user: AuthUser;
   onHome: () => void;
+  onDiscover: () => void;
   onProjects: () => void;
   onOpenProject: (id: string) => void;
   onCollapse: () => void;
@@ -78,13 +79,15 @@ export function CollapsedSidebar({
   section,
   user,
   onHome,
+  onDiscover,
   onProjects,
   onExpand,
 }: {
   health: Health | null;
-  section: 'home' | 'projects';
+  section: 'home' | 'projects' | 'discover';
   user: AuthUser;
   onHome: () => void;
+  onDiscover: () => void;
   onProjects: () => void;
   onExpand: () => void;
 }) {
@@ -94,6 +97,12 @@ export function CollapsedSidebar({
       label: '首页',
       icon: <Home size={18} />,
       onClick: onHome,
+    },
+    {
+      key: 'discover' as const,
+      label: '发现',
+      icon: <Compass size={18} />,
+      onClick: onDiscover,
     },
     {
       key: 'projects' as const,
@@ -154,6 +163,7 @@ export default function HomeSidebar({
   section,
   user,
   onHome,
+  onDiscover,
   onProjects,
   onOpenProject,
   onCollapse,
@@ -192,7 +202,12 @@ export default function HomeSidebar({
           active={section === 'home'}
           onClick={onHome}
         />
-        <NavItem icon={<Compass size={17} />} label="资源" placeholder />
+        <NavItem
+          icon={<Compass size={17} />}
+          label="发现"
+          active={section === 'discover'}
+          onClick={onDiscover}
+        />
         <NavItem
           icon={<Folder size={17} />}
           label="项目"
@@ -246,12 +261,14 @@ export default function HomeSidebar({
               </button>
             ))
           ) : (
-            <p className="px-2 py-1.5 text-[12px] text-ink-30">尚无聊天记录</p>
+            <p className="px-2 py-1.5 text-[12px] text-ink-30">
+              尚无聊天记录
+            </p>
           )}
         </div>
       </div>
 
-      <div className="px-2 pb-3">
+      <div className="mt-auto px-2 pb-3">
         <div className="mt-3 flex items-center gap-2 px-1">
           <InitialAvatar size={28} label={userInitial(user)} />
           <div className="min-w-0 flex-1">

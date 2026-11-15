@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hmac
 import io
 import json
 import logging
 import re
 import shutil
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,6 +20,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import (
     FileResponse,
+    HTMLResponse,
     JSONResponse,
     RedirectResponse,
     Response,
@@ -27,6 +31,7 @@ from starlette.background import BackgroundTask
 
 import agent
 import auth
+import categories
 import config
 import db
 import mailer
@@ -155,6 +160,27 @@ class CreateProjectBody(BaseModel):
 class GenerateBody(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     team_mode: bool = True  # kept for UI parity; routing is always team-routed
+
+
+class PublishBody(BaseModel):
+    """Optional discover metadata supplied with a publish.
+
+    Omitted fields keep the project's current values. Sending an empty
+    description clears it, which is why the handler distinguishes ``None``
+    (body absent) from an explicit empty string.
+    """
+
+    description: str | None = Field(default=None, max_length=280)
+    category: str | None = Field(default=None, max_length=20)
+
+
+class CoverBody(BaseModel):
+    version: int = Field(ge=0)
+    image: str = Field(min_length=32, max_length=2_000_000)
+
+
+class CategorySuggestBody(BaseModel):
+    description: str | None = Field(default=None, max_length=280)
 
 
 class EmailBody(BaseModel):
@@ -624,6 +650,7 @@ async def list_projects(user: dict = Depends(auth.current_user)) -> dict:
             project["mode"] = "frontend"
         project["generating"] = _is_generating(project["id"])
         db.decorate_project(project)
+        project["cover_url"] = _project_cover_url(project)
     return {"projects": projects}
 
 
@@ -687,7 +714,11 @@ async def get_project(pid: str, user: dict = Depends(auth.current_user)) -> dict
 
 
 @app.post("/api/projects/{pid}/publish")
-async def publish_project(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+async def publish_project(
+    pid: str,
+    body: PublishBody | None = None,
+    user: dict = Depends(auth.current_user),
+) -> dict:
     """Snapshot the last successful build and make it publicly reachable."""
     project = await db.get_project_for_user(pid, user["id"])
     if not project:
@@ -699,6 +730,23 @@ async def publish_project(pid: str, user: dict = Depends(auth.current_user)) -> 
         raise HTTPException(status_code=409, detail="项目还没有成功构建，无法发布")
     if not _preview_ready(pid):
         raise HTTPException(status_code=409, detail="构建产物不存在，请先重新构建")
+
+    # Validate discover metadata before touching the snapshot. The author can
+    # publish without a body (older clients); an explicit body updates both
+    # fields, and an empty description clears it.
+    final_description: str | None = None
+    final_category: str | None = None
+    if body is not None:
+        final_description = (
+            body.description
+            if body.description is not None
+            else (project.get("description") or "")
+        ).strip()[:280]
+        current_category = categories.normalize_category(project.get("category"))
+        requested = (body.category or "").strip()
+        if requested and requested not in categories.CATEGORIES:
+            raise HTTPException(status_code=400, detail="分类不正确")
+        final_category = requested or current_category
 
     # Mark synchronously before the first await inside the snapshot section;
     # the re-check below closes the window opened by the ownership query.
@@ -714,6 +762,12 @@ async def publish_project(pid: str, user: dict = Depends(auth.current_user)) -> 
             publisher.snapshot, pid, int(built), mode, project["name"]
         )
         await db.mark_published(pid, int(built))
+        if body is not None:
+            await db.update_project_meta(
+                pid,
+                final_description or "",
+                final_category or categories.DEFAULT_CATEGORY,
+            )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - surface the snapshot failure
@@ -766,6 +820,316 @@ async def resume_project(pid: str, user: dict = Depends(auth.current_user)) -> d
     if updated:
         db.decorate_project(updated)
     return {"ok": True, "project": updated}
+
+
+# ---------------------------------------------------------------------------
+# Discover: other users' published apps
+# ---------------------------------------------------------------------------
+
+
+def _cover_file(pid: str) -> tuple[Path, str] | None:
+    root = config.APPS_DIR / pid
+    for name, media_type in (("cover.jpg", "image/jpeg"), ("cover.png", "image/png")):
+        path = root / name
+        if path.is_file():
+            return path, media_type
+    return None
+
+
+def _build_cover_file(pid: str) -> tuple[Path, str] | None:
+    root = config.APPS_DIR / pid
+    for name, media_type in (
+        ("build-cover.jpg", "image/jpeg"),
+        ("build-cover.png", "image/png"),
+    ):
+        path = root / name
+        if path.is_file():
+            return path, media_type
+    return None
+
+
+def _project_cover_url(project: dict) -> str | None:
+    """Owner-facing project card cover.
+
+    A published snapshot cover wins over a working-build cover, matching the
+    rule that the online thumbnail is the canonical one. A build cover exists
+    for projects that are built but not published yet.
+    """
+    pid = project["id"]
+    published = project.get("published_version")
+    cover_version = project.get("cover_version")
+    if (
+        published is not None
+        and cover_version == published
+        and _cover_file(pid) is not None
+    ):
+        return f"/api/projects/{pid}/cover?v={cover_version}"
+
+    built = project.get("built_version")
+    build_cover = project.get("build_cover_version")
+    if (
+        built is not None
+        and build_cover == built
+        and _build_cover_file(pid) is not None
+    ):
+        return f"/api/projects/{pid}/cover?v=b{build_cover}"
+    return None
+
+
+def _decorate_discover(row: dict) -> dict:
+    app = dict(row)
+    has_frontend = bool(app.pop("has_frontend", 0))
+    has_backend = bool(app.pop("has_backend", 0))
+    if has_frontend and has_backend:
+        app["mode"] = "fullstack"
+    elif has_backend:
+        app["mode"] = "backend"
+    else:
+        app["mode"] = "frontend"
+    app["description"] = app.get("description") or ""
+    app["category"] = categories.normalize_category(app.get("category"))
+    app["view_count"] = int(app.get("view_count") or 0)
+    app["saved"] = bool(app.get("saved"))
+    app["published_url"] = f"/s/{app['id']}/"
+    cover_version = app.get("cover_version")
+    cover = _cover_file(app["id"])
+    if (
+        cover is not None
+        and cover_version is not None
+        and cover_version == app.get("published_version")
+    ):
+        app["cover_url"] = f"/api/discover/{app['id']}/cover?v={cover_version}"
+    else:
+        app["cover_url"] = None
+    # These are storage details, not part of the public discover contract.
+    app.pop("cover_version", None)
+    app.pop("cover_at", None)
+    return app
+
+
+async def _store_cover(pid: str, data: bytes, ext: str, prefix: str) -> None:
+    root = config.APPS_DIR / pid
+    await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True)
+    target = root / f"{prefix}.{ext}"
+    tmp = root / f".{prefix}-{uuid.uuid4().hex}.tmp"
+    await asyncio.to_thread(tmp.write_bytes, data)
+    await asyncio.to_thread(tmp.replace, target)
+    for name in (f"{prefix}.jpg", f"{prefix}.png"):
+        other = root / name
+        if other != target and other.exists():
+            await asyncio.to_thread(other.unlink)
+
+
+_COVER_DATA_URL = re.compile(r"^data:image/(png|jpeg);base64,([A-Za-z0-9+/=]+)$")
+
+
+def _decode_cover_image(image: str) -> tuple[bytes, str]:
+    match = _COVER_DATA_URL.match((image or "").strip())
+    if not match:
+        raise HTTPException(status_code=400, detail="封面格式不正确")
+    kind = match.group(1)
+    try:
+        data = base64.b64decode(match.group(2), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="封面格式不正确") from exc
+    if len(data) > 1_200_000:
+        raise HTTPException(status_code=413, detail="封面图片不能超过 1.2MB")
+    if kind == "jpeg" and not data.startswith(b"\xff\xd8\xff"):
+        raise HTTPException(status_code=400, detail="封面格式不正确")
+    if kind == "png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise HTTPException(status_code=400, detail="封面格式不正确")
+    return data, ("jpg" if kind == "jpeg" else "png")
+
+
+@app.post("/api/projects/{pid}/category/suggest")
+async def suggest_project_category(
+    pid: str,
+    body: CategorySuggestBody | None = None,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Offer one category. This never persists anything; the author confirms."""
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    prompt = await db.first_user_message(pid)
+    files = await db.latest_artifact_names(pid)
+    description = (
+        (body.description if body is not None else None)
+        or project.get("description")
+        or ""
+    ).strip()
+    category = await categories.suggest_category(
+        name=project["name"],
+        prompt=prompt,
+        description=description,
+        files=files,
+    )
+    return {"category": category}
+
+
+@app.post("/api/projects/{pid}/cover")
+async def upload_project_cover(
+    pid: str,
+    body: CoverBody,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Store the browser-captured cover for the current published version."""
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    published = project.get("published_version")
+    if published is None or body.version != published:
+        raise HTTPException(status_code=409, detail="封面版本与线上版本不一致")
+
+    data, ext = _decode_cover_image(body.image)
+    await _store_cover(pid, data, ext, "cover")
+    await db.set_project_cover(pid, body.version)
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/build-cover")
+async def upload_project_build_cover(
+    pid: str,
+    body: CoverBody,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Store the browser-captured cover for the latest successful build."""
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    built = project.get("built_version")
+    if built is None or body.version != built:
+        raise HTTPException(status_code=409, detail="缩略图版本与最近构建版本不一致")
+
+    data, ext = _decode_cover_image(body.image)
+    await _store_cover(pid, data, ext, "build-cover")
+    await db.set_project_build_cover(pid, body.version)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{pid}/cover")
+async def project_card_cover(pid: str, user: dict = Depends(auth.current_user)):
+    """Serve the owner's card cover: published cover first, then build cover."""
+    project = await db.get_project_for_user(pid, user["id"])
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    published = project.get("published_version")
+    if published is not None and project.get("cover_version") == published:
+        cover = _cover_file(pid)
+        if cover is not None:
+            path, media_type = cover
+            return FileResponse(
+                path,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+    built = project.get("built_version")
+    if built is not None and project.get("build_cover_version") == built:
+        cover = _build_cover_file(pid)
+        if cover is not None:
+            path, media_type = cover
+            return FileResponse(
+                path,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+    raise HTTPException(status_code=404, detail="缩略图不存在")
+
+
+@app.get("/api/discover")
+async def discover_list(
+    sort: str = "latest",
+    category: str | None = None,
+    q: str | None = None,
+    saved: bool = False,
+    offset: int = 0,
+    limit: int = 24,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    if sort not in {"latest", "popular"}:
+        raise HTTPException(status_code=400, detail="排序方式不正确")
+    if category and category != "全部" and category not in categories.CATEGORIES:
+        raise HTTPException(status_code=400, detail="分类不正确")
+    page_size = max(1, min(limit, 60))
+    rows = await db.list_discover(
+        user["id"],
+        sort=sort,
+        category=None if category == "全部" else category,
+        query=(q or "")[:80],
+        saved=saved,
+        limit=page_size,
+        offset=max(0, offset),
+    )
+    has_more = len(rows) > page_size
+    return {
+        "apps": [_decorate_discover(row) for row in rows[:page_size]],
+        "has_more": has_more,
+    }
+
+
+@app.get("/api/discover/{pid}")
+async def discover_detail(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    row = await db.get_discover(pid, user["id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="应用不存在或已下线")
+    app = _decorate_discover(row)
+    related = await db.list_related(pid, user["id"], app["category"], 4)
+    app["related"] = [_decorate_discover(item) for item in related]
+    return {"app": app}
+
+
+@app.post("/api/discover/{pid}/view")
+async def discover_view(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    if not await db.get_discover(pid, user["id"]):
+        raise HTTPException(status_code=404, detail="应用不存在或已下线")
+    return {"ok": True, "view_count": await db.increment_view(pid)}
+
+
+@app.post("/api/discover/{pid}/save")
+async def discover_save(pid: str, user: dict = Depends(auth.current_user)) -> dict:
+    if not await db.get_discover(pid, user["id"]):
+        raise HTTPException(status_code=404, detail="应用不存在或已下线")
+    await db.save_project(user["id"], pid)
+    return {"ok": True, "saved": True}
+
+
+@app.delete("/api/discover/{pid}/save")
+async def discover_unsave(
+    pid: str, user: dict = Depends(auth.current_user)
+) -> dict:
+    # Unconditionally removing the row lets a user tidy up after an app is
+    # paused or taken down.
+    await db.unsave_project(user["id"], pid)
+    return {"ok": True, "saved": False}
+
+
+@app.get("/api/discover/{pid}/cover")
+async def discover_cover(pid: str, user: dict = Depends(auth.current_user)):
+    row = await db.get_discover(pid, user["id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="应用不存在或已下线")
+    cover = _cover_file(pid)
+    if (
+        cover is None
+        or row.get("cover_version") is None
+        or row.get("cover_version") != row.get("published_version")
+    ):
+        raise HTTPException(status_code=404, detail="封面不存在")
+    path, media_type = cover
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _zip_artifacts(files: dict[str, str]) -> bytes:
@@ -1111,7 +1475,103 @@ def _published_target(pid: str, path: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-async def _serve_project_file(pid: str, path: str) -> FileResponse:
+_CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Runs inside the sandboxed preview iframe. It captures the app's own DOM and
+# posts a JPEG back to the workspace, which uploads it as the discover cover.
+# The tool itself is a same-origin classic script in the demo's public assets.
+_CAPTURE_SCRIPT = """
+<script>
+(function () {
+  var ID = __ID__;
+  var TOOL = __TOOL__;
+  var started = false;
+  function post(type, extra) {
+    try {
+      parent.postMessage(Object.assign({ type: type, id: ID }, extra || {}), '*');
+    } catch (e) {}
+  }
+  function loadTool() {
+    return new Promise(function (resolve, reject) {
+      if (window.htmlToImage) return resolve();
+      var script = document.createElement('script');
+      script.src = TOOL;
+      script.onload = function () { resolve(); };
+      script.onerror = function () { reject(new Error('无法加载截图工具')); };
+      document.head.appendChild(script);
+    });
+  }
+  function capture() {
+    if (started) return;
+    started = true;
+    // The worker may be offscreen, where Chrome can throttle rAF to a crawl.
+    // html-to-image uses rAF after decoding the SVG image, so give it a
+    // timer-backed implementation just for this capture.
+    window.requestAnimationFrame = function (callback) {
+      return setTimeout(function () { callback(Date.now()); }, 16);
+    };
+    loadTool()
+      .then(function () {
+        return new Promise(function (resolve) { setTimeout(resolve, 350); });
+      })
+      .then(function () {
+        var fonts = document.fonts && document.fonts.ready
+          ? document.fonts.ready
+          : Promise.resolve();
+        return Promise.race([
+          fonts,
+          new Promise(function (resolve) { setTimeout(resolve, 1200); })
+        ]);
+      })
+      .then(function () {
+        return window.htmlToImage.toJpeg(document.body, {
+          quality: 0.86,
+          backgroundColor: '#ffffff',
+          width: 1280,
+          height: 720,
+          canvasWidth: 1280,
+          canvasHeight: 720,
+          pixelRatio: 1,
+          cacheBust: true,
+          skipFonts: true,
+          imagePlaceholder: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='
+        });
+      })
+      .then(function (data) {
+        if (!data || data.length < 5000) throw new Error('截图内容为空');
+        post('atoms-cover', { dataUrl: data });
+      })
+      .catch(function (err) {
+        post('atoms-cover-error', { message: String((err && err.message) || err) });
+      });
+  }
+  window.addEventListener('message', function (event) {
+    if (event.data && event.data.type === 'atoms-capture' && event.data.id === ID) {
+      capture();
+    }
+  });
+  function ready() { post('atoms-cover-ready'); }
+  if (document.readyState === 'complete') ready();
+  else window.addEventListener('load', ready, { once: true });
+})();
+</script>
+"""
+
+
+def _capture_document(html_text: str, capture_id: str) -> str:
+    safe_id = capture_id if _CAPTURE_ID_RE.match(capture_id or "") else uuid.uuid4().hex
+    script = _CAPTURE_SCRIPT.replace(
+        "__ID__", json.dumps(safe_id)
+    ).replace("__TOOL__", json.dumps("/preview-assets/html-to-image.js"))
+    index = html_text.lower().rfind("</body>")
+    if index >= 0:
+        return html_text[:index] + script + html_text[index:]
+    return html_text + script
+
+
+async def _serve_project_file(
+    pid: str, path: str, capture_id: str | None = None
+) -> FileResponse | HTMLResponse:
     target = _static_target(pid, path)
     if target is None:
         raise HTTPException(status_code=404, detail="预览文件不存在")
@@ -1121,6 +1581,9 @@ async def _serve_project_file(pid: str, path: str) -> FileResponse:
         **CORS_HEADERS,
         "Cache-Control": "no-store",
     }
+    if capture_id is not None and target.name == "index.html":
+        html_text = await asyncio.to_thread(target.read_text, encoding="utf-8")
+        return HTMLResponse(_capture_document(html_text, capture_id), headers=headers)
     return FileResponse(target, headers=headers)
 
 
@@ -1249,7 +1712,12 @@ async def preview(pid: str, path: str, request: Request):
         user = await auth.current_user(request)
         if not await db.get_project_for_user(pid, user["id"]):
             raise HTTPException(status_code=404, detail="项目不存在")
-    return await _serve_project_file(pid, path)
+    capture_id = (
+        request.query_params.get("capture_id", "")
+        if request.query_params.get("atoms_capture") == "1"
+        else None
+    )
+    return await _serve_project_file(pid, path, capture_id)
 
 
 # ---------------------------------------------------------------------------

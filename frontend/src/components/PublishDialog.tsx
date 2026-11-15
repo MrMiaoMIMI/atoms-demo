@@ -1,7 +1,11 @@
 import { useEffect } from 'react';
 import type { Project, ProjectStatus } from '../types';
+import {
+  DISCOVER_CATEGORIES,
+  isDiscoverCategory,
+} from '../lib/discover';
 import { absoluteUrl } from '../lib/projects';
-import { Check, Copy, ExternalLink, Spinner, X } from './Icons';
+import { Check, Copy, ExternalLink, Sparkle, Spinner, X } from './Icons';
 
 interface Props {
   open: boolean;
@@ -11,6 +15,12 @@ interface Props {
   busy: boolean;
   error: string | null;
   copied: boolean;
+  description: string;
+  category: string;
+  suggestingCategory: boolean;
+  onDescriptionChange: (value: string) => void;
+  onCategoryChange: (value: string) => void;
+  onSuggestCategory: () => void;
   onClose: () => void;
   onPublish: () => void;
   onPause: () => void;
@@ -27,6 +37,12 @@ export default function PublishDialog({
   busy,
   error,
   copied,
+  description,
+  category,
+  suggestingCategory,
+  onDescriptionChange,
+  onCategoryChange,
+  onSuggestCategory,
   onClose,
   onPublish,
   onPause,
@@ -97,6 +113,9 @@ export default function PublishDialog({
     };
   })();
 
+  const canPublish = Boolean(content.primary);
+  const selectedCategory = isDiscoverCategory(category) ? category : '其他';
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
       <button
@@ -109,7 +128,7 @@ export default function PublishDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="publish-dialog-title"
-        className="relative w-full max-w-[520px] overflow-hidden rounded-2xl border border-line-6 bg-white shadow-float animate-rise"
+        className="relative max-h-[calc(100vh-32px)] w-full max-w-[520px] overflow-y-auto rounded-2xl border border-line-6 bg-white shadow-float animate-rise"
       >
         <div className="flex items-start justify-between gap-4 px-6 pt-5">
           <div className="min-w-0">
@@ -186,6 +205,63 @@ export default function PublishDialog({
             </p>
           ) : null}
 
+          {canPublish ? (
+            <div className="space-y-3 rounded-xl border border-line-4 bg-[#FBFBFA] p-3.5">
+              <label className="block">
+                <span className="flex items-center justify-between text-[11px] text-ink-55">
+                  <span>简介（可选）</span>
+                  <span>{description.length}/280</span>
+                </span>
+                <textarea
+                  value={description}
+                  onChange={(event) =>
+                    onDescriptionChange(event.target.value.slice(0, 280))
+                  }
+                  disabled={disabled}
+                  rows={3}
+                  maxLength={280}
+                  placeholder="一句话介绍这个应用，会显示在发现详情页。"
+                  className="mt-1.5 w-full resize-none rounded-lg border border-line-8 bg-white px-3 py-2 text-[12px] leading-[19px] text-ink-95 outline-none transition placeholder:text-ink-30 focus:border-line-12 disabled:cursor-not-allowed disabled:opacity-60"
+                />
+              </label>
+
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-ink-55">分类</span>
+                  <button
+                    type="button"
+                    onClick={onSuggestCategory}
+                    disabled={disabled || suggestingCategory}
+                    className="inline-flex h-6 items-center gap-1 rounded-full border border-line-8 bg-white px-2 text-[10px] font-medium text-ink-80 transition hover:border-line-12 hover:text-ink-95 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {suggestingCategory ? (
+                      <Spinner size={11} />
+                    ) : (
+                      <Sparkle size={11} />
+                    )}
+                    自动识别
+                  </button>
+                </div>
+                <select
+                  aria-label="分类"
+                  value={selectedCategory}
+                  onChange={(event) => onCategoryChange(event.target.value)}
+                  disabled={disabled}
+                  className="mt-1.5 h-9 w-full rounded-lg border border-line-8 bg-white px-2.5 text-[12px] text-ink-95 outline-none transition focus:border-line-12 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {DISCOVER_CATEGORIES.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[10px] leading-[16px] text-ink-30">
+                  分类会显示在发现页，自动识别只给建议，你可以随时修改。
+                </p>
+              </div>
+            </div>
+          ) : null}
+
           {error ? (
             <p className="rounded-lg bg-danger/10 px-3 py-2 text-[12px] leading-[18px] text-danger">
               {error}
@@ -198,7 +274,7 @@ export default function PublishDialog({
             <button
               type="button"
               onClick={onClose}
-              className="inline-flex h-9 items-center rounded-full bg-[#0C0C0C] px-4 text-[12px] font-medium text-white transition hover:bg-[#232323]"
+              className="inline-flex h-9 items-center rounded-full bg-brand px-4 text-[12px] font-medium text-white transition hover:bg-brand-600"
             >
               知道了
             </button>
@@ -217,7 +293,7 @@ export default function PublishDialog({
                 type="button"
                 onClick={onPublish}
                 disabled={disabled}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#0C0C0C] px-4 text-[12px] font-medium text-white transition hover:bg-[#232323] disabled:cursor-not-allowed disabled:opacity-40"
+                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-brand px-4 text-[12px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {busy ? <Spinner size={13} /> : null}
                 {building ? '构建中…' : busy ? '发布中…' : content.primary}
@@ -239,7 +315,7 @@ export default function PublishDialog({
               <button
                 type="button"
                 onClick={onOpenSite}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#0C0C0C] px-4 text-[12px] font-medium text-white transition hover:bg-[#232323]"
+                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-brand px-4 text-[12px] font-medium text-white transition hover:bg-brand-600"
               >
                 <ExternalLink size={13} />
                 打开站点
@@ -260,7 +336,7 @@ export default function PublishDialog({
                 type="button"
                 onClick={onPublish}
                 disabled={disabled}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#0C0C0C] px-4 text-[12px] font-medium text-white transition hover:bg-[#232323] disabled:cursor-not-allowed disabled:opacity-40"
+                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-brand px-4 text-[12px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {busy ? <Spinner size={13} /> : null}
                 {building ? '构建中…' : busy ? '发布中…' : content.primary}
@@ -310,7 +386,7 @@ export default function PublishDialog({
                 type="button"
                 onClick={onPublish}
                 disabled={disabled}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#0C0C0C] px-4 text-[12px] font-medium text-white transition hover:bg-[#232323] disabled:cursor-not-allowed disabled:opacity-40"
+                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-brand px-4 text-[12px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {busy ? <Spinner size={13} /> : null}
                 {building ? '构建中…' : busy ? '发布中…' : content.primary}

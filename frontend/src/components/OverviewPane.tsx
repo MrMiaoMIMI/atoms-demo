@@ -156,7 +156,7 @@ export default function OverviewPane({
                 type="button"
                 onClick={onOpenPublish}
                 disabled={disabled}
-                className="inline-flex h-9 flex-none items-center gap-1.5 rounded-full bg-[#0C0C0C] px-4 text-[12px] font-medium text-white transition hover:bg-[#232323] disabled:cursor-not-allowed disabled:opacity-40"
+                className="inline-flex h-9 flex-none items-center gap-1.5 rounded-full bg-brand px-4 text-[12px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {building ? <Spinner size={13} /> : null}
                 {building ? '构建中…' : '发布新变更'}
@@ -177,7 +177,7 @@ export default function OverviewPane({
                 type="button"
                 onClick={onOpenPublish}
                 disabled={disabled}
-                className="mt-5 inline-flex h-10 items-center gap-1.5 rounded-full bg-[#0C0C0C] px-5 text-[13px] font-medium text-white transition hover:bg-[#232323] disabled:cursor-not-allowed disabled:opacity-40"
+                className="mt-5 inline-flex h-10 items-center gap-1.5 rounded-full bg-brand px-5 text-[13px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {building ? <Spinner size={14} /> : null}
                 {building ? '构建中…' : '发布应用'}

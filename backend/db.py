@@ -51,8 +51,23 @@ CREATE TABLE IF NOT EXISTS projects (
     built_at          TEXT,
     published_version INTEGER,
     published_at      TEXT,
-    paused            INTEGER NOT NULL DEFAULT 0
+    paused            INTEGER NOT NULL DEFAULT 0,
+    description       TEXT,
+    category          TEXT NOT NULL DEFAULT '其他',
+    view_count        INTEGER NOT NULL DEFAULT 0,
+    cover_version     INTEGER,
+    cover_at          TEXT,
+    build_cover_version INTEGER,
+    build_cover_at      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS project_saves (
+    user_id    TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_saves_project ON project_saves(project_id);
 
 CREATE TABLE IF NOT EXISTS conversations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,6 +132,13 @@ async def _migrate(conn) -> None:
             "published_version": "INTEGER",
             "published_at": "TEXT",
             "paused": "INTEGER NOT NULL DEFAULT 0",
+            "description": "TEXT",
+            "category": "TEXT NOT NULL DEFAULT '其他'",
+            "view_count": "INTEGER NOT NULL DEFAULT 0",
+            "cover_version": "INTEGER",
+            "cover_at": "TEXT",
+            "build_cover_version": "INTEGER",
+            "build_cover_at": "TEXT",
         },
     }
     for table, columns in migrations.items():
@@ -138,6 +160,11 @@ async def init_db() -> None:
         # databases created before accounts existed.
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, created_at)"
+        )
+        # Discover only ever reads online projects, newest first.
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_projects_discover "
+            "ON projects(paused, published_at DESC)"
         )
         await conn.commit()
 
@@ -415,6 +442,8 @@ async def list_projects(user_id: str | None = None) -> list[dict]:
             SELECT p.id, p.name, p.user_id, p.created_at,
                    p.built_version, p.built_at,
                    p.published_version, p.published_at, p.paused,
+                   p.description, p.category, p.view_count,
+                   p.cover_version, p.cover_at, p.build_cover_version, p.build_cover_at,
                    (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id) AS message_count,
                    (SELECT COUNT(DISTINCT filename) FROM artifacts a WHERE a.project_id = p.id) AS artifact_count,
                    (SELECT MAX(a.version) FROM artifacts a WHERE a.project_id = p.id) AS latest_version,
@@ -444,6 +473,206 @@ async def get_project_for_user(pid: str, user_id: str) -> dict | None:
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Discover (read-only across users, but only for published, non-paused apps)
+# ---------------------------------------------------------------------------
+
+# ``?`` order: the viewer id for the ``saved`` flag comes first, before the
+# WHERE placeholders. Callers must keep that order.
+_DISCOVER_SELECT = """
+    SELECT p.id, p.name, p.created_at,
+           COALESCE(p.description, '') AS description,
+           COALESCE(NULLIF(p.category, ''), '其他') AS category,
+           COALESCE(p.view_count, 0) AS view_count,
+           p.published_version, p.published_at,
+           p.cover_version, p.cover_at,
+           COALESCE(
+               NULLIF(TRIM(u.name), ''),
+               '用户 ' || substr(COALESCE(u.id, p.user_id, 'anon'), 1, 4)
+           ) AS author_name,
+           CASE
+               WHEN TRIM(COALESCE(u.name, '')) = ''
+                   THEN upper(substr(COALESCE(u.id, p.user_id, 'a'), 1, 1))
+               ELSE upper(substr(TRIM(u.name), 1, 1))
+           END AS author_initial,
+           EXISTS(
+               SELECT 1 FROM project_saves s2
+               WHERE s2.project_id = p.id AND s2.user_id = ?
+           ) AS saved,
+           EXISTS(
+               SELECT 1 FROM artifacts a
+               WHERE a.project_id = p.id AND a.filename LIKE 'frontend/%'
+           ) AS has_frontend,
+           EXISTS(
+               SELECT 1 FROM artifacts a
+               WHERE a.project_id = p.id AND a.filename LIKE 'backend/%'
+           ) AS has_backend
+    FROM projects p
+    LEFT JOIN users u ON u.id = p.user_id
+"""
+
+
+async def list_discover(
+    viewer_id: str,
+    *,
+    sort: str = "latest",
+    category: str | None = None,
+    query: str | None = None,
+    saved: bool = False,
+    limit: int = 24,
+    offset: int = 0,
+) -> list[dict]:
+    """List other users' online apps. The viewer's own projects are excluded."""
+    where = [
+        "p.published_version IS NOT NULL",
+        "p.paused = 0",
+        "p.user_id != ?",
+    ]
+    params: list[object] = [viewer_id, viewer_id]
+    if category and category != "全部":
+        where.append("COALESCE(NULLIF(p.category, ''), '其他') = ?")
+        params.append(category)
+    keyword = (query or "").strip()
+    if keyword:
+        where.append(
+            "(instr(lower(p.name), lower(?)) > 0 "
+            "OR instr(lower(COALESCE(p.description, '')), lower(?)) > 0)"
+        )
+        params.extend([keyword, keyword])
+    if saved:
+        where.append(
+            "EXISTS (SELECT 1 FROM project_saves s3 "
+            "WHERE s3.project_id = p.id AND s3.user_id = ?)"
+        )
+        params.append(viewer_id)
+
+    order = (
+        "p.view_count DESC, p.published_at DESC, p.created_at DESC"
+        if sort == "popular"
+        else "p.published_at DESC, p.created_at DESC"
+    )
+    page_size = max(1, min(limit, 60))
+    # Fetch one extra row so the caller can report has_more accurately.
+    params.extend([page_size + 1, max(0, offset)])
+    sql = f"{_DISCOVER_SELECT} WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ? OFFSET ?"
+    async with _connect() as conn:
+        async with conn.execute(sql, params) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def get_discover(pid: str, viewer_id: str) -> dict | None:
+    sql = (
+        f"{_DISCOVER_SELECT} "
+        "WHERE p.id = ? AND p.published_version IS NOT NULL "
+        "AND p.paused = 0 AND p.user_id != ?"
+    )
+    async with _connect() as conn:
+        async with conn.execute(sql, (viewer_id, pid, viewer_id)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def list_related(
+    pid: str, viewer_id: str, category: str, limit: int = 4
+) -> list[dict]:
+    """Other users' online apps, same category first, then popular/newest."""
+    sql = (
+        f"{_DISCOVER_SELECT} "
+        "WHERE p.id != ? AND p.published_version IS NOT NULL "
+        "AND p.paused = 0 AND p.user_id != ? "
+        "ORDER BY (COALESCE(NULLIF(p.category, ''), '其他') = ?) DESC, "
+        "p.view_count DESC, p.published_at DESC LIMIT ?"
+    )
+    async with _connect() as conn:
+        async with conn.execute(
+            sql, (viewer_id, pid, viewer_id, category, max(1, min(limit, 12)))
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def increment_view(pid: str) -> int:
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE projects SET view_count = COALESCE(view_count, 0) + 1 "
+            "WHERE id = ? AND published_version IS NOT NULL AND paused = 0",
+            (pid,),
+        )
+        await conn.commit()
+        async with conn.execute(
+            "SELECT COALESCE(view_count, 0) FROM projects WHERE id = ?", (pid,)
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+
+async def save_project(user_id: str, pid: str) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "INSERT OR IGNORE INTO project_saves (user_id, project_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (user_id, pid, now()),
+        )
+        await conn.commit()
+
+
+async def unsave_project(user_id: str, pid: str) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "DELETE FROM project_saves WHERE user_id = ? AND project_id = ?",
+            (user_id, pid),
+        )
+        await conn.commit()
+
+
+async def update_project_meta(pid: str, description: str, category: str) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE projects SET description = ?, category = ? WHERE id = ?",
+            (description, category, pid),
+        )
+        await conn.commit()
+
+
+async def set_project_cover(pid: str, version: int) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE projects SET cover_version = ?, cover_at = ? WHERE id = ?",
+            (version, now(), pid),
+        )
+        await conn.commit()
+
+
+async def set_project_build_cover(pid: str, version: int) -> None:
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE projects SET build_cover_version = ?, build_cover_at = ? "
+            "WHERE id = ?",
+            (version, now(), pid),
+        )
+        await conn.commit()
+
+
+async def first_user_message(pid: str) -> str:
+    async with _connect() as conn:
+        async with conn.execute(
+            "SELECT content FROM conversations "
+            "WHERE project_id = ? AND role = 'user' ORDER BY id LIMIT 1",
+            (pid,),
+        ) as cur:
+            row = await cur.fetchone()
+            return str(row[0]) if row else ""
+
+
+async def latest_artifact_names(pid: str) -> list[str]:
+    async with _connect() as conn:
+        async with conn.execute(
+            "SELECT DISTINCT filename FROM artifacts "
+            "WHERE project_id = ? ORDER BY filename LIMIT 80",
+            (pid,),
+        ) as cur:
+            return [str(row[0]) for row in await cur.fetchall()]
 
 
 async def get_state(pid: str) -> dict | None:
@@ -616,6 +845,13 @@ async def delete_artifacts_except(pid: str, keep: set[str]) -> None:
 
 async def delete_project(pid: str) -> None:
     async with _connect() as conn:
-        for table in ("conversations", "artifacts", "executions", "projects"):
-            await conn.execute(f"DELETE FROM {table} WHERE {'id' if table == 'projects' else 'project_id'} = ?", (pid,))
+        for table in (
+            "conversations",
+            "artifacts",
+            "executions",
+            "project_saves",
+            "projects",
+        ):
+            column = "id" if table == "projects" else "project_id"
+            await conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (pid,))
         await conn.commit()

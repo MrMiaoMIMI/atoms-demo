@@ -289,6 +289,25 @@ export function Share(props: IconProps) {
   );
 }
 
+export function Bookmark(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M6.5 4.5h11a1 1 0 0 1 1 1v14l-6.5-4-6.5 4v-14a1 1 0 0 1 1-1z" />
+    </Icon>
+  );
+}
+
+export function BookmarkFill(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path
+        d="M6.5 4.5h11a1 1 0 0 1 1 1v14l-6.5-4-6.5 4v-14a1 1 0 0 1 1-1z"
+        fill="currentColor"
+      />
+    </Icon>
+  );
+}
+
 export function Settings(props: IconProps) {
   return (
     <Icon {...props}>

@@ -1,11 +1,15 @@
 import type { FormEvent, MouseEvent as ReactMouseEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
-import type { AuthUser, Health, ProjectSummary } from '../types';
+import { contentMaxWidth } from '../lib/layout';
+import type { AuthUser, DiscoverApp, Health, ProjectSummary } from '../types';
 import { AgentRail } from './Avatar';
+import CardGrid from './CardGrid';
+import DiscoverCard from './DiscoverCard';
 import HomeSidebar, { CollapsedSidebar } from './HomeSidebar';
 import MentionComposer from './MentionComposer';
 import ProjectCard from './ProjectCard';
+import Tabs, { type TabItem } from './Tabs';
 import {
   ApiIcon,
   ArrowUp,
@@ -168,10 +172,18 @@ interface HomeProps {
   onStart: (projectId: string, prompt: string) => void;
   onOpen: (projectId: string) => void;
   onBrowseAllProjects: () => void;
+  onDiscover: () => void;
+  onOpenDiscoverApp: (id: string) => void;
   onLogout: () => void;
 }
 
-type Tab = 'projects' | 'templates';
+type Tab = 'discover' | 'projects' | 'templates';
+
+const HOME_TABS: TabItem<Tab>[] = [
+  { value: 'discover', label: '发现' },
+  { value: 'projects', label: '项目' },
+  { value: 'templates', label: '模板' },
+];
 
 const BANNER_KEY = 'atoms.home.banner.dismissed';
 
@@ -192,15 +204,21 @@ export default function Home({
   onStart,
   onOpen,
   onBrowseAllProjects,
+  onDiscover,
+  onOpenDiscoverApp,
   onLogout,
 }: HomeProps) {
   const [prompt, setPrompt] = useState('');
   const [creating, setCreating] = useState(false);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [discoverApps, setDiscoverApps] = useState<DiscoverApp[]>([]);
+  const [discoverLoading, setDiscoverLoading] = useState(true);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+  const [discoverNonce, setDiscoverNonce] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('projects');
+  const [tab, setTab] = useState<Tab>('discover');
   const [banner, setBanner] = useState(readBannerVisible);
   const [connector, setConnector] = useState(true);
   const [plusOpen, setPlusOpen] = useState(false);
@@ -227,6 +245,34 @@ export default function Home({
       cancelled = true;
     };
   }, []);
+
+  // The shell polls /api/projects every 2s. Mirror it here so view counts and
+  // freshly captured thumbnails appear without a full page reload.
+  useEffect(() => {
+    if (sidebarProjects.length) setProjects(sidebarProjects);
+  }, [sidebarProjects]);
+
+  // The discover tab is the default landing view. It shows the same cards as
+  // the discover page, just a single page worth of the latest apps.
+  useEffect(() => {
+    let cancelled = false;
+    setDiscoverLoading(true);
+    setDiscoverError(null);
+    api
+      .discover({ sort: 'latest', offset: 0, limit: 6 })
+      .then((data) => {
+        if (!cancelled) setDiscoverApps(data.apps);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setDiscoverError(err.message || '发现列表加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setDiscoverLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [discoverNonce]);
 
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
@@ -280,7 +326,7 @@ export default function Home({
   }
 
   function goHomeContent() {
-    setTab('projects');
+    setTab('discover');
     mainRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
@@ -301,6 +347,13 @@ export default function Home({
       : '服务离线'
     : '连接中';
 
+  const browseAll =
+    tab === 'discover'
+      ? onDiscover
+      : tab === 'projects'
+        ? onBrowseAllProjects
+        : null;
+
   return (
     <div className="flex h-full overflow-hidden bg-base">
       {sidebarCollapsed ? (
@@ -309,6 +362,7 @@ export default function Home({
           section="home"
           user={user}
           onHome={goHomeContent}
+          onDiscover={onDiscover}
           onProjects={onBrowseAllProjects}
           onExpand={() => onSidebarCollapsed(false)}
         />
@@ -318,6 +372,7 @@ export default function Home({
           section="home"
           user={user}
           onHome={goHomeContent}
+          onDiscover={onDiscover}
           onProjects={onBrowseAllProjects}
           onOpenProject={onOpen}
           onCollapse={() => onSidebarCollapsed(true)}
@@ -371,7 +426,8 @@ export default function Home({
 
           <div
             ref={composerRef}
-            className="mx-auto flex w-full max-w-[1164px] flex-col items-center px-6 pb-4 pt-4 sm:pb-4 sm:pt-4"
+            className="mx-auto flex w-full flex-col items-center px-6 pb-4 pt-4 sm:pb-4 sm:pt-4"
+            style={{ maxWidth: contentMaxWidth(sidebarCollapsed, 1164) }}
           >
             <span className="inline-flex h-8 items-center gap-2 rounded-full bg-line-4 px-4 text-[14px] text-ink-55">
               本地演示
@@ -537,33 +593,16 @@ export default function Home({
             </form>
           </div>
 
-          <section className="mx-auto mb-12 w-full max-w-[1100px] rounded-[24px] border border-line-4 bg-white p-6 shadow-panel sm:p-8">
+          <section
+            className="mx-auto mb-12 w-full rounded-[24px] border border-line-4 bg-white p-6 shadow-panel sm:p-8"
+            style={{ maxWidth: contentMaxWidth(sidebarCollapsed, 1100) }}
+          >
             <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-1">
-                {(
-                  [
-                    ['projects', '项目'],
-                    ['templates', '模板'],
-                  ] as const
-                ).map(([value, label]) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => setTab(value)}
-                    className={`h-8 rounded-full px-4 text-[14px] transition ${
-                      tab === value
-                        ? 'bg-line-6 text-ink-95'
-                        : 'text-ink-55 hover:text-ink-80'
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              {tab === 'projects' ? (
+              <Tabs items={HOME_TABS} value={tab} onChange={setTab} />
+              {browseAll ? (
                 <button
                   type="button"
-                  onClick={onBrowseAllProjects}
+                  onClick={browseAll}
                   className="inline-flex items-center gap-0.5 text-[14px] text-ink-55 transition hover:text-ink-95"
                 >
                   查看全部
@@ -573,17 +612,70 @@ export default function Home({
             </div>
 
             <div className="mt-6">
-              {tab === 'projects' ? (
-                loading ? (
-                  <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-                    {[0, 1, 2].map((index) => (
+              {tab === 'discover' ? (
+                discoverLoading ? (
+                  <CardGrid collapsed={sidebarCollapsed}>
+                    {[0, 1, 2, 3, 4, 5].map((index) => (
                       <div key={index} className="animate-pulse">
                         <div className="aspect-[16/10] rounded-xl bg-line-4" />
                         <div className="mt-3 h-3 w-2/3 rounded-full bg-line-4" />
                         <div className="mt-2 h-2 w-1/2 rounded-full bg-line-2" />
                       </div>
                     ))}
+                  </CardGrid>
+                ) : discoverError ? (
+                  <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-line-8 px-6 py-16 text-center">
+                    <span className="grid h-11 w-11 place-items-center rounded-xl bg-line-4 text-ink-55">
+                      <Sparkle size={20} />
+                    </span>
+                    <p className="mt-3 text-[14px] font-medium text-ink-95">
+                      发现内容加载失败
+                    </p>
+                    <p className="mt-1 text-[12px] text-ink-55">
+                      {discoverError}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setDiscoverNonce((value) => value + 1)}
+                      className="mt-4 inline-flex h-8 items-center rounded-full border border-line-8 bg-white px-4 text-[13px] text-ink-80 transition hover:border-line-12 hover:text-ink-95"
+                    >
+                      重试
+                    </button>
                   </div>
+                ) : discoverApps.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-line-8 px-6 py-16 text-center">
+                    <span className="grid h-11 w-11 place-items-center rounded-xl bg-line-4 text-ink-55">
+                      <Sparkle size={20} />
+                    </span>
+                    <p className="mt-3 text-[14px] font-medium text-ink-95">
+                      还没有其他用户公开应用
+                    </p>
+                    <p className="mt-1 text-[12px] text-ink-55">
+                      发布你的应用后，其他用户会在这里看到它。
+                    </p>
+                  </div>
+                ) : (
+                  <CardGrid collapsed={sidebarCollapsed}>
+                    {discoverApps.map((app) => (
+                      <DiscoverCard
+                        key={app.id}
+                        app={app}
+                        onOpen={onOpenDiscoverApp}
+                      />
+                    ))}
+                  </CardGrid>
+                )
+              ) : tab === 'projects' ? (
+                loading ? (
+                  <CardGrid collapsed={sidebarCollapsed}>
+                    {[0, 1, 2, 3].map((index) => (
+                      <div key={index} className="animate-pulse">
+                        <div className="aspect-[16/10] rounded-xl bg-line-4" />
+                        <div className="mt-3 h-3 w-2/3 rounded-full bg-line-4" />
+                        <div className="mt-2 h-2 w-1/2 rounded-full bg-line-2" />
+                      </div>
+                    ))}
+                  </CardGrid>
                 ) : projects.length === 0 ? (
                   <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-line-8 px-6 py-16 text-center">
                     <span className="grid h-11 w-11 place-items-center rounded-xl bg-line-4 text-ink-55">
@@ -605,7 +697,7 @@ export default function Home({
                     </button>
                   </div>
                 ) : (
-                  <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+                  <CardGrid collapsed={sidebarCollapsed}>
                     {projects.map((project) => (
                       <ProjectCard
                         key={project.id}
@@ -615,10 +707,10 @@ export default function Home({
                         deleting={deleting === project.id}
                       />
                     ))}
-                  </div>
+                  </CardGrid>
                 )
               ) : (
-                <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+                <CardGrid collapsed={sidebarCollapsed}>
                   {TEMPLATES.map((template) => (
                     <button
                       key={template.id}
@@ -646,7 +738,7 @@ export default function Home({
                       </p>
                     </button>
                   ))}
-                </div>
+                </CardGrid>
               )}
             </div>
           </section>

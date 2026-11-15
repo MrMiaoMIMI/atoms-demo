@@ -1,13 +1,21 @@
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
+import { contentMaxWidth } from '../lib/layout';
 import { PROJECT_MODES, MODE_LABEL, projectMode } from '../lib/projects';
 import type { AuthUser, Health, ProjectMode, ProjectSummary } from '../types';
+import CardGrid from './CardGrid';
 import HomeSidebar, { CollapsedSidebar } from './HomeSidebar';
 import { Code, Plus, Search, X } from './Icons';
 import ProjectCard from './ProjectCard';
+import Tabs, { type TabItem } from './Tabs';
 
 type ModeFilter = ProjectMode | 'all';
+
+const MODE_TABS: TabItem<ModeFilter>[] = [
+  { value: 'all', label: '全部' },
+  ...PROJECT_MODES.map((value) => ({ value, label: MODE_LABEL[value] })),
+];
 
 interface Props {
   health: Health | null;
@@ -16,6 +24,7 @@ interface Props {
   user: AuthUser;
   onSidebarCollapsed: (collapsed: boolean) => void;
   onHome: () => void;
+  onDiscover: () => void;
   onNewProject: () => void;
   onOpenProject: (id: string) => void;
   onLogout: () => void;
@@ -28,6 +37,7 @@ export default function ProjectsPage({
   user,
   onSidebarCollapsed,
   onHome,
+  onDiscover,
   onNewProject,
   onOpenProject,
   onLogout,
@@ -60,6 +70,12 @@ export default function ProjectsPage({
       cancelled = true;
     };
   }, []);
+
+  // Keep counts, cover thumbnails and generating state in sync with the shell
+  // poll while the page is open.
+  useEffect(() => {
+    if (sidebarProjects.length) setProjects(sidebarProjects);
+  }, [sidebarProjects]);
 
   const counts = useMemo(() => {
     const next: Record<ModeFilter, number> = {
@@ -111,6 +127,7 @@ export default function ProjectsPage({
           section="projects"
           user={user}
           onHome={onHome}
+          onDiscover={onDiscover}
           onProjects={() => undefined}
           onExpand={() => onSidebarCollapsed(false)}
         />
@@ -120,6 +137,7 @@ export default function ProjectsPage({
           section="projects"
           user={user}
           onHome={onHome}
+          onDiscover={onDiscover}
           onProjects={() => undefined}
           onOpenProject={onOpenProject}
           onCollapse={() => onSidebarCollapsed(true)}
@@ -128,7 +146,10 @@ export default function ProjectsPage({
       )}
 
       <main className="min-w-0 flex-1 overflow-y-auto bg-base">
-        <div className="mx-auto w-full max-w-[1100px] px-6 py-8 sm:px-8">
+        <div
+          className="mx-auto w-full px-6 py-8 sm:px-8"
+          style={{ maxWidth: contentMaxWidth(sidebarCollapsed, 1100) }}
+        >
           <header className="flex flex-wrap items-start justify-between gap-4">
             <div className="min-w-0">
               <h1 className="text-[24px] font-medium leading-[32px] tracking-[-0.3px] text-ink-95">
@@ -149,34 +170,15 @@ export default function ProjectsPage({
           </header>
 
           <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-1 rounded-full bg-line-4 p-1">
-              {(
-                [
-                  ['all', '全部'],
-                  ...PROJECT_MODES.map((value) => [value, MODE_LABEL[value]]),
-                ] as [ModeFilter, string][]
-              ).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => setMode(value)}
-                  className={`inline-flex h-8 items-center gap-1.5 rounded-full px-3.5 text-[13px] transition ${
-                    mode === value
-                      ? 'bg-white text-ink-95 shadow-pill'
-                      : 'text-ink-55 hover:text-ink-80'
-                  }`}
-                >
-                  {label}
-                  <span
-                    className={`text-[11px] ${
-                      mode === value ? 'text-ink-55' : 'text-ink-30'
-                    }`}
-                  >
-                    {counts[value]}
-                  </span>
-                </button>
-              ))}
-            </div>
+            <Tabs
+              items={MODE_TABS.map((item) => ({
+                ...item,
+                count: counts[item.value],
+              }))}
+              value={mode}
+              onChange={setMode}
+              className="flex-wrap"
+            />
 
             <div className="relative w-full sm:w-[240px]">
               <Search
@@ -219,7 +221,7 @@ export default function ProjectsPage({
 
           <div className="mt-4 pb-10">
             {loading ? (
-              <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              <CardGrid collapsed={sidebarCollapsed}>
                 {[0, 1, 2, 3, 4, 5, 6, 7].map((index) => (
                   <div key={index} className="animate-pulse">
                     <div className="aspect-[16/10] rounded-xl bg-line-4" />
@@ -227,7 +229,7 @@ export default function ProjectsPage({
                     <div className="mt-2 h-2 w-1/2 rounded-full bg-line-2" />
                   </div>
                 ))}
-              </div>
+              </CardGrid>
             ) : projects.length === 0 ? (
               <div className="flex flex-col items-center justify-center rounded-[20px] border border-dashed border-line-8 bg-white/60 px-6 py-20 text-center">
                 <span className="grid h-12 w-12 place-items-center rounded-2xl bg-line-4 text-ink-55">
@@ -268,7 +270,7 @@ export default function ProjectsPage({
                 </button>
               </div>
             ) : (
-              <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              <CardGrid collapsed={sidebarCollapsed}>
                 {filtered.map((project) => (
                   <ProjectCard
                     key={project.id}
@@ -278,7 +280,7 @@ export default function ProjectsPage({
                     deleting={deleting === project.id}
                   />
                 ))}
-              </div>
+              </CardGrid>
             )}
           </div>
         </div>

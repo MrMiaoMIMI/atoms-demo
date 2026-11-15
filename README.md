@@ -84,11 +84,28 @@ apps/{project_id}/
 - 暂停 / 恢复只改 `projects.paused` 并停止发布运行时，不重新构建；恢复后首个访问懒启动。
 - 线上与工作台共用 `backend/data/app.db`，访客写入的数据在工作台预览也能看到。
 
+## 发现
+
+登录后左侧「发现」可以浏览其他用户已发布的应用：
+
+- 只展示 `published_version` 非空且未暂停的项目，并**排除当前用户自己的项目**；自己的项目仍在「项目」页和工作台查看。发现页侧边栏与首页保持一致，仍会显示自己的「文件夹 / 最近项目」导航。
+- 浏览数：每次打开详情页都会 +1（同一账号重复访问会累加）；首页项目 tab 和项目列表卡片展示浏览量。
+- 项目卡片缩略图：构建成功后由工作台在浏览器端生成 build cover；发布后再生成 published cover。卡片优先展示 published cover，其次 build cover，最后回退 CSS 占位；卡片不再展示「N 条对话 · N 个文件」。
+- 分类对齐 Atoms 官方九类（网站 / 电商 / 游戏 / 效率 / 原型 / 数据分析 / 博客 / 名片 / 深度研究）+ 其他；发布时手动选择，「自动识别」只给 LLM / 关键词建议，由作者确认。
+- 支持最新 / 最热排序、分类筛选、标题与简介搜索、收藏和「已保存」筛选；每次打开详情页都会计入浏览数。
+- 详情页用 16:9 iframe 直接运行 `/s/{id}/` 的发布快照，提供打开应用、复制公开链接、收藏；底部推荐同类应用。
+- 封面：发布成功后，浏览器在隐藏的 sandbox iframe 中通过 `html-to-image` 截取 `/apps/{id}/` 并上传为 `apps/{id}/cover.jpg`。只有 `cover_version == published_version` 时使用；截图失败、没有截图或版本不匹配时自动回退 CSS 封面。服务端不引入 Chromium，也不在列表里批量启动运行时。
+- 数据：`projects.description / category / view_count / cover_version / cover_at / build_cover_version / build_cover_at` + `project_saves(user_id, project_id)`。发现接口全部要求登录；`/s/{id}/` 仍公开。
+- 本期不做：克隆 / Remix、点赞、模板 tab、多 tag、服务端截图。
+- 演示提示：发现内容排除自己的项目（侧边栏仍与首页一致，会显示自己的最近项目）。用两个邮箱各快捷登录一次，账号 A 发布应用，账号 B 打开「发现」即可看到；A 继续在「项目」页查看自己的应用。
+
 ## 架构
 
 ```
 浏览器 (React 工作台)
  ├─ /api/auth/* ──► FastAPI 账号 / 会话 / 邮箱验证 / Google OAuth
+ ├─ /api/discover* ──► 其他用户的已发布应用（需登录，排除自己的项目）
+ │                    └─ 分类 / 最新·最热 / 搜索 / 收藏 / 浏览数 / 封面
  ├─ POST /api/projects/{id}/generate ──► FastAPI（需登录，校验项目归属）
  │                                        ├─ 意图判断：build / consult
  │                                        ├─ build: Mike → (Bob | Alex)，尾部 @ 交接
@@ -98,8 +115,9 @@ apps/{project_id}/
  │                                        └─ consult: 被 @ 的角色并行回答，不修改文件
  │◄────────── SSE: project / agent_start / execution / token / artifact / preview / message / agent_end / done
  │
- ├─ SQLite (WAL): users / sessions / email_tokens / projects(user_id) /
- │                 conversations(agent, run_id, run_index) / artifacts / executions(run_id)
+ ├─ SQLite (WAL): users / sessions / email_tokens /
+ │                 projects(user_id, description, category, view_count, cover_version) /
+ │                 project_saves / conversations(agent, run_id, run_index) / artifacts / executions(run_id)
  │
  ├─ iframe /apps/{id}/ ───────────────► Nginx ──► FastAPI 预览静态文件（需登录）
  │                                        └─► /apps/{id}/api/* ──► 工作区 uvicorn
@@ -295,6 +313,22 @@ CERTBOT_EMAIL=you@example.com ./scripts/init-letsencrypt.sh
 | GET | `/s/{id}/` | 已发布公开站点（无需登录；未发布/暂停 404） |
 | GET/POST/... | `/s/{id}/api/*` | 代理到发布快照的独立 FastAPI 后端 |
 
+### 发现
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/discover` | 其他用户的已发布应用；`sort=latest\|popular`、`category`、`q`、`saved=1`、`offset`、`limit` |
+| GET | `/api/discover/{id}` | 详情 + 相关应用；自己的项目、暂停、未发布统一 404 |
+| POST | `/api/discover/{id}/view` | 浏览数 +1；每次打开详情页都会上报 |
+| POST/DELETE | `/api/discover/{id}/save` | 收藏 / 取消收藏 |
+| GET | `/api/discover/{id}/cover` | 登录后读取其他用户的发布封面（无封面 / 版本不匹配 404） |
+| POST | `/api/projects/{id}/category/suggest` | 分类建议（仅项目所有者；不落库） |
+| POST | `/api/projects/{id}/cover` | 所有者上传发布版本对应的封面 |
+| POST | `/api/projects/{id}/build-cover` | 所有者上传最近构建版本对应的缩略图 |
+| GET | `/api/projects/{id}/cover` | 所有者读取项目卡片缩略图：发布封面优先，其次构建封面 |
+
+> `POST /api/projects/{id}/publish` 可附带 `{description?, category?}`；不带 body 时保留现有发现元数据。
+
 SSE 事件：
 
 | event | payload |
@@ -344,6 +378,12 @@ SSE 事件：
 - [x] 生命周期状态：未构建 / 未发布 / 在线 / 暂停；首次构建成功后工作台出现「概览」
 - [x] 发布快照与公开链接 `/s/{id}/`；发布后继续构建不影响线上，概览提示变更并可重新发布
 - [x] 暂停 / 恢复只切状态不重建；项目列表显示状态徽标；顶栏发布按钮按状态展示不同弹窗
+- [x] 发现内容只展示其他用户的在线应用；自己的项目不在发现列表 / 详情 / 相关推荐出现，侧边栏与首页一致
+- [x] 发现支持分类、搜索、最新 / 最热、收藏 / 已保存；详情页 iframe 运行发布快照
+- [x] 浏览数每次打开详情页都会累加；首页项目 tab 和项目列表卡片展示浏览量，不再展示对话 / 文件数
+- [x] 构建成功后生成 build cover；发布成功后生成 published cover；项目卡片按 published > build > CSS 展示
+- [x] 发布时可填简介、选分类并「自动识别」；封面失败回退 CSS
+- [x] 暂停 / 删除的项目从发现消失，详情统一 404
 
 ## 设计边界与安全说明
 
@@ -351,6 +391,8 @@ SSE 事件：
 - 生成的前端运行在 `sandbox` iframe 中（不含 `allow-same-origin`），通过 CORS 访问自己的后端。因此 iframe 自身的 `fetch()` 不携带 demo 登录 cookie：`/apps/{id}/api/*` 和静态资源不做额外登录校验，预览 HTML 入口仍要求项目所有者登录。
 - 生成的后端是**在本机（Docker 容器内）执行的不可信代码**：它有内存上限、只监听 127.0.0.1、环境变量被裁剪，但没有真正的进程/文件系统沙箱。这个 demo 定位为单用户演示；生产化需要把每个项目放进独立容器或 microVM。
 - 不执行 `npm install` 级别的服务端构建；预览用共享 esbuild 打包生成的前端源码。
+- 发现只做浏览 / 收藏 / 浏览数，不做克隆、Remix、点赞。封面由浏览器端 `html-to-image` 生成：项目卡片优先 published cover，其次 build cover，最后回退 CSS；发现页只使用 published cover。服务端不引入 Chromium。
+- 发现接口是唯一跨用户读取项目元数据的入口，只返回发布快照的名称、简介、分类、作者显示名、浏览数与封面，不返回邮箱、对话或文件；项目所有者接口仍按 `user_id` 隔离。
 - 发布只保留一份最新快照，不做真正的版本历史 / 回滚 / 多版本并存；不做自定义域名、SEO、Google Ads、分析、推广素材。变更判断用 `built_version > published_version`，不做内容哈希。
 - 线上快照与工作台共用项目的 `backend/data/app.db`（演示取舍）：访客写入的数据工作台可见，但工作台后续构建若修改表结构，可能与线上旧代码不兼容。需要强隔离时应拆成独立数据库。
 - `/s/{id}/` 是公开入口，生成的后端同样是在本机执行的不可信代码；发布不会额外增加沙箱能力。

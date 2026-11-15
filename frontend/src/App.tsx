@@ -6,6 +6,8 @@ import LoginPage from "./components/auth/LoginPage";
 import RegisterPage from "./components/auth/RegisterPage";
 import ResetPasswordPage from "./components/auth/ResetPasswordPage";
 import VerifyEmailPage from "./components/auth/VerifyEmailPage";
+import DiscoverDetailPage from "./components/DiscoverDetailPage";
+import DiscoverPage from "./components/DiscoverPage";
 import Home from "./components/Home";
 import { AtomsMark } from "./components/Icons";
 import ProjectsPage from "./components/ProjectsPage";
@@ -16,6 +18,8 @@ import type { AuthUser, Health, ProjectSummary } from "./types";
 type Route =
   | { name: "home" }
   | { name: "projects" }
+  | { name: "discover" }
+  | { name: "discover-detail"; projectId: string }
   | { name: "workspace"; projectId: string }
   | { name: "login" }
   | { name: "register"; email: string; redirect: string }
@@ -76,6 +80,17 @@ function parseRoute(): Route {
     return { name: "workspace", projectId };
   }
 
+  const discoverDetail = /^\/discover\/([^/]+)$/.exec(path);
+  if (discoverDetail) {
+    let projectId = discoverDetail[1];
+    try {
+      projectId = decodeURIComponent(projectId);
+    } catch {
+      // Keep the raw segment if it is not valid percent-encoding.
+    }
+    return { name: "discover-detail", projectId };
+  }
+
   // Legacy links used /?p={id}; keep them working.
   const legacy = query.get("p");
   if (legacy) return { name: "workspace", projectId: legacy };
@@ -108,6 +123,8 @@ function parseRoute(): Route {
       };
     case "/projects":
       return { name: "projects" };
+    case "/discover":
+      return { name: "discover" };
     default:
       return { name: "home" };
   }
@@ -129,7 +146,9 @@ function normalizeRoute(): void {
   const known =
     path === "/dashboard" ||
     path === "/projects" ||
+    path === "/discover" ||
     /^\/chat\/[^/]+$/.test(path) ||
+    /^\/discover\/[^/]+$/.test(path) ||
     isAuthPath(path);
   if (!known) window.history.replaceState({}, "", "/dashboard");
 }
@@ -302,9 +321,13 @@ export default function App() {
       authTitles[route.name] ??
       (route.name === "projects"
         ? "项目 · Atoms"
-        : route.name === "workspace"
-          ? "工作台 · Atoms"
-          : "Atoms · 让想法变成可运行的应用");
+        : route.name === "discover"
+          ? "发现 · Atoms"
+          : route.name === "discover-detail"
+            ? "发现 · Atoms"
+            : route.name === "workspace"
+              ? "工作台 · Atoms"
+              : "Atoms · 让想法变成可运行的应用");
   }, [route]);
 
   const navigate = useCallback((path: string) => {
@@ -320,6 +343,17 @@ export default function App() {
   const goProjects = useCallback(() => {
     navigate("/projects");
   }, [navigate]);
+
+  const goDiscover = useCallback(() => {
+    navigate("/discover");
+  }, [navigate]);
+
+  const openDiscoverApp = useCallback(
+    (projectId: string) => {
+      navigate(`/discover/${encodeURIComponent(projectId)}`);
+    },
+    [navigate]
+  );
 
   const openProject = useCallback(
     (projectId: string) => {
@@ -442,6 +476,7 @@ export default function App() {
         health={health}
         onExit={goHome}
         projects={projects}
+        onDiscover={goDiscover}
         onOpenProject={openProject}
         onOpenProjects={goProjects}
         user={user!}
@@ -458,9 +493,48 @@ export default function App() {
         sidebarCollapsed={sidebarCollapsed}
         onSidebarCollapsed={setSidebarCollapsed}
         onHome={goHome}
+        onDiscover={goDiscover}
         onNewProject={goHome}
         onOpenProject={openProject}
         user={user!}
+        onLogout={logout}
+      />
+    );
+  }
+
+  if (route.name === "discover") {
+    return (
+      <DiscoverPage
+        health={health}
+        sidebarProjects={projects}
+        sidebarCollapsed={sidebarCollapsed}
+        user={user!}
+        onSidebarCollapsed={setSidebarCollapsed}
+        onHome={goHome}
+        onDiscover={goDiscover}
+        onProjects={goProjects}
+        onOpenProject={openProject}
+        onOpenDiscoverApp={openDiscoverApp}
+        onLogout={logout}
+      />
+    );
+  }
+
+  if (route.name === "discover-detail") {
+    return (
+      <DiscoverDetailPage
+        key={route.projectId}
+        projectId={route.projectId}
+        health={health}
+        sidebarProjects={projects}
+        sidebarCollapsed={sidebarCollapsed}
+        user={user!}
+        onSidebarCollapsed={setSidebarCollapsed}
+        onHome={goHome}
+        onDiscover={goDiscover}
+        onProjects={goProjects}
+        onOpenProject={openProject}
+        onOpenDiscoverApp={openDiscoverApp}
         onLogout={logout}
       />
     );
@@ -475,6 +549,8 @@ export default function App() {
       onStart={start}
       onOpen={openProject}
       onBrowseAllProjects={goProjects}
+      onDiscover={goDiscover}
+      onOpenDiscoverApp={openDiscoverApp}
       user={user!}
       onLogout={logout}
     />

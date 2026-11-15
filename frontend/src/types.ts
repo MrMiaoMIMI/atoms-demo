@@ -68,6 +68,13 @@ export interface Project {
   status?: ProjectStatus;
   has_changes?: boolean;
   published_url?: string | null;
+  description?: string | null;
+  category?: string | null;
+  view_count?: number | null;
+  cover_version?: number | null;
+  cover_at?: string | null;
+  build_cover_version?: number | null;
+  build_cover_at?: string | null;
 }
 
 export interface ProjectState {
@@ -104,6 +111,40 @@ export interface ProjectSummary {
   status?: ProjectStatus;
   has_changes?: boolean;
   published_url?: string | null;
+  description?: string | null;
+  category?: string | null;
+  view_count?: number | null;
+  cover_version?: number | null;
+  cover_at?: string | null;
+  build_cover_version?: number | null;
+  build_cover_at?: string | null;
+  cover_url?: string | null;
+}
+
+export type DiscoverSort = "latest" | "popular";
+
+/**
+ * An app shown on the discover page. The backend excludes the viewer's own
+ * projects, so this always describes another user's published snapshot.
+ */
+export interface DiscoverApp {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  mode: ProjectMode;
+  view_count: number;
+  published_version?: number | null;
+  published_at?: string | null;
+  published_url: string;
+  cover_url: string | null;
+  saved: boolean;
+  author_name: string;
+  author_initial: string;
+}
+
+export interface DiscoverDetail extends DiscoverApp {
+  related: DiscoverApp[];
 }
 
 export interface Health {

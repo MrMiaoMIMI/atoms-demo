@@ -1,6 +1,9 @@
 import type {
   AuthProviders,
   AuthUser,
+  DiscoverApp,
+  DiscoverDetail,
+  DiscoverSort,
   Health,
   Project,
   ProjectState,
@@ -179,11 +182,34 @@ export const api = {
     await request(`/api/projects/${pid}`, { method: "DELETE" });
   },
 
-  publishProject: (pid: string) =>
-    postJson<{ ok: boolean; project: Project; published_url: string }>(
-      `/api/projects/${pid}/publish`,
-      {}
+  publishProject: (
+    pid: string,
+    meta?: { description?: string; category?: string }
+  ) =>
+    postJson<{
+      ok: boolean;
+      project: Project;
+      published_url: string;
+      manifest?: Record<string, unknown>;
+    }>(`/api/projects/${pid}/publish`, meta ?? {}),
+
+  suggestCategory: (pid: string, description: string) =>
+    postJson<{ category: string }>(
+      `/api/projects/${pid}/category/suggest`,
+      { description }
     ),
+
+  uploadCover: (pid: string, version: number, image: string) =>
+    postJson<{ ok: boolean }>(`/api/projects/${pid}/cover`, {
+      version,
+      image,
+    }),
+
+  uploadBuildCover: (pid: string, version: number, image: string) =>
+    postJson<{ ok: boolean }>(`/api/projects/${pid}/build-cover`, {
+      version,
+      image,
+    }),
 
   pauseProject: (pid: string) =>
     postJson<{ ok: boolean; project: Project }>(
@@ -216,6 +242,56 @@ export const api = {
       filename = plain[1];
     }
     return { blob: await res.blob(), filename };
+  },
+
+  // ---- discover -----------------------------------------------------------
+
+  discover: async (params: {
+    sort?: DiscoverSort;
+    category?: string;
+    q?: string;
+    saved?: boolean;
+    offset?: number;
+    limit?: number;
+  }): Promise<{ apps: DiscoverApp[]; has_more: boolean }> => {
+    const query = new URLSearchParams();
+    if (params.sort) query.set("sort", params.sort);
+    if (params.category) query.set("category", params.category);
+    if (params.q) query.set("q", params.q);
+    if (params.saved) query.set("saved", "1");
+    if (params.offset != null) query.set("offset", String(params.offset));
+    if (params.limit != null) query.set("limit", String(params.limit));
+    const suffix = query.toString();
+    return getJson<{ apps: DiscoverApp[]; has_more: boolean }>(
+      `/api/discover${suffix ? `?${suffix}` : ""}`
+    );
+  },
+
+  discoverDetail: async (pid: string): Promise<DiscoverDetail> => {
+    const data = await getJson<{ app: DiscoverDetail }>(
+      `/api/discover/${encodeURIComponent(pid)}`
+    );
+    return data.app;
+  },
+
+  recordDiscoverView: (pid: string) =>
+    postJson<{ ok: boolean; view_count: number }>(
+      `/api/discover/${encodeURIComponent(pid)}/view`,
+      {}
+    ),
+
+  saveDiscover: (pid: string) =>
+    postJson<{ ok: boolean; saved: boolean }>(
+      `/api/discover/${encodeURIComponent(pid)}/save`,
+      {}
+    ),
+
+  unsaveDiscover: async (pid: string): Promise<{ saved: boolean }> => {
+    const res = await request(
+      `/api/discover/${encodeURIComponent(pid)}/save`,
+      { method: "DELETE" }
+    );
+    return (await res.json()) as { saved: boolean };
   },
 };
 

@@ -367,7 +367,7 @@ export default function ChatPanel({
                   type="button"
                   onClick={onStop}
                   title="停止生成"
-                  className="grid h-8 w-8 place-items-center rounded-full bg-ink-95 text-white transition hover:bg-ink-80"
+                  className="grid h-8 w-8 place-items-center rounded-full bg-brand text-white transition hover:bg-brand-600"
                 >
                   <Stop size={14} />
                 </button>

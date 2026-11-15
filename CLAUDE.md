@@ -33,6 +33,7 @@
 - 角色能力靠 `AgentSpec.tools` 白名单 + `Toolbox` 强制隔离（Mike 只读，Bob 可校验方案，Alex 可写文件/构建/启动运行时）；工具是进程内 Python 函数，不用 MCP
 - 所有 AI 调用必须可降级：无 API Key 时走 Mock Agent 返回中性占位模板（不再伪装成 Todo/落地页）；运行中 LLM 失败按 `LLM_MAX_RETRIES`（默认 3 次）重试，仍失败则回滚本轮并保留上一个可用版本，不静默替换项目；前端构建或后端启动失败同样回滚并报错
 - 单次 LLM 输出预算由 `LLM_MAX_TOKENS` 控制（默认 16384，上游 400 时自动降回 8192）；`finish_reason=length` 时按 `LLM_CONTINUATION_PASSES`（默认 3）续写；生成后单文件 >12000 字符告警，>20000 字符的前端 TS/TSX 尝试自动拆分
+- 发现模块：登录后可见，只列 `published_version` 非空且未暂停的项目，并**排除当前用户自己的项目**；自己的项目只在「项目」页 / 工作台展示，发现页侧边栏与首页一致（仍显示自己的最近项目）。分类对齐官方九类 + 其他，发布时手选，自动识别只给建议；支持最新/最热、搜索、收藏/已保存；每次打开详情页浏览数 +1，首页项目 tab 和项目列表卡片展示浏览数并去掉「N 条对话 · N 个文件」。详情页 iframe 运行 `/s/{id}/`。封面：构建成功后由浏览器 sandbox iframe + `html-to-image` 生成 build cover，发布后生成 published cover；项目卡片按 published > build > CSS 展示，发现页只用 published cover；服务端不引入 Chromium
 - 账号体系：邮箱 + 密码（scrypt 加盐哈希）、邮箱验证、忘记密码、快捷登录（演示）、真实 Google OAuth；会话为 HttpOnly + SameSite=Lax 的随机 token cookie，服务端只存 SHA-256；`/api/auth/*` 与 `/api/health` 公开，其余项目 API 和 `/apps/{id}/` HTML 入口必须登录并校验 `projects.user_id`
 - Google 创建的账号 `password_hash` 为 NULL、不设初始密码；登录时与普通账号一样进入密码校验，未设置密码则提示失败，用户可通过「忘记密码」邮件设置密码，之后支持 Google 与邮箱密码双方式登录
 - 邮件：SMTP（QQ 邮箱 465/SSL）发送验证/重置链接；SMTP 未配置时自动进入开发模式，在页面展示链接；`AUTH_DEV_LINKS` 可强制开启，生产关闭
@@ -53,7 +54,8 @@
 - users(id, email UNIQUE COLLATE NOCASE, name, password_hash, provider, email_verified, created_at, last_login_at)
 - sessions(token_hash PK, user_id, created_at, expires_at, user_agent, ip)
 - email_tokens(token_hash PK, user_id, kind, email, expires_at, used_at, created_at)
-- projects(id, name, user_id, created_at, built_version, built_at, published_version, published_at, paused)
+- projects(id, name, user_id, created_at, built_version, built_at, published_version, published_at, paused, description, category, view_count, cover_version, cover_at, build_cover_version, build_cover_at)
+- project_saves(user_id, project_id, created_at) — 发现页收藏
 - conversations(id, project_id, role, content, agent, run_id, run_index, created_at)
 - artifacts(id, project_id, filename, content, version)
 - executions(id, project_id, agent, step, status, log, run_id, created_at)
@@ -62,8 +64,13 @@
 
 atoms-demo/
 ├── frontend/ # Vite React（Atoms 工作台）
+│ ├── src/components/DiscoverPage.tsx / DiscoverDetailPage.tsx / DiscoverCard.tsx
+│ ├── src/lib/discover.ts # 分类 / 计数格式化
+│ ├── src/lib/cover.ts # 发布后浏览器端封面截图与上传
+│ └── scripts/copy-capture-tool.mjs # 把 html-to-image 复制到 public/preview-assets
 ├── backend/ # FastAPI
-│ ├── main.py # 入口 + REST/SSE + 预览托管与 API 代理
+│ ├── main.py # 入口 + REST/SSE + 发现 API + 预览托管与 API 代理
+│ ├── categories.py # 发现分类常量 / 关键词启发式 / LLM 分类建议
 │ ├── agents.py # 角色表 / prompt / 意图判断 / @ 解析 / 依赖排序
 │ ├── agent.py # 编排器：Mike/Bob/Alex、尾部交接、循环上限、构建流水线
 │ ├── tools.py # Toolbox + 角色白名单工具（读状态/写文件/构建/运行时）
@@ -103,6 +110,9 @@ Phase 5：注册登录与用户隔离。
 
 Phase 6：项目状态管理与发布概览。
 `draft / unpublished / online / paused` 状态派生；发布快照 `.published/` 与独立发布运行时；公开站点 `/s/{id}/`；暂停/恢复；工作台「概览」tab（仅首次构建成功后显示）、按状态弹窗的顶栏发布入口、项目列表状态徽标。本期不做真正的版本历史/回滚。
+
+Phase 7：发现模块。
+登录后 `/discover` 浏览其他用户已发布的应用（内容排除自己的项目，侧边栏与首页一致）；官方九类 + 其他、最新/最热、搜索、收藏/已保存；每次打开详情页浏览数 +1，首页项目 tab 和项目列表卡片展示浏览数并去掉对话/文件数；`/discover/{id}` 详情页 16:9 iframe 运行发布快照；发布弹窗增加简介/分类/自动识别；构建成功后浏览器端生成 build cover，发布后生成 published cover，项目卡片按 published > build > CSS 展示，发现页只用 published cover，失败回退 CSS。本期不做克隆/Remix/点赞/模板 tab。
 下一步：在 `https://hajimi.site` 完成 Let's Encrypt 签发、Google OAuth 与 QQ 邮箱 SMTP 配置，跑一遍验收并整理截图。
 
 ## 硬性验收
@@ -117,6 +127,11 @@ Phase 6：项目状态管理与发布概览。
 8. 首次构建成功后工作台出现「概览」；未构建时不显示
 9. 发布后公开链接未登录可访问；继续 chat 构建不影响线上并提示「有未发布变更」；重新发布后线上更新
 10. 暂停/恢复只切状态不重建；项目列表显示状态徽标；顶栏发布按钮按状态展示不同弹窗
+11. 发现内容只展示其他用户的在线应用；自己的项目不在发现列表、详情和相关推荐出现；发现页侧边栏与首页一致
+12. 发现支持分类、搜索、最新/最热、收藏/已保存；详情页 iframe 运行发布快照
+13. 每次打开详情页浏览数 +1；首页项目 tab 和项目列表卡片展示浏览量，不再展示对话/文件数
+14. 构建成功后生成 build cover，发布成功后生成 published cover；项目卡片按 published > build > CSS 展示
+15. 发布可填简介、选分类并「自动识别」；封面失败回退 CSS；暂停/删除的项目从发现消失
 
 ## 明确不做
 
@@ -128,4 +143,5 @@ Phase 6：项目状态管理与发布概览。
 - 不引入 LangChain / LangGraph / MCP：3 角色 + 有界交接用显式状态机 + Toolbox 足够，框架会增加依赖、内存与 SSE 事件映射成本
 - 不做 Emma / David / Iris / Sarah / Adrian 等其他角色（本轮只实现 Mike / Bob / Alex 三个构建角色）
 - 不做真正的版本历史 / 回滚 / 多版本并存：发布只保留一份最新快照，变更判断用版本号而非内容哈希
+- 发现页不做克隆 / Remix / 点赞 / 模板 tab / 多 tag；不做服务端 Chromium 截图（封面由浏览器端 html-to-image 生成，项目卡片 published > build > CSS，失败回退 CSS）；发现页保持登录后可见，不改成公开免登录页面
 - 不做自定义域名 / SEO / Google Ads / 分析 / 推广素材；线上快照与工作台共用同一个项目 SQLite（需要强隔离时再拆独立库）

@@ -14,7 +14,7 @@ export const authInputClass =
   'h-10 w-full rounded-lg border border-line-6 bg-[#F7F7F6] px-3 text-[14px] text-ink-95 outline-none transition placeholder:text-ink-30 focus:border-brand focus:bg-white focus:ring-2 focus:ring-brand/10 disabled:cursor-not-allowed disabled:text-ink-55';
 
 export const authPrimaryClass =
-  'flex h-10 w-full items-center justify-center rounded-lg bg-[#0C0C0C] text-[14px] font-medium text-white transition hover:bg-[#252525] disabled:cursor-not-allowed disabled:bg-[#D8D8D4] disabled:text-white';
+  'flex h-10 w-full items-center justify-center rounded-lg bg-brand text-[14px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:bg-brand-200 disabled:text-white';
 
 export const authSecondaryClass =
   'flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-brand-200 bg-brand-50 text-[13px] font-medium text-brand-600 transition hover:bg-brand-100 disabled:cursor-not-allowed disabled:border-line-6 disabled:bg-transparent disabled:text-ink-30';

@@ -3,6 +3,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, generate, resumeGeneration } from '../api';
 import { AGENT_KEYS, agentFor, isAgentKey } from '../lib/agents';
 import { copyText } from '../lib/clipboard';
+import {
+  captureBuildCover,
+  capturePublishedCover,
+} from '../lib/cover';
 import { buildGroups, type ChatGroup } from '../lib/groups';
 import { projectStatus } from '../lib/projects';
 import type {
@@ -44,6 +48,7 @@ interface Props {
   onExit: () => void;
   projects: ProjectSummary[];
   user: AuthUser;
+  onDiscover: () => void;
   onOpenProject: (id: string) => void;
   onOpenProjects: () => void;
   onLogout: () => void;
@@ -88,6 +93,7 @@ export default function Workspace({
   onExit,
   projects,
   user,
+  onDiscover,
   onOpenProject,
   onOpenProjects,
   onLogout,
@@ -109,6 +115,9 @@ export default function Workspace({
   const [publishBusy, setPublishBusy] = useState(false);
   const [statusBusy, setStatusBusy] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
+  const [publishDescription, setPublishDescription] = useState('');
+  const [publishCategory, setPublishCategory] = useState('其他');
+  const [suggestingCategory, setSuggestingCategory] = useState(false);
   const [chatOpen, setChatOpen] = useState(
     () => window.localStorage.getItem('atoms-chat-open') !== '0'
   );
@@ -133,6 +142,21 @@ export default function Workspace({
   const startedRef = useRef(false);
   const resumeStartedRef = useRef(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
+  const buildCoverAttempt = useRef<string | null>(null);
+
+  const maybeCaptureBuildCover = useCallback(
+    (version: number) => {
+      const key = `${projectId}:${version}`;
+      if (buildCoverAttempt.current === key) return;
+      buildCoverAttempt.current = key;
+      void captureBuildCover(projectId, version).then((ok) => {
+        if (!ok && buildCoverAttempt.current === key) {
+          buildCoverAttempt.current = null;
+        }
+      });
+    },
+    [projectId]
+  );
 
   const latestVersion = useMemo(
     () =>
@@ -217,6 +241,17 @@ export default function Workspace({
       .then((state) => {
         if (cancelled) return;
         applyState(state);
+        const built = state.project.built_version;
+        const buildCover = state.project.build_cover_version;
+        const hasPublishedCover =
+          state.project.cover_version != null &&
+          state.project.cover_version === state.project.published_version;
+        // Backfill a working-build thumbnail for projects built before this
+        // feature existed. A published cover already wins on the project card,
+        // so it is not worth another capture in that case.
+        if (built != null && buildCover !== built && !hasPublishedCover) {
+          maybeCaptureBuildCover(built);
+        }
         if (state.generating) {
           // A build kept running after the previous page was closed.
           setRunning(true);
@@ -232,7 +267,7 @@ export default function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [projectId, applyState]);
+  }, [projectId, applyState, maybeCaptureBuildCover]);
 
   // The overview only exists after the first successful build; never leave the
   // right pane pointing at a hidden mode.
@@ -448,6 +483,9 @@ export default function Workspace({
         ) {
           setMode(data.mode);
         }
+        if (typeof data.version === 'number') {
+          maybeCaptureBuildCover(data.version);
+        }
         return;
       }
       if (event === 'message') {
@@ -490,7 +528,7 @@ export default function Workspace({
         );
       }
     },
-    [applyState, normalizeAgent],
+    [applyState, normalizeAgent, maybeCaptureBuildCover],
   );
 
   const run = useCallback(
@@ -709,28 +747,60 @@ export default function Workspace({
   }, [projectId, applyState]);
 
   const openPublish = useCallback(() => {
+    setPublishDescription(project?.description ?? '');
+    setPublishCategory(project?.category ?? '其他');
     setPublishError(null);
     setPublishOpen(true);
-  }, []);
+  }, [project?.description, project?.category]);
 
   const closePublish = useCallback(() => {
     setPublishOpen(false);
     setPublishError(null);
   }, []);
 
+  const suggestPublishCategory = useCallback(async () => {
+    setSuggestingCategory(true);
+    setPublishError(null);
+    try {
+      const result = await api.suggestCategory(
+        projectId,
+        publishDescription
+      );
+      setPublishCategory(result.category);
+    } catch (err) {
+      setPublishError((err as Error).message || '自动识别失败');
+    } finally {
+      setSuggestingCategory(false);
+    }
+  }, [projectId, publishDescription]);
+
   const doPublish = useCallback(async () => {
     setPublishBusy(true);
     setPublishError(null);
     try {
-      await api.publishProject(projectId);
+      const result = await api.publishProject(projectId, {
+        description: publishDescription,
+        category: publishCategory,
+      });
       await reloadProject();
       setPublishOpen(false);
+      // The cover is captured from the just-published workspace build. It is
+      // best-effort: a failure leaves the discover card on its CSS cover.
+      const version = result.project.published_version;
+      if (version != null) {
+        void capturePublishedCover(projectId, version);
+      }
     } catch (err) {
       setPublishError((err as Error).message || '发布失败');
     } finally {
       setPublishBusy(false);
     }
-  }, [projectId, reloadProject]);
+  }, [
+    projectId,
+    publishDescription,
+    publishCategory,
+    reloadProject,
+  ]);
 
   const doPause = useCallback(async () => {
     setStatusBusy(true);
@@ -813,6 +883,7 @@ export default function Workspace({
           section="workspace"
           user={user}
           onHome={onExit}
+          onDiscover={onDiscover}
           onProjects={onOpenProjects}
           onOpenProject={onOpenProject}
           onCollapse={() => setSidebarOpen(false)}
@@ -983,7 +1054,7 @@ export default function Workspace({
               onClick={openPublish}
               disabled={building || publishBusy || statusBusy}
               title={publishLabel}
-              className="flex h-[30px] items-center gap-1.5 rounded-full bg-[#0C0C0C] px-3 text-[13px] font-medium text-white transition hover:bg-[#232323] disabled:cursor-not-allowed disabled:opacity-40"
+              className="flex h-[30px] items-center gap-1.5 rounded-full bg-brand px-3 text-[13px] font-medium text-white transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {building ? <Spinner size={13} /> : null}
               {publishLabel}
@@ -1075,6 +1146,12 @@ export default function Workspace({
           busy={publishBusy || statusBusy}
           error={publishError}
           copied={shareCopied}
+          description={publishDescription}
+          category={publishCategory}
+          suggestingCategory={suggestingCategory}
+          onDescriptionChange={setPublishDescription}
+          onCategoryChange={setPublishCategory}
+          onSuggestCategory={() => void suggestPublishCategory()}
           onClose={closePublish}
           onPublish={() => void doPublish()}
           onPause={() => void doPause()}

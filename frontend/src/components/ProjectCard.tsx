@@ -1,4 +1,6 @@
 import type { MouseEvent as ReactMouseEvent } from 'react';
+import { useEffect, useState } from 'react';
+import { formatCount } from '../lib/discover';
 import { timeAgo } from '../lib/format';
 import {
   STATUS_LABEL,
@@ -8,13 +10,19 @@ import {
   projectStatus,
 } from '../lib/projects';
 import type { ProjectSummary } from '../types';
-import { AtomsMark, Spinner, Trash } from './Icons';
+import { AtomsMark, Eye, Spinner, Trash } from './Icons';
 
-export function ProjectCover({ project }: { project: ProjectSummary }) {
+export function ProjectCover({
+  project,
+  label,
+}: {
+  project: ProjectSummary;
+  label?: string;
+}) {
   const badge = (
     <div className="absolute bottom-6 left-6 flex items-center gap-1.5 rounded-full bg-white/85 px-2.5 py-1 text-[11px] font-medium text-ink-80 shadow-sm backdrop-blur">
       <AtomsMark size={12} className="text-brand" />
-      {modeLabel(project)} · v{project.latest_version ?? 0}
+      {label ?? `${modeLabel(project)} · v${project.latest_version ?? 0}`}
     </div>
   );
 
@@ -95,6 +103,11 @@ export default function ProjectCard({
   deleting = false,
 }: ProjectCardProps) {
   const status = projectStatus(project);
+  const [coverFailed, setCoverFailed] = useState(false);
+  useEffect(() => {
+    setCoverFailed(false);
+  }, [project.cover_url]);
+  const showCover = Boolean(project.cover_url) && !coverFailed;
   return (
     <div
       role="button"
@@ -110,7 +123,17 @@ export default function ProjectCard({
         className="relative aspect-[16/10] overflow-hidden rounded-[12px] border border-line-4 transition group-hover:border-line-8"
         style={{ background: coverFor(project.id) }}
       >
-        <ProjectCover project={project} />
+        {showCover ? (
+          <img
+            src={project.cover_url ?? ''}
+            alt=""
+            loading="lazy"
+            onError={() => setCoverFailed(true)}
+            className="absolute inset-0 h-full w-full object-cover"
+          />
+        ) : (
+          <ProjectCover project={project} />
+        )}
         <div className="absolute left-2 top-2 inline-flex items-center gap-1.5 rounded-full bg-white/90 px-2 py-1 text-[10px] font-medium text-ink-80 shadow-sm backdrop-blur">
           <span
             className={`h-1.5 w-1.5 rounded-full ${STATUS_TONE[status].dot}`}
@@ -134,8 +157,10 @@ export default function ProjectCard({
           <h3 className="truncate text-[14px] font-medium text-ink-95">
             {project.name}
           </h3>
-          <p className="mt-1 truncate text-[12px] text-ink-55">
-            {project.message_count} 条对话 · {project.artifact_count} 个文件 ·{' '}
+          <p className="mt-1 flex items-center gap-1 text-[12px] text-ink-55">
+            <Eye size={12} className="flex-none" />
+            {formatCount(project.view_count ?? 0)}
+            <span className="mx-0.5 text-ink-30">·</span>
             {timeAgo(project.created_at)}
           </p>
         </div>
